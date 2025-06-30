@@ -1,0 +1,6 @@
+node_modules/
+.env
+channel-config/*
+documents/*
+!documents/DOCUMENTFOLDER.txt
+!channel-config/EXAMPLE.json	
