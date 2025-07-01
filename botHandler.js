@@ -7,10 +7,10 @@
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence, clearChat } = require('./discord-helper.js');
 const { getAIResponse } = require('./aiCore.js');
-const { setMessageReaction, getChannelConfig , setReplyAsWebhook} = require('./discord-helper.js');
+// voice-related helper functions are also exported from discord-helper
+const { setMessageReaction, getChannelConfig , setReplyAsWebhook, setStartListening, getSpeech } = require('./discord-helper.js');
 const { getContextAsChunks } = require('./helper.js');
 const Context = require('./context.js');
-const { setStartListening, getSpeech } = require('./voice.js'); 
 
 
 // Run an AI request
