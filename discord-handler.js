@@ -1,6 +1,6 @@
 // Version 1.0
 // Handler for Discord related actions
-// 
+
 // Requirements
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");

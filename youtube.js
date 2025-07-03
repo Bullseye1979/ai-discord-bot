@@ -1,6 +1,6 @@
 // Version: 1.0
 // Get the subtitles from YouTube videos and process them with AI
-// Test
+
 // Configuration
 
 const MAX_TOKENS_PER_CHUNK = 2000; 
