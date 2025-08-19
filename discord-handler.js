@@ -7,7 +7,7 @@
 // - Reaktionen: ⏳ während Verarbeitung, ✅ bei Erfolg, ❌ bei Ablehnung/Fehler
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
-const { setEmptyChat, setBotPresence, setMessageReaction, setAddUserMessage, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
+const { setEmptyChat, setBotPresence, setMessageReaction, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
 const { getContextAsChunks } = require("./helper.js");
 

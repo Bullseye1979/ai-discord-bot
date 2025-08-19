@@ -1,10 +1,11 @@
-// Version 2.0
+// bot.js
+// Version 2.1 (Patched)
 // Initiates the bot and manages the messages to discord and exposes the documents directory via HTTP
-// ✨ NEU:
-// - Reagiert NICHT, wenn es keine Channel-Config gibt (kein globaler Fallback).
-// - Block-Auflösung pro Nachricht (user/speaker) via resolveChannelConfig.
-// - Eigene Konversation pro Sender (sessionKey: user:<id> / speaker:<name>).
-// - Model + API-Key pro Block.
+// ✨ Änderungen:
+// - getSpeakerName: nutzt bei Webhooks den per-Message Autor-Namen (message.author.username)
+// - Mapping speaker -> effectiveUserId (Guild-Member-Suche)
+// - Session-Key auf user:<effectiveUserId>, damit Voice (Webhook) & Text im selben Kontext landen
+// - Restliche Logik unverändert
 
 const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
@@ -77,18 +78,10 @@ const guildTextChannels = new Map();
 const activeRecordings = new Map();
 const state = { isAIProcessing: 0 };
 
-// Utility: Speaker-Name von Webhook ermitteln
+// Utility: Sprechername von Webhook ermitteln (per-Message Autorname)
 async function getSpeakerName(message) {
-    if (!message.webhookId) return null;
-    try {
-        const webhooks = await message.channel.fetchWebhooks();
-        const matching = webhooks.find(w => w.id === message.webhookId);
-        if (matching) return matching.name || null;
-    } catch (err) {
-        // Fallback: evtl. message.author.username
-        return message.author?.username || null;
-    }
-    return null;
+    // Für Webhook-Nachrichten liefert Discord in message.author den per-Message gesetzten Namen
+    return message.webhookId ? (message.author?.username || null) : null;
 }
 
 client.on('messageCreate', async (message) => {
@@ -101,15 +94,35 @@ client.on('messageCreate', async (message) => {
 
     // 2) Sender-Typ bestimmen
     const isWebhook = !!message.webhookId;
-    const userId = isWebhook ? null : message.author?.id;
+    const rawUserId = isWebhook ? null : message.author?.id;
     const speaker = isWebhook ? (await getSpeakerName(message)) : null;
 
+    // 2b) Speaker → echten Guild-User auflösen (damit Voice & Text denselben Kontext nutzen)
+    let effectiveUserId = rawUserId;
+    if (!effectiveUserId && speaker) {
+        try {
+            const members = await message.guild.members.fetch();
+            const match = members.find(m =>
+                m.displayName === speaker || m.user.username === speaker
+            );
+            if (match) effectiveUserId = match.id;
+        } catch {
+            // kein harter Fehler – fallback bleibt speaker-basiert
+        }
+    }
+
     // 3) Passenden Block auflösen (user/speaker/defaults). Wenn null -> NICHT reagieren.
-    const resolved = getChannelConfig(message.channelId, { userId, speaker });
+    //    Für Block-Checks geben wir sowohl userId (effectiveUserId, falls vorhanden) als auch speaker rein.
+    const resolved = getChannelConfig(message.channelId, { userId: effectiveUserId || rawUserId, speaker });
     if (!resolved) return;
 
-    // 4) Context-Storage pro Sender (damit unterschiedliche Blocks getrennt laufen)
-    const sessionKey = speaker ? `speaker:${speaker}` : `user:${userId}`;
+    // 4) Context-Storage pro Sender
+    //    → Wenn wir effectiveUserId haben, nutzen wir *immer* user:<id> (gemeinsamer Kontext).
+    //    → Nur wenn keine ID auflösbar ist, fallback auf speaker:<name>.
+    const sessionKey = effectiveUserId
+        ? `user:${effectiveUserId}`
+        : (speaker ? `speaker:${speaker}` : `user:${rawUserId}`);
+
     if (!contextStorage.has(message.channelId)) {
         contextStorage.set(message.channelId, new Map());
     }
@@ -124,7 +137,7 @@ client.on('messageCreate', async (message) => {
     // 5) Erst TTS-Weiterleitung prüfen (wenn Bot im Voice-Channel etc.)
     await setTTS(message, client, guildTextChannels);
 
-    // 6) User-Message in passenden Kontext legen
+    // 6) User-Message in passenden Kontext legen (gilt für Text *und* Webhook/Voice-Transkripte)
     await setAddUserMessage(message, chatContext);
 
     // 7) Trigger prüfen
