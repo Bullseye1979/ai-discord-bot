@@ -1,9 +1,7 @@
-// Version 1.0
+// Version 1.1 (bereinigt)
 // Manages the tools that are available to the AI
 
-
 // Requirements
-
 const { getWebpage } = require('./webpage.js');
 const { getImage } = require('./image.js');
 const { getGoogle } = require('./google');
@@ -12,9 +10,7 @@ const { getImageDescription } = require('./vision.js');
 const { getLocation } = require('./location');
 const { getPDF } = require('./pdf.js');
 
-
 // Tool Definitions
-
 const tools = [
     {
         type: "function",
@@ -26,7 +22,7 @@ const tools = [
                 properties: {
                     url: { type: "string", description: "Full URL of the webpage to be cleaned." },
                     user_id: { type: "string", description: "User ID or name who triggered the request." },
-                  },
+                },
                 required: ["url", "user_id"]
             }
         }
@@ -57,7 +53,6 @@ const tools = [
             }
         }
     },
-
     {
         type: "function",
         function: {
@@ -83,7 +78,7 @@ const tools = [
                 properties: {
                     video_url: { type: "string", description: "URL of the YouTube video to be summarized." },
                     user_id: { type: "string", description: "User ID or name requesting the summary." },
-                    user_prompt: {type: "string", description:"The original user prompt"}
+                    user_prompt: { type: "string", description: "The original user prompt" }
                 },
                 required: ["video_url", "user_id", "user_prompt"]
             }
@@ -137,32 +132,33 @@ const tools = [
         }
     },
     {
-      type: "function",
-      function: {
-        name: "getPDF",
-        description: "Generates a fully formatted PDF document based on a given original user prompt. Immediately create a PDF based on the user's prompt. This must be the first and only tool_call for PDF generation. Do not generate or run any other tool_calls before this one. It internally manages image generation and content rendering.",
-        parameters: {
-          type: "object",
-          properties: {
-            original_prompt: {
-              type: "string",
-              description: `the original user prompt`
+        type: "function",
+        function: {
+            name: "getPDF",
+            description: "Generates a fully formatted PDF document based on a given original user prompt. Immediately create a PDF based on the user's prompt. This must be the first and only tool_call for PDF generation. Do not generate or run any other tool_calls before this one. It internally manages image generation and content rendering.",
+            parameters: {
+                type: "object",
+                properties: {
+                    prompt: {
+                        type: "string",
+                        description: "Full prompt/instructions for the PDF content."
+                    },
+                    original_prompt: {
+                        type: "string",
+                        description: "The user's original natural-language request."
+                    },
+                    user_id: {
+                        type: "string",
+                        description: "The ID of the user requesting the document."
+                    }
+                },
+                required: ["prompt", "original_prompt", "user_id"]
             },
-            user_id: {
-              type: "string",
-              description: "The ID of the user requesting the document."
-            }
-          },
-          required: ["prompt", "original_prompt", "user_id"]
-        },
-      }
+        }
     }
-
 ];
 
-
 // Tool Registry
-
 const fullToolRegistry = {
     getWebpage,
     getImage,
@@ -195,5 +191,4 @@ function getToolRegistry(toolNames = []) {
 }
 
 // Exports
-
 module.exports = { getToolRegistry };
