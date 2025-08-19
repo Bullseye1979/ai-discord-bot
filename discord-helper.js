@@ -1,460 +1,399 @@
-// Version 1.2
-// Offers functions that are used to make handling with Discord easier
-// ✨ getChannelConfig liefert jetzt auch `blocks` zurück (für Berechtigungen)
-// ✨ kleinere Robustheits-Verbesserungen
+// discord-helper.js
+// Version 3.0
+// - Voice-Transkription (Whisper) -> als Webhook-Nachricht im Textkanal posten (username = Sprecher)
+// - Diese Webhook-Nachrichten werden wie normale User-Messages vom Bot verarbeitet und landen dadurch im Chat-Kontext
+// - TTS-Ausgabe für AI-Antworten im Voice-Channel
+// - Channel-Config-Auflösung inkl. Block-Overrides (user/speaker) und Tools-Registry
+// - Utility-Funktionen (Reaktionen, Präsenz, Chat leeren, etc.)
 
-const fs = require("fs");
-const path = require("path");
-const { tools, getToolRegistry } = require('./tools.js');
-const { WebhookClient } = require('discord.js');
-const { EndBehaviorType } = require("@discordjs/voice");
-const { createAudioPlayer, createAudioResource, joinVoiceChannel, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
-const { PassThrough } = require('stream');
-const axios = require("axios");
-const ffmpeg = require("fluent-ffmpeg");
-const prism = require("prism-media");
-const { getSafeDelete } = require("./helper.js");
-const { getTranscription, getTTS } = require("./aiService.js");
-require("dotenv").config();
-ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
+require('dotenv').config();
 
-// Variables
-const queueMap = new Map();
-const playerMap = new Map();
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
 
-// Resolve user Tools
-function getUserTools(nameOrDisplayName) {
-    const configPath = path.join(__dirname, "permissions.json");
-    const raw = fs.readFileSync(configPath, "utf8");
-    const parsed = JSON.parse(raw);
+const {
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  EndBehaviorType,
+  getVoiceConnection,
+} = require('@discordjs/voice');
 
-    const defaultTools = parsed.default?.tools || [];
-    const userTools = parsed.users?.[nameOrDisplayName]?.tools;
+const prism = require('prism-media');
+const { getTranscription, getTTS } = require('./aiService.js');
+const { getToolRegistry } = require('./tools.js');
+const { getSafeDelete } = require('./helper.js');
 
-    const toolNames = Array.isArray(userTools) ? userTools : defaultTools;
-    const activeTools = tools.filter(t => toolNames.includes(t.function.name));
-    const { registry: toolRegistry } = getToolRegistry(toolNames);
+// -------- Globale Caches --------
+/** Merkt pro Textkanal eine (oder mehrere) Webhooks zur Sprach-Weiterleitung */
+const channelWebhookCache = new Map(); // channelId -> webhook
 
-    return {
-        tools: activeTools,
-        toolRegistry
-    };
+/** Audio-Player pro Guild (eine Instanz reicht idR) */
+const guildAudioPlayers = new Map();   // guildId -> AudioPlayer
+
+// ===== Utilitys =====
+
+async function setBotPresence(client, text = '✅ Ready', status = 'online') {
+  try {
+    await client.user.setPresence({
+      activities: [{ name: text }],
+      status,
+    });
+  } catch {}
 }
 
-// Default Persona laden 
-function getDefaultPersona() {
-    const defaultPath = path.join(__dirname, "channel-config", "default.json");
-    try {
-        const data = fs.readFileSync(defaultPath, "utf8");
-        const json = JSON.parse(data);
-        return {
-            persona: json.persona || "",
-            instructions: json.instructions || "",
-            voice: json.voice || "",
-            name: json.name || "",
-            botname: json.botname || "",
-            selectedTools: json.tools || [],
-            blocks: Array.isArray(json.blocks) ? json.blocks : []
-        };
-    } catch (err) {
-        console.warn("[WARN] Could not load default persona/instructions:", err.message);
-        return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [] };
-    }
-}
-
-// Answer via webhook
-async function setReplyAsWebhook(message, content, config = {}) {
-    try {
-        const botname = config.botname || "AI";
-        const avatarUrl = config.avatarUrl || message.client.user.displayAvatarURL();
-        const webhooks = await message.channel.fetchWebhooks();
-        let webhook = webhooks.find(w => w.name === botname);
-        if (!webhook) {
-            webhook = await message.channel.createWebhook({ name: botname });
-        }
-        const parts = content.match(/[\s\S]{1,2000}/g) || [];
-        for (const part of parts) {
-            await webhook.send({
-                content: part,
-                username: botname,
-                avatarURL: avatarUrl
-            });
-        }
-    } catch (err) {
-        console.error("[ERROR] Failed to send via webhook:", err);
-    }
-}
-
-// Get channel based bot configuration
-function getChannelConfig(channelId) {
-    const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
-    const defaultConfig = getDefaultPersona();
-
-    let {
-        persona,
-        instructions,
-        voice,
-        name,
-        botname,
-        selectedTools,
-        blocks
-    } = defaultConfig;
-
-    if (fs.existsSync(configPath)) {
-        try {
-            const rawData = fs.readFileSync(configPath, "utf8");
-            const config = JSON.parse(rawData);
-
-            if (typeof config.voice === "string") voice = config.voice;
-            if (typeof config.botname === "string") botname = config.botname;
-            if (typeof config.name === "string") name = config.name;
-            if (typeof config.persona === "string") persona = config.persona;
-            if (typeof config.instructions === "string") instructions = config.instructions;
-
-            // Channel-weite (nicht block-spezifische) Tools für Default-Kontext
-            if (Array.isArray(config.tools)) {
-                selectedTools = config.tools;
-            }
-
-            // ✨ NEU: Blocks mit ausliefern
-            if (Array.isArray(config.blocks)) {
-                blocks = config.blocks;
-            } else {
-                blocks = [];
-            }
-        } catch (err) {
-            console.error(`[ERROR] Failed to load channel config for ${channelId}:`, err.message);
-        }
-    }
-
-    const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
-
-    const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-    const avatarUrl = fs.existsSync(avatarPath)
-        ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
-        : `https://ralfreschke.de/documents/avatars/default.png`;
-
-    return {
-        name,
-        botname,
-        voice,
-        persona,
-        avatarUrl,
-        instructions,
-        tools: ctxTools,
-        toolRegistry,
-        blocks // <- wichtig für Berechtigungsprüfung
-    };
-}
-
-// Set the status that the bot presents
-async function setBotPresence(client, activityText, status, activityType = 4) {
-    if (client && client.user) {
-        await client.user.setPresence({
-            activities: [{ name: activityText, type: activityType }],
-            status: status
-        });
-    }
-}
-
-// React to the message
 async function setMessageReaction(message, emoji) {
-    try {
-        await message.reactions.removeAll();
-        await message.react(emoji);
-    } catch (err) {
-        console.warn("[WARN]: Could not modify reactions:", err);
-    }
+  try {
+    await message.react(emoji);
+  } catch {}
 }
 
-// Add the user message to the context. Considers attachments.
-async function setAddUserMessage(message, chatContext) {
-    let content = message.content;
-    if (message.attachments.size > 0) {
-        const attachmentLinks = message.attachments.map(a => a.url).join("\n");
-        content = `${attachmentLinks}\n${content}`;
-    }
-    const senderName = message.member?.displayName
-        || message.author?.username
-        || "user";
-
-    await chatContext.add("user", senderName, content);
-}
-
-// Remove all messages from the chat
+/**
+ * Löscht "sichtbar" den Textkanal (max. die letzten ~1000 Nachrichten paginiert),
+ * ohne Garantien, je nach Berechtigungen.
+ */
 async function setEmptyChat(channel) {
-    try {
-        let skippedCount = 0;
-        let hasMore = true;
-        while (hasMore) {
-            const fetched = await channel.messages.fetch({ limit: 100 });
-            hasMore = fetched.size > 0;
-            for (const msg of fetched.values()) {
-                if (msg.pinned) {
-                    skippedCount++;
-                    continue;
-                }
-                try {
-                    await msg.delete();
-                    await new Promise(res => setTimeout(res, 150));
-                } catch (err) {
-                    skippedCount++;
-                }
-            }
-        }
-
-        if (skippedCount > 0) {
-            console.warn(`[WARN]: Could not delete all files (${skippedCount} remaining).`);
-        } 
-    } catch (err) {
-        console.error("[ERROR]", err);
+  try {
+    let lastId = null;
+    for (let i = 0; i < 10; i++) {
+      const msgs = await channel.messages.fetch({ limit: 100, before: lastId || undefined });
+      if (msgs.size === 0) break;
+      const deletable = [...msgs.values()].filter(m => m.deletable);
+      for (const m of deletable) {
+        try { await m.delete(); } catch {}
+      }
+      lastId = msgs.last().id;
+      if (msgs.size < 100) break;
     }
+  } catch (err) {
+    console.warn('[setEmptyChat] Warn:', err.message);
+  }
 }
 
-// Start the listener
+async function setReplyAsWebhook(message, text, { botname = 'AI', avatarUrl = null } = {}) {
+  try {
+    const hooks = await message.channel.fetchWebhooks();
+    let hook = hooks.find(h => h.name === botname);
+
+    if (!hook) {
+      hook = await message.channel.createWebhook({
+        name: botname,
+        avatar: avatarUrl || undefined,
+        reason: 'AI reply webhook',
+      });
+    }
+
+    await hook.send({
+      content: text,
+      username: botname,
+      avatarURL: avatarUrl || undefined,
+      allowedMentions: { parse: [] },
+    });
+  } catch (err) {
+    // Fallback: normal senden
+    try { await message.channel.send(text); } catch {}
+  }
+}
+
+/**
+ * Fügt eine eingehende Textnachricht in den Chat-Kontext.
+ * Achtung: Der eigentliche Kontext wird im Bot an Context gebunden – hier nur die Brücke.
+ * Erwartet: chatContext (Context-Instanz), message (Discord.js Message)
+ */
+async function setAddUserMessage(message, chatContext) {
+  try {
+    // Prefer DisplayName, fallback auf Username
+    const display =
+      message.member?.displayName ||
+      message.author?.username ||
+      'user';
+
+    // Text-Inhalt; bei Anhängen (z. B. Bilder) füge die URLs an
+    let content = message.content || '';
+    if (message.attachments?.size) {
+      const links = [...message.attachments.values()].map(a => a.url).join('\n');
+      content = content ? `${content}\n${links}` : links;
+    }
+
+    if (!content || !content.trim()) return;
+    await chatContext.add('user', display, content.trim());
+  } catch (err) {
+    console.warn('[setAddUserMessage] Warn:', err.message);
+  }
+}
+
+// ===== Channel-Config =====
+
+/**
+ * Lädt die Channel-Config aus ./channel-config/<channelId>.json und
+ * wendet optional Block-Overrides (userId / speaker) an.
+ *
+ * Rückgabe:
+ * - null, wenn keine Config
+ * - Objekt mit: botname, voice, name, model, apikey, persona, instructions,
+ *               tools, toolRegistry, avatarUrl, blocks (unverändert)
+ */
+function getChannelConfig(channelId, opts = null) {
+  try {
+    const cfgPath = path.join(__dirname, 'channel-config', `${channelId}.json`);
+    if (!fs.existsSync(cfgPath)) return null;
+
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    const cfg = JSON.parse(raw);
+
+    // Basiswerte
+    const base = {
+      botname: cfg.botname || 'AI',
+      voice: cfg.voice || 'alloy',
+      name: (cfg.name || cfg.botname || 'bot').toLowerCase(),
+      model: cfg.model || 'gpt-4o',
+      apikey: cfg.apikey || null,
+      persona: cfg.persona || '',
+      instructions: cfg.instructions || '',
+      tools: [],
+      toolRegistry: {},
+      avatarUrl: cfg.avatarUrl || null,
+      blocks: Array.isArray(cfg.blocks) ? cfg.blocks : [],
+    };
+
+    // Tool-Setup (Channel-weit)
+    if (Array.isArray(cfg.tools) && cfg.tools.length > 0) {
+      const { tools, registry } = getToolRegistry(cfg.tools);
+      base.tools = tools;
+      base.toolRegistry = registry;
+    }
+
+    // Ohne Auflösung zurückgeben (Existenzprüfung u. ä.)
+    if (!opts) return base;
+
+    const { userId, speaker } = opts;
+
+    // Passender Block (ODER-Logik: userId || speaker)
+    const match = base.blocks.find(b => {
+      const okUser = Array.isArray(b.user) && b.user.map(String).includes(String(userId || ''));
+      const okSpeaker = Array.isArray(b.speaker) && b.speaker.includes(String(speaker || ''));
+      return okUser || okSpeaker;
+    });
+
+    if (!match) return base;
+
+    // Overrides anwenden
+    const out = { ...base };
+    if (match.model) out.model = match.model;
+    if (match.apikey) out.apikey = match.apikey;
+    if (Array.isArray(match.tools) && match.tools.length > 0) {
+      const { tools, registry } = getToolRegistry(match.tools);
+      out.tools = tools;
+      out.toolRegistry = registry;
+    }
+    if (typeof match.voice === 'string') out.voice = match.voice;
+    if (typeof match.botname === 'string') out.botname = match.botname;
+    if (typeof match.name === 'string') out.name = match.name;
+
+    return out;
+  } catch (err) {
+    console.warn('[getChannelConfig] Warn:', err.message);
+    return null;
+  }
+}
+
+// ===== TTS-Ausgabe =====
+
+/**
+ * Spricht Text im Voice-Channel der Guild (falls Bot verbunden).
+ * - Verwendet OpenAI TTS (getTTS), responseType: 'stream'
+ */
+async function getSpeech(connection, guildId, text, client, voice = 'alloy') {
+  try {
+    if (!connection) return;
+    let player = guildAudioPlayers.get(guildId);
+    if (!player) {
+      player = createAudioPlayer();
+      guildAudioPlayers.set(guildId, player);
+      connection.subscribe(player);
+    }
+
+    const ttsStream = await getTTS(text, 'tts-1', voice);
+    const resource = createAudioResource(ttsStream);
+    player.play(resource);
+
+    // Optional: warten bis fertig (nicht zwingend)
+    await new Promise((resolve) => {
+      const onIdle = () => {
+        player.off(AudioPlayerStatus.Idle, onIdle);
+        resolve();
+      };
+      player.on(AudioPlayerStatus.Idle, onIdle);
+    });
+  } catch (err) {
+    console.warn('[getSpeech] Warn:', err.message);
+  }
+}
+
+// ===== Sprachaufzeichnung & Transkription =====
+
+/**
+ * Erzeugt (oder cached) einen Kanal-WebHook für "Voice Relay".
+ */
+async function getOrCreateRelayWebhook(textChannel) {
+  const cached = channelWebhookCache.get(textChannel.id);
+  if (cached) return cached;
+  const hooks = await textChannel.fetchWebhooks();
+  let hook = hooks.find(h => h.name === 'Voice Relay');
+  if (!hook) {
+    hook = await textChannel.createWebhook({
+      name: 'Voice Relay',
+      reason: 'Post transcriptions as user-like messages',
+    });
+  }
+  channelWebhookCache.set(textChannel.id, hook);
+  return hook;
+}
+
+/**
+ * Konvertiert rohe PCM-Buffer in eine einfache WAV-Datei (PCM 16 LE, 48kHz, mono).
+ */
+function writeWavFile(filePath, pcmBuffer) {
+  const numChannels = 1;
+  const sampleRate = 48000;
+  const bitsPerSample = 16;
+
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const dataSize = pcmBuffer.length;
+
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);                            // ChunkID
+  header.writeUInt32LE(36 + dataSize, 4);             // ChunkSize
+  header.write('WAVE', 8);                            // Format
+  header.write('fmt ', 12);                           // Subchunk1ID
+  header.writeUInt32LE(16, 16);                       // Subchunk1Size (16 for PCM)
+  header.writeUInt16LE(1, 20);                        // AudioFormat (1 = PCM)
+  header.writeUInt16LE(numChannels, 22);              // NumChannels
+  header.writeUInt32LE(sampleRate, 24);               // SampleRate
+  header.writeUInt32LE(byteRate, 28);                 // ByteRate
+  header.writeUInt16LE(blockAlign, 32);               // BlockAlign
+  header.writeUInt16LE(bitsPerSample, 34);            // BitsPerSample
+  header.write('data', 36);                           // Subchunk2ID
+  header.writeUInt32LE(dataSize, 40);                 // Subchunk2Size
+
+  const fileBuffer = Buffer.concat([header, pcmBuffer]);
+  fs.writeFileSync(filePath, fileBuffer);
+}
+
+/**
+ * Startet die Voice-Aufnahme & Transkription.
+ * - connection: VoiceConnection
+ * - guildId: Guild-ID
+ * - guildTextChannels: Map(guildId -> textChannelId) (kommt aus bot.js)
+ * - activeRecordings: Map (wird hier nicht tief genutzt, aber kompatibel)
+ * - client: Discord.Client
+ *
+ * Ablauf:
+ *   1) abonnieren wir alle Sprecher (connection.receiver)
+ *   2) für jeden Sprach-Chunk -> decode nach PCM, baue WAV, an Whisper -> Text
+ *   3) sende den Text als Webhook-Nachricht (username = Sprecher, avatar = Useravatar)
+ *      => Bot-Handler sieht das als "Webhook-Speaker" und legt es in den passenden Kontext.
+ */
 async function setStartListening(connection, guildId, guildTextChannels, activeRecordings, client) {
-    const receiver = connection.receiver;
-    receiver.speaking.on("start", async (userId) => {
-        if (activeRecordings.has(userId)) return;
-        const textChannelId = guildTextChannels.get(guildId);
-        const textChannel = client.channels.cache.get(textChannelId);
-        if (!textChannel) return;
-        activeRecordings.set(userId, true);
-        await setTranscribeAudio(receiver, userId, textChannel, activeRecordings, client);
-    });
-}
+  if (!connection) return;
+  const receiver = connection.receiver;
 
-// Record the Audio and transcribe it
-async function setTranscribeAudio(receiver, userId, textChannel, activeRecordings, client) {
-    const timestamp = Date.now();
-    const rawAudio = `audio_${userId}_${timestamp}.pcm`;
-    const wavAudio = `audio_${userId}_${timestamp}.wav`;
-    const opusStream = receiver.subscribe(userId, {
-        end: { behavior: EndBehaviorType.AfterSilence, duration: 2000 },
-    });
-    const pcmStream = new prism.opus.Decoder({ frameSize: 960, channels: 1, rate: 48000 });
-    const fileStream = fs.createWriteStream(rawAudio);
-    opusStream.pipe(pcmStream).pipe(fileStream);
+  // Der Textkanal, in den wir posten sollen
+  const textChannelId = guildTextChannels.get(guildId);
+  if (!textChannelId) return;
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+  const textChannel = guild.channels.cache.get(textChannelId);
+  if (!textChannel || !textChannel.isTextBased()) return;
 
-    opusStream.on("close", async () => {
-        activeRecordings.delete(userId);
-        try {
-            await setConvertAudio(rawAudio, wavAudio);
-            if (!getIsSpeechDetected(rawAudio)) return;
+  const hook = await getOrCreateRelayWebhook(textChannel);
 
-            const transcript = await getTranscription(wavAudio);
-            if (transcript && transcript.trim()) {
-                let user = { username: `User-${userId}`, displayAvatarURL: () => null };
-
-                try {
-                    const webhooks = await textChannel.fetchWebhooks();
-                    let webhook = webhooks.find(wh => wh.name === "VoiceTranscriber");
-                    if (!webhook) {
-                        webhook = await textChannel.createWebhook({
-                            name: "VoiceTranscriber",
-                            avatar: client.user.displayAvatarURL(),
-                        });
-                    }
-
-                    try {
-                        const member = await textChannel.guild.members.fetch(userId);
-                        if (member) {
-                            user = {
-                                username: member.displayName || member.user.username || user.username,
-                                displayAvatarURL: () => member.user.displayAvatarURL(),
-                            };
-                        }
-                    } catch (err) {
-                        console.warn("[WARN]: ", err);
-                    }
-
-                    await webhook.send({
-                        content: transcript,
-                        username: user.username,
-                        avatarURL: user.displayAvatarURL(),
-                    });
-
-                } catch (err) {
-                    console.error("[ERROR]: ", err);
-                    await textChannel.send(`**${user.username}**: ${transcript}`);
-                }
-            }
-        } catch (err) {
-            console.error(`[ERROR]: `, err);
-        }
-        await getSafeDelete(rawAudio);
-        await getSafeDelete(wavAudio);
-    });
-}
-
-// Convert Audio in a format that whisper can work with
-function setConvertAudio(input, output) {
-    return new Promise((resolve, reject) => {
-        ffmpeg(input)
-            .inputFormat("s16le")
-            .audioFrequency(48000)
-            .audioChannels(1)
-            .audioCodec("pcm_s16le")
-            .toFormat("wav")
-            .on("end", () => resolve())
-            .on("error", (err) => reject(err))
-            .save(output);
-    });
-}
-
-// Check whether speech is contained in the file
-function getIsSpeechDetected(filePath, sampleRate = 16000) {
-    const pcmData = fs.readFileSync(filePath);
-    const frameSize = sampleRate / 10; // 100ms
-    const minLengthSeconds = 2.5;
-    const minFrames = (sampleRate * minLengthSeconds) / frameSize;
-
-    const durationSeconds = pcmData.length / (sampleRate * 2);
-    if (durationSeconds < minLengthSeconds) {
-        return false;
-    }
-
-    let speechDetected = false;
-
-    for (let i = 0; i < pcmData.length; i += frameSize * 2) {
-        const chunk = pcmData.slice(i, i + frameSize * 2);
-        const avgVolume = getAverageVolume(chunk);
-        const snr = getSNR(chunk);
-
-        if (avgVolume > 0.02 && snr > 5) {
-            speechDetected = true;
-            break;
-        }
-    }
-
-    return speechDetected;
-}
-
-// Get the average volume of the audio
-function getAverageVolume(chunk) {
-    let sum = 0;
-    for (let i = 0; i < chunk.length; i += 2) {
-        let sample = chunk.readInt16LE(i) / 32768;
-        sum += Math.abs(sample);
-    }
-    return sum / (chunk.length / 2);
-}
-
-// Check the SNR of the Audio
-function getSNR(chunk) {
-    let signalPower = 0;
-    let noisePower = 0;
-    const threshold = 0.005;
-
-    for (let i = 0; i < chunk.length; i += 2) {
-        let sample = chunk.readInt16LE(i) / 32768;
-        if (Math.abs(sample) > threshold) {
-            signalPower += sample * sample;
-        } else {
-            noisePower += sample * sample;
-        }
-    }
-
-    if (noisePower === 0) return 100;
-    return 10 * Math.log10(signalPower / noisePower);
-}
-
-// Put texts in the voice queue
-function setEnqueueTTS(guildId, task) {
-    if (!queueMap.has(guildId)) {
-        queueMap.set(guildId, []);
-    }
-    const queue = queueMap.get(guildId);
-    queue.push(task);
-    if (queue.length === 1) {
-        setProcessTTSQueue(guildId);
-    }
-}
-
-// Process the voice queue
-async function setProcessTTSQueue(guildId) {
-    const queue = queueMap.get(guildId);
-    if (!queue || queue.length === 0) return;
-    const task = queue[0];
+  receiver.speaking.on('start', async (userId) => {
     try {
-        await task();
+      const user = await guild.members.fetch(userId).catch(() => null);
+      if (!user) return;
+
+      // Opus -> PCM
+      const opusStream = receiver.subscribe(userId, {
+        end: {
+          behavior: EndBehaviorType.AfterSilence,
+          duration: 1200, // 1.2s Stille => Ende
+        },
+      });
+
+      const decoder = new prism.opus.Decoder({
+        frameSize: 960,
+        channels: 1,
+        rate: 48000,
+      });
+
+      const pcmChunks = [];
+      opusStream.pipe(decoder);
+
+      decoder.on('data', (chunk) => {
+        pcmChunks.push(chunk);
+      });
+
+      decoder.on('end', async () => {
+        try {
+          if (!pcmChunks.length) return;
+
+          const pcmBuffer = Buffer.concat(pcmChunks);
+          // sehr kurze/kleine Aufnahme ignorieren (~ < 0.3s)
+          if (pcmBuffer.length < 48000 * 2 * 0.3) return;
+
+          // WAV schreiben, an Whisper schicken
+          const tmpDir = path.join(__dirname, 'tmp');
+          await fsp.mkdir(tmpDir, { recursive: true });
+          const wavPath = path.join(tmpDir, `rec_${guildId}_${userId}_${Date.now()}.wav`);
+          writeWavFile(wavPath, pcmBuffer);
+
+          const text = await getTranscription(wavPath); // nutzt whisper-1
+          await getSafeDelete(wavPath);
+
+          if (!text || !text.trim() || text.startsWith('[ERROR]')) return;
+
+          // Als Webhook posten => username = Sprechername, avatar = User-Avatar
+          const display = user.displayName || user.user.username || 'user';
+          const avatar = user.user.displayAvatarURL?.() || null;
+
+          await hook.send({
+            content: text.trim(),
+            username: display,
+            avatarURL: avatar || undefined,
+            allowedMentions: { parse: [] },
+          });
+
+          // Optional: auch kurz visuelles Feedback in den Chat
+          // await textChannel.send(`🎤 **${display}**: ${text.trim()}`);
+
+        } catch (errEnd) {
+          console.warn('[voice] end-handler warn:', errEnd.message);
+        }
+      });
+
+      decoder.on('error', (e) => {
+        console.warn('[voice] decoder error:', e.message);
+      });
     } catch (err) {
-        console.error("[ERROR]:", err);
-    } finally {
-        queue.shift();
-        if (queue.length > 0) {
-            setProcessTTSQueue(guildId);
-        }
+      console.warn('[voice] start-handler warn:', err.message);
     }
+  });
 }
 
-// Split text into chunks for TTS
-function getSplitTextToChunks(text, maxChars = 500) {
-    const sentences = text.match(/[^.!?\n]+[.!?\n]?/g) || [text];
-    const chunks = [];
-    let current = "";
-
-    for (const sentence of sentences) {
-        if ((current + sentence).length > maxChars) {
-            chunks.push(current.trim());
-            current = sentence;
-        } else {
-            current += sentence;
-        }
-    }
-    if (current.trim()) chunks.push(current.trim());
-    return chunks;
-}
-
-// Read the text (TTS) in voice chat
-async function getSpeech(connection, guildId, text, client, voice) {
-    if (!connection || !text || !text.trim()) return;
-    const chunks = getSplitTextToChunks(text);
-    setEnqueueTTS(guildId, async () => {
-        let player = playerMap.get(guildId);
-        if (!player) {
-            player = createAudioPlayer();
-            playerMap.set(guildId, player);
-            connection.subscribe(player);
-        }
-        for (const chunk of chunks) {
-            try {
-                const response = await getTTS(chunk, "tts-1", voice);
-                const passThrough = new PassThrough();
-                response.pipe(passThrough);
-                const decoder = new prism.FFmpeg({
-                    args: [
-                        '-i', 'pipe:0',
-                        '-f', 's16le',
-                        '-ar', '48000',
-                        '-ac', '2',
-                    ],
-                });
-                const pcmStream = passThrough.pipe(decoder);
-                const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
-                player.play(resource);
-                await new Promise((resolve, reject) => {
-                    player.once(AudioPlayerStatus.Idle, resolve);
-                    player.once('error', reject);
-                });
-                await new Promise(res => setTimeout(res, 100));
-
-            } catch (error) {
-                console.error('[ERROR]:', error);
-            }
-        }
-    });
-}
-
+// ===== Exports =====
 module.exports = {
-    getUserTools,
-    getDefaultPersona,
-    setStartListening,
-    getSpeech,
-    setReplyAsWebhook,
-    getChannelConfig, // liefert jetzt auch blocks
-    setEmptyChat,
-    setBotPresence,
-    setMessageReaction,
-    setAddUserMessage
+  // vom Bot/Handler erwartete Exporte:
+  setEmptyChat,
+  setBotPresence,
+  setMessageReaction,
+  setAddUserMessage,
+  getChannelConfig,
+  setReplyAsWebhook,
+  getSpeech,
+
+  // Voice
+  setStartListening,
 };

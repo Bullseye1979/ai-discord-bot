@@ -22,14 +22,6 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     state.isAIProcessing++;
     await setBotPresence(client, "⏳", "dnd");
 
-    // Immer zuerst: User-Message in den Kontext (inkl. Attachments) schreiben
-    // => auch dann, wenn später wegen fehlender Berechtigung abgebrochen wird
-    try {
-        await setAddUserMessage(message, chatContext);
-    } catch (err) {
-        console.warn("[WARN] Could not add user message to context:", err?.message || err);
-    }
-
     try {
         await message.react("⏳");
 
