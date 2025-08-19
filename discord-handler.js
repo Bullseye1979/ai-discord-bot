@@ -1,7 +1,8 @@
-// Version 2.1
+// Version 2.2
 // Handler for Discord related actions
 // ✨ Korrektur: user (ID) und speaker (Name) werden unabhängig geprüft (ODER-Logik)
-// ✨ Robustere Block-Suche, fallback auf Default-Config wenn kein Block passt
+// ✨ Block-Check: Es muss mindestens 1 Block existieren
+// ✨ Robustere Fehlerausgaben
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence } = require('./discord-helper.js');
@@ -31,9 +32,16 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
             return;
         }
 
+        // Block-Check: mindestens 1 Block muss existieren
+        if (!Array.isArray(channelMeta.blocks) || channelMeta.blocks.length === 0) {
+            await message.reply(`❌ No permission blocks defined in channel ${message.channelId}`);
+            return;
+        }
+
         // passenden Block anhand von User-ID ODER Speaker-Name suchen
         const senderId = String(message.author.id);
         const senderName = message.author.username;
+
         const block = channelMeta.blocks.find(b =>
             (b.user && b.user.includes(senderId)) ||
             (b.speaker && b.speaker.includes(senderName))
@@ -46,6 +54,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
             return;
         }
 
+        // Anfrage an AI
         const output = await getAIResponse(chatContext, null, null, block.model || model, block.apikey || apiKey);
         if (output) {
             await setReplyAsWebhook(message, output, channelMeta || {});
