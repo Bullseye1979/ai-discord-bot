@@ -41,27 +41,6 @@ function getUserTools(nameOrDisplayName) {
     };
 }
 
-// Default Persona laden 
-function getDefaultPersona() {
-    const defaultPath = path.join(__dirname, "channel-config", "default.json");
-    try {
-        const data = fs.readFileSync(defaultPath, "utf8");
-        const json = JSON.parse(data);
-        return {
-            persona: json.persona || "",
-            instructions: json.instructions || "",
-            voice: json.voice || "",
-            name: json.name || "",
-            botname: json.botname || "",
-            selectedTools: json.tools || [],
-            blocks: Array.isArray(json.blocks) ? json.blocks : []
-        };
-    } catch (err) {
-        console.warn("[WARN] Could not load default persona/instructions:", err.message);
-        return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [] };
-    }
-}
-
 // Answer via webhook
 async function setReplyAsWebhook(message, content, config = {}) {
     try {
@@ -88,64 +67,48 @@ async function setReplyAsWebhook(message, content, config = {}) {
 // Get channel based bot configuration
 function getChannelConfig(channelId) {
     const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
-    const defaultConfig = getDefaultPersona();
 
-    let {
-        persona,
-        instructions,
-        voice,
-        name,
-        botname,
-        selectedTools,
-        blocks
-    } = defaultConfig;
-
-    if (fs.existsSync(configPath)) {
-        try {
-            const rawData = fs.readFileSync(configPath, "utf8");
-            const config = JSON.parse(rawData);
-
-            if (typeof config.voice === "string") voice = config.voice;
-            if (typeof config.botname === "string") botname = config.botname;
-            if (typeof config.name === "string") name = config.name;
-            if (typeof config.persona === "string") persona = config.persona;
-            if (typeof config.instructions === "string") instructions = config.instructions;
-
-            // Channel-weite (nicht block-spezifische) Tools für Default-Kontext
-            if (Array.isArray(config.tools)) {
-                selectedTools = config.tools;
-            }
-
-            // ✨ NEU: Blocks mit ausliefern
-            if (Array.isArray(config.blocks)) {
-                blocks = config.blocks;
-            } else {
-                blocks = [];
-            }
-        } catch (err) {
-            console.error(`[ERROR] Failed to load channel config for ${channelId}:`, err.message);
-        }
+    if (!fs.existsSync(configPath)) {
+        // Keine Config vorhanden → Bot reagiert nicht
+        return null;
     }
 
-    const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
+    try {
+        const rawData = fs.readFileSync(configPath, "utf8");
+        const config = JSON.parse(rawData);
 
-    const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-    const avatarUrl = fs.existsSync(avatarPath)
-        ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
-        : `https://ralfreschke.de/documents/avatars/default.png`;
+        const persona = typeof config.persona === "string" ? config.persona : "";
+        const instructions = typeof config.instructions === "string" ? config.instructions : "";
+        const voice = typeof config.voice === "string" ? config.voice : "";
+        const name = typeof config.name === "string" ? config.name : "";
+        const botname = typeof config.botname === "string" ? config.botname : "";
+        const selectedTools = Array.isArray(config.tools) ? config.tools : [];
+        const blocks = Array.isArray(config.blocks) ? config.blocks : [];
 
-    return {
-        name,
-        botname,
-        voice,
-        persona,
-        avatarUrl,
-        instructions,
-        tools: ctxTools,
-        toolRegistry,
-        blocks // <- wichtig für Berechtigungsprüfung
-    };
+        const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
+
+        const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
+        const avatarUrl = fs.existsSync(avatarPath)
+            ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
+            : `https://ralfreschke.de/documents/avatars/default.png`;
+
+        return {
+            name,
+            botname,
+            voice,
+            persona,
+            avatarUrl,
+            instructions,
+            tools: ctxTools,
+            toolRegistry,
+            blocks
+        };
+    } catch (err) {
+        console.error(`[ERROR] Failed to load channel config for ${channelId}:`, err.message);
+        return null; // Fehler beim Laden → keine Config
+    }
 }
+
 
 // Set the status that the bot presents
 async function setBotPresence(client, activityText, status, activityType = 4) {
@@ -448,7 +411,6 @@ async function getSpeech(connection, guildId, text, client, voice) {
 
 module.exports = {
     getUserTools,
-    getDefaultPersona,
     setStartListening,
     getSpeech,
     setReplyAsWebhook,
