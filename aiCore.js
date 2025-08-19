@@ -14,6 +14,11 @@ async function getAIResponse(
     model = "gpt-4-turbo",
     apiKey = null
 ) {
+    if (tokenlimit == null)
+    {
+        tokenlimit=4096;
+    }
+    
     const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
     context.messages = [...context_orig.messages];
 
