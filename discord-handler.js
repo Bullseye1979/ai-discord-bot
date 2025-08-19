@@ -10,7 +10,7 @@ const {
     setStartListening,
     getSpeech,
     setMessageReaction,
-    getChannelMeta,
+    getChannelConfig,
     setReplyAsWebhook
 } = require('./discord-helper.js');
 const { getContextAsChunks } = require('./helper.js');
@@ -25,8 +25,8 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     try {
         await message.react("⏳");
 
-        const channelMeta = getChannelMeta(message.channelId);
-        if (!channelMeta || !channelMeta.blocks || channelMeta.blocks.length === 0) {
+        const channelConfig = getChannelConfig(message.channelId);
+        if (!channelConfig || !channelConfig.blocks || channelConfig.blocks.length === 0) {
             // keine ChannelConfig oder keine Blocks → stillschweigend abbrechen
             return;
         }
@@ -34,7 +34,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         // passenden Block anhand von User-ID ODER Speaker-Name suchen
         const senderId = String(message.author.id);
         const senderName = message.author.username;
-        const block = channelMeta.blocks.find(b =>
+        const block = channelConfig.blocks.find(b =>
             (b.user && b.user.includes(senderId)) ||
             (b.speaker && b.speaker.includes(senderName))
         );
@@ -46,8 +46,8 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
         const output = await getAIResponse(chatContext, null, null, block.model || model, block.apikey || apiKey);
         if (output) {
-            await setReplyAsWebhook(message, output, channelMeta || {});
-            chatContext.add("assistant", channelMeta?.botname || "AI", output);
+            await setReplyAsWebhook(message, output, channelConfig || {});
+            chatContext.add("assistant", channelConfig?.botname || "AI", output);
         }
     } catch (err) {
         console.error("[ERROR]: Failed to process request:", err);
@@ -69,7 +69,6 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 async function setClearChat(message, contextStorage) {
     if (!message.member.permissions.has("ManageMessages")) return;
     await setEmptyChat(message.channel);
-    contextStorage.delete(message.channelId);
 }
 
 // Enter a voice channel and start listening
@@ -94,7 +93,7 @@ async function setTTS(message, client, guildTextChannels) {
     const expectedChannelId = guildTextChannels.get(guildId);
     if (message.channel.id !== expectedChannelId) return;
 
-    const meta = getChannelMeta(message.channelId);
+    const meta = getChannelConfig(message.channelId);
     if (!meta) return; // keine Channel-Config -> keine Ausgabe
 
     const { botname, voice } = meta;
