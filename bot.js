@@ -10,7 +10,7 @@ const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const path = require('path');
 const Context = require('./context.js');
-const { getChannelConfig, resolveChannelConfig, setAddUserMessage, setBotPresence } = require('./discord-helper.js');
+const { getChannelConfig, setAddUserMessage, setBotPresence } = require('./discord-helper.js');
 const fs = require("fs");
 const { getImage } = require("./image"); // nutzt DALL·E
 const {
@@ -105,7 +105,7 @@ client.on('messageCreate', async (message) => {
     const speaker = isWebhook ? (await getSpeakerName(message)) : null;
 
     // 3) Passenden Block auflösen (user/speaker/defaults). Wenn null -> NICHT reagieren.
-    const resolved = resolveChannelConfig(message.channelId, { userId, speaker });
+    const resolved = getChannelConfig(message.channelId, { userId, speaker });
     if (!resolved) return;
 
     // 4) Context-Storage pro Sender (damit unterschiedliche Blocks getrennt laufen)
