@@ -1,7 +1,7 @@
 // Version 2.1
 // Handler for Discord related actions
-// ✨ Erweiterung: Zugriff wird anhand von userId oder speakerName geprüft
-// ✨ getProcessAIRequest zieht model + apiKey aus Block
+// ✨ Korrektur: user (ID) und speaker (Name) werden unabhängig geprüft (ODER-Logik)
+// ✨ Robustere Block-Suche, fallback auf Default-Config wenn kein Block passt
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence } = require('./discord-helper.js');
@@ -15,40 +15,38 @@ const {
 } = require('./discord-helper.js');
 const { getContextAsChunks } = require('./helper.js');
 
-// Zugriff prüfen: ist User oder Speaker erlaubt?
-function getBlockForMessage(channelMeta, message) {
-    if (!channelMeta?.blocks) return null;
-
-    const senderId = message.author?.id;
-    const senderName = message.webhookId ? message.author?.username : message.author?.username;
-
-    return channelMeta.blocks.find(block =>
-        (block.user && block.user.includes(senderId)) ||
-        (block.speaker && block.speaker.includes(senderName))
-    );
-}
-
 // Run an AI request
-async function getProcessAIRequest(message, chatContext, client, state) {
+async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
     if (state.isAIProcessing >= 3) return setMessageReaction(message, "❌");
-
-    const channelMeta = getChannelMeta(message.channelId);
-    if (!channelMeta) return; // keine Channel-Config
-
-    const block = getBlockForMessage(channelMeta, message);
-    if (!block) {
-        console.log(`❌ No permissions for ${message.author.username} (${message.author.id}) in channel ${message.channelId}`);
-        return;
-    }
-
-    const { model, apikey } = block;
 
     state.isAIProcessing++;
     await setBotPresence(client, "⏳", "dnd");
 
     try {
         await message.react("⏳");
-        const output = await getAIResponse(chatContext, null, null, model, apikey);
+
+        const channelMeta = getChannelMeta(message.channelId);
+        if (!channelMeta) {
+            await message.reply("❌ No channel configuration found.");
+            return;
+        }
+
+        // passenden Block anhand von User-ID ODER Speaker-Name suchen
+        const senderId = String(message.author.id);
+        const senderName = message.author.username;
+        const block = channelMeta.blocks.find(b =>
+            (b.user && b.user.includes(senderId)) ||
+            (b.speaker && b.speaker.includes(senderName))
+        );
+
+        if (!block) {
+            await message.reply(
+                `❌ No permissions for ${senderName} (${senderId}) in channel ${message.channelId}`
+            );
+            return;
+        }
+
+        const output = await getAIResponse(chatContext, null, null, block.model || model, block.apikey || apiKey);
         if (output) {
             await setReplyAsWebhook(message, output, channelMeta || {});
             chatContext.add("assistant", channelMeta?.botname || "AI", output);
@@ -56,7 +54,7 @@ async function getProcessAIRequest(message, chatContext, client, state) {
             await message.reply("[ERROR]: No response from AI.");
         }
     } catch (err) {
-        await message.reply("[ERROR]: Failed to process request." + err);
+        await message.reply("[ERROR]: Failed to process request. " + err);
     } finally {
         state.isAIProcessing--;
         if (state.isAIProcessing === 0) {
