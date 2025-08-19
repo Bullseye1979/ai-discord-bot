@@ -1,16 +1,20 @@
-// Version 2.0
+// Version 2.1
 // Provides the AI Functionality for the main process (tool_calls, length management, final answer)
 // Änderungen:
-// - Safe-Messages: 'name' wird vor API-Call entfernt; Sprecher optional als Tag im content.
-// - max_tokens nur senden, wenn Zahl > 0; zusätzlich Fallback auf 4096 wenn null/undefined.
-// - Tool-Calls korrekt durchreichen (assistant.tool_calls / tool.tool_call_id).
+// - Sprecherinformationen bleiben im Context (name).
+// - Nur für den API-Call werden Sprecher temporär als Tags in den content gehoben.
+// - Nach dem API-Call werden Tags aus der Modell-Antwort entfernt, bevor wir sie zurückgeben oder in den Context schreiben.
+// - 'name' wird nie an die API gesendet (vermeidet 500er).
+// - max_tokens wird nur gesendet, wenn es eine Zahl > 0 ist; zusätzlich Fallback, falls Aufrufer null/undefined liefert.
 
 require('dotenv').config();
 const axios = require('axios');
 const { OPENAI_API_URL } = require('./config.js');
 const Context = require('./context.js');
 
-// ---- Helpers -------------------------------------------------------------
+// ------------------------------------------------------
+// Helpers
+// ------------------------------------------------------
 
 function sanitizeSpeakerTag(s) {
   return String(s || "")
@@ -21,39 +25,46 @@ function sanitizeSpeakerTag(s) {
     .slice(0, 64);
 }
 
-/**
- * Entfernt problematische Felder (name) und versieht Inhalte optional mit Sprecher-Tags.
- * - assistant mit tool_calls: nur tool_calls senden, keinen content
- * - tool: content + tool_call_id
- * - andere: content (+ optional Sprecher-Tag)
- */
-function toSafeMessages(messages, { tagSpeakers = true } = {}) {
+// Tags nur temporär für den API-Call einbetten.
+// WICHTIG: Wir taggen NUR USER-/SYSTEM-Nachrichten, NICHT assistant.
+// So reduziert sich die Wahrscheinlichkeit, dass das Modell die Tags „nachahmt“.
+function toSafeMessages(messages) {
   return messages.map(m => {
-    // assistant mit tool_calls -> spezieller Nachrichten-Typ
+    // assistant mit tool_calls -> spezieller Nachrichtentyp (kein content + name)
     if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
       return { role: "assistant", tool_calls: m.tool_calls };
     }
 
-    // tool-Nachricht
+    // tool-Nachrichten: content + tool_call_id
     if (m.role === "tool") {
       const out = { role: "tool", content: m.content ?? "" };
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
       return out;
     }
 
-    // normale Nachricht
-    const out = { role: m.role, content: m.content ?? "" };
+    // normale Nachrichten
+    let content = m.content ?? "";
 
-    // Sprecher als Tag in den Content heben (verhindert API-Fehler durch 'name', erhält Auswertbarkeit)
-    if (tagSpeakers && m.name) {
+    // Nur USER und SYSTEM bekommen temporäre Sprecher-Tags (falls name vorhanden)
+    if ((m.role === "user" || m.role === "system") && m.name) {
       const tag = sanitizeSpeakerTag(m.name);
-      out.content = `【speaker:${tag}】\n${out.content}`;
+      content = `【speaker:${tag}】\n${content}`;
     }
-    return out;
+
+    // 'name' NIE mitsenden
+    return { role: m.role, content };
   });
 }
 
-// ---- Main ----------------------------------------------------------------
+// Entfernt alle temporären Sprecher-Tags aus Text (für Anzeige + Kontextspeicherung)
+function stripSpeakerMarkers(text) {
+  if (!text) return text;
+  return text.replace(/【speaker:[^】]+】\s*\n?/g, "").trim();
+}
+
+// ------------------------------------------------------
+// Main
+// ------------------------------------------------------
 
 async function getAIResponse(
   context_orig,
@@ -62,9 +73,10 @@ async function getAIResponse(
   model = "gpt-4-turbo",
   apiKey = null
 ) {
-  // Robustes Handling: null/undefined -> 4096
+  // robust gegen null/undefined
   if (tokenlimit == null) tokenlimit = 4096;
 
+  // Arbeitskontexte aufsetzen (ändern NICHT deinen Original-Kontext)
   const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
   context.messages = [...context_orig.messages];
 
@@ -73,7 +85,7 @@ async function getAIResponse(
 
   const toolRegistry = context.toolRegistry;
 
-  // Zeit als System-Message injizieren (ohne name)
+  // Zeit als System-Message (ohne name)
   const nowUtc = new Date().toISOString();
   context.messages.unshift({
     role: "system",
@@ -91,8 +103,8 @@ async function getAIResponse(
   const authKey = apiKey || process.env.OPENAI_API_KEY;
 
   do {
-    // Sichere Messages für die API erzeugen
-    const safeMessages = toSafeMessages(context.messages, { tagSpeakers: true });
+    // Nur für den API-Call: Sprecher -> temporäre Tags in content (user/system)
+    const safeMessages = toSafeMessages(context.messages);
 
     const payload = {
       model,
@@ -129,17 +141,19 @@ async function getAIResponse(
 
     hasToolCalls = aiMessage.tool_calls && aiMessage.tool_calls.length > 0;
 
-    // Wichtig: Im lokalen Verlauf darf 'name' weiterhin existieren (aus context_orig),
-    // aber an die API haben wir es NICHT gesendet.
+    // Assistant-Toolcalls in unseren Arbeitskontext übernehmen
     if (aiMessage.tool_calls) {
-      // assistant Nachricht mit tool_calls in den Verlauf übernehmen
       context.messages.push({
         role: "assistant",
         tool_calls: aiMessage.tool_calls || null
       });
     }
+
+    // Die Antwort des Modells kann (selten) Tags „nachahmen“.
+    // Wir entfernen ALLE Tags aus dem Rückkanal, BEVOR wir sie zurückgeben oder in den Original-Kontext schreiben.
     if (aiMessage.content) {
-      responseMessage += aiMessage.content.trim();
+      const cleaned = stripSpeakerMarkers(aiMessage.content.trim());
+      responseMessage += cleaned;
     }
 
     if (hasToolCalls) {
@@ -159,7 +173,7 @@ async function getAIResponse(
           const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse);
           lastmessage = toolResult;
 
-          // tool-Antwort in den Verlauf (mit tool_call_id)
+          // tool-Antworten in Arbeitskontext (werden beim nächsten Turn als tool gelesen)
           context.messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
@@ -175,10 +189,11 @@ async function getAIResponse(
         }
       }
     } else {
-      // keine Tool-Calls; wenn letztes Tool etwas erzeugt hat, das in den Originalkontext soll:
+      // keine Tool-Calls; evtl. Tool-Nachricht in den Originalkontext spiegeln
       if (lastmessage) {
-        // Beachte: context_orig.add(name) schreibt evtl. 'name' – intern ok.
-        context_orig.add("assistant", "", lastmessage);
+        // In den ORIGINAL-Kontext OHNE Tags zurückschreiben
+        const cleanedTool = stripSpeakerMarkers(String(lastmessage));
+        context_orig.add("assistant", "", cleanedTool);
       }
     }
 
@@ -195,7 +210,8 @@ async function getAIResponse(
 
   } while (hasToolCalls || continueResponse);
 
-  return responseMessage;
+  // Rückgabe an Aufrufer: ebenfalls ohne Tags
+  return stripSpeakerMarkers(responseMessage);
 }
 
 module.exports = { getAIResponse };
