@@ -1,7 +1,7 @@
-// Version 2.0
+// Version 2.1
 // Handler for Discord related actions
-// ✨ NEU: getProcessAIRequest akzeptiert model + apiKey
-// ✨ Anpassungen: Verwendung von getChannelMeta statt getChannelConfig
+// ✨ Erweiterung: Zugriff wird anhand von userId oder speakerName geprüft
+// ✨ getProcessAIRequest zieht model + apiKey aus Block
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence } = require('./discord-helper.js');
@@ -10,23 +10,46 @@ const {
     setStartListening,
     getSpeech,
     setMessageReaction,
-    getChannelMeta,         // NEU
+    getChannelMeta,
     setReplyAsWebhook
 } = require('./discord-helper.js');
 const { getContextAsChunks } = require('./helper.js');
 
+// Zugriff prüfen: ist User oder Speaker erlaubt?
+function getBlockForMessage(channelMeta, message) {
+    if (!channelMeta?.blocks) return null;
+
+    const senderId = message.author?.id;
+    const senderName = message.webhookId ? message.author?.username : message.author?.username;
+
+    return channelMeta.blocks.find(block =>
+        (block.user && block.user.includes(senderId)) ||
+        (block.speaker && block.speaker.includes(senderName))
+    );
+}
+
 // Run an AI request
-async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
+async function getProcessAIRequest(message, chatContext, client, state) {
     if (state.isAIProcessing >= 3) return setMessageReaction(message, "❌");
+
+    const channelMeta = getChannelMeta(message.channelId);
+    if (!channelMeta) return; // keine Channel-Config
+
+    const block = getBlockForMessage(channelMeta, message);
+    if (!block) {
+        console.log(`❌ No permissions for ${message.author.username} (${message.author.id}) in channel ${message.channelId}`);
+        return;
+    }
+
+    const { model, apikey } = block;
 
     state.isAIProcessing++;
     await setBotPresence(client, "⏳", "dnd");
 
     try {
         await message.react("⏳");
-        const output = await getAIResponse(chatContext, null, null, model, apiKey);
+        const output = await getAIResponse(chatContext, null, null, model, apikey);
         if (output) {
-            const channelMeta = getChannelMeta(message.channelId);
             await setReplyAsWebhook(message, output, channelMeta || {});
             chatContext.add("assistant", channelMeta?.botname || "AI", output);
         } else {
