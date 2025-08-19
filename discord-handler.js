@@ -1,18 +1,12 @@
-// Version 2.2
+// Version 2.5
 // Handler for Discord related actions
-// ✨ Änderung: Wenn kein passender Block gefunden wird, ignoriert der Bot die Nachricht komplett
-// ✨ ODER-Logik für userId und speakerName
+// ✨ Reaktionen: ⏳ während Verarbeitung, ❌ bei fehlender Permission/Blocks, ✅ bei erfolgreicher AI-Antwort
+// ✨ ODER-Logik: userId ODER speakerName müssen matchen
+// ✨ Kein Tokenverbrauch bei fehlender Permission (kein AI-Call)
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
-const { setEmptyChat, setBotPresence } = require('./discord-helper.js');
+const { setEmptyChat, setBotPresence, getChannelConfig, setReplyAsWebhook, setStartListening, getSpeech, setMessageReaction } = require('./discord-helper.js');
 const { getAIResponse } = require('./aiCore.js');
-const {
-    setStartListening,
-    getSpeech,
-    setMessageReaction,
-    getChannelConfig,
-    setReplyAsWebhook
-} = require('./discord-helper.js');
 const { getContextAsChunks } = require('./helper.js');
 
 // Run an AI request
@@ -22,35 +16,61 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     state.isAIProcessing++;
     await setBotPresence(client, "⏳", "dnd");
 
+    let output = null;
+    let denied = false;
+
     try {
-        await message.react("⏳");
+        // Erste optische Rückmeldung
+        try { await message.react("⏳"); } catch (_) {}
 
         const channelConfig = getChannelConfig(message.channelId);
-        if (!channelConfig || !channelConfig.blocks || channelConfig.blocks.length === 0) {
-            // keine ChannelConfig oder keine Blocks → stillschweigend abbrechen
+
+        // Keine Config oder keine Blocks -> ablehnen (❌) und NICHTS weiter tun
+        if (!channelConfig || !Array.isArray(channelConfig.blocks) || channelConfig.blocks.length === 0) {
+            denied = true;
             return;
         }
 
-        // passenden Block anhand von User-ID ODER Speaker-Name suchen
+        // passenden Block anhand von User-ID ODER Speaker-Name suchen (ODER-Logik)
         const senderId = String(message.author.id);
         const senderName = message.author.username;
+
         const block = channelConfig.blocks.find(b =>
-            (b.user && b.user.includes(senderId)) ||
-            (b.speaker && b.speaker.includes(senderName))
+            (Array.isArray(b.user) && b.user.map(String).includes(senderId)) ||
+            (Array.isArray(b.speaker) && b.speaker.includes(senderName))
         );
 
         if (!block) {
-            // kein Permission-Block gefunden → gar nichts tun
+            // Kein Permission-Block gefunden -> still ablehnen (❌), KEIN AI-Call
+            denied = true;
             return;
         }
 
-        const output = await getAIResponse(chatContext, null, null, block.model || model, block.apikey || apiKey);
+        // AI-Call mit block-spezifischem model/apikey
+        const useModel = block.model || model;
+        const useApiKey = block.apikey || apiKey;
+
+        // Tools/Registry für diesen Request auf Block einschränken (falls dein Context das unterstützt)
+        const prevTools = chatContext.tools;
+        const prevRegistry = chatContext.toolRegistry;
+
+        // Wenn du eine tools-Auswahl pro Block erzwingen willst, kannst du sie hier setzen:
+        // (chatContext.tools = ...; chatContext.toolRegistry = ...;) – abhängig von deiner tools.js-API.
+
+        output = await getAIResponse(chatContext, null, null, useModel, useApiKey);
+
+        // Tools/Registry zurücksetzen
+        chatContext.tools = prevTools;
+        chatContext.toolRegistry = prevRegistry;
+
         if (output) {
             await setReplyAsWebhook(message, output, channelConfig || {});
             chatContext.add("assistant", channelConfig?.botname || "AI", output);
         }
     } catch (err) {
+        // Bei Fehlern still bleiben (kein Reply in den Chat, um TTS zu sparen)
         console.error("[ERROR]: Failed to process request:", err);
+        denied = true; // Zeige ❌ als Signal, dass es nicht geklappt hat
     } finally {
         state.isAIProcessing--;
         if (state.isAIProcessing === 0) {
@@ -58,7 +78,12 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         }
         try {
             await message.reactions.removeAll();
-            await message.react("✅");
+            if (denied) {
+                await message.react("❌");
+            } else if (output) {
+                await message.react("✅");
+            }
+            // Wenn weder denied noch output: keine Reaktion setzen (z. B. bei leerer Antwort)
         } catch (err) {
             console.warn("[WARN]: Could not modify final reactions:", err);
         }
@@ -69,6 +94,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 async function setClearChat(message, contextStorage) {
     if (!message.member.permissions.has("ManageMessages")) return;
     await setEmptyChat(message.channel);
+    contextStorage.delete(message.channelId);
 }
 
 // Enter a voice channel and start listening
