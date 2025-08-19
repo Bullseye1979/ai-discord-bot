@@ -1,87 +1,92 @@
-// Version 2.6
+// Version 2.4
 // Handler for Discord related actions
-// ✨ Reaktionen: ⏳ während Verarbeitung, ❌ bei fehlender Permission/Blocks, ✅ bei erfolgreicher AI-Antwort
-// ✨ ODER-Logik: userId ODER speakerName müssen matchen
-// ✨ Block-Tools werden für den AI-Call in den Context injiziert (u.a. getImage)
+// ✨ ODER-Logik für user (ID) und speaker (Name)
+// ✨ Silent-Deny: keine Antwort/kein TTS bei fehlender Permission
+// ✨ Abgelehnte Prompts werden trotzdem in den Kontext geschrieben
+// ✨ Rotes ❌ bei Ablehnung, ✅ bei erfolgreicher Verarbeitung
+// ✨ Verwendet getChannelConfig (nicht getChannelMeta)
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
+const { setEmptyChat, setBotPresence } = require('./discord-helper.js');
+const { getAIResponse } = require('./aiCore.js');
 const {
-  setEmptyChat,
-  setBotPresence,
-  getChannelConfig,
-  setReplyAsWebhook,
   setStartListening,
   getSpeech,
-  setMessageReaction
-} = require("./discord-helper.js");
-const { getAIResponse } = require("./aiCore.js");
-const { getContextAsChunks } = require("./helper.js");
-const { getToolRegistry } = require("./tools.js");
+  setMessageReaction,
+  getChannelConfig,
+  setReplyAsWebhook,
+  setAddUserMessage, // <— wichtig für Kontext-Schreiben auch bei Ablehnung
+} = require('./discord-helper.js');
+const { getContextAsChunks } = require('./helper.js');
 
 // Run an AI request
-async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
+async function getProcessAIRequest(message, chatContext, client, state, model) {
+  // Flood-Guard
   if (state.isAIProcessing >= 3) return setMessageReaction(message, "❌");
 
   state.isAIProcessing++;
   await setBotPresence(client, "⏳", "dnd");
 
-  let output = null;
-  let denied = false;
+  let wasRejected = false;
 
   try {
-    try { await message.react("⏳"); } catch (_) {}
+    await message.react("⏳");
 
+    // Channel-Config laden
     const channelConfig = getChannelConfig(message.channelId);
-
-    // Keine Config oder keine Blocks -> ablehnen (❌) und NICHTS weiter tun
-    if (!channelConfig || !Array.isArray(channelConfig.blocks) || channelConfig.blocks.length === 0) {
-      denied = true;
-      return;
+    if (!channelConfig) {
+      // Prompt trotzdem in den Kontext aufnehmen
+      await setAddUserMessage(message, chatContext);
+      wasRejected = true; // keine Antwort senden
+      return; // silent deny
     }
 
-    // passenden Block anhand von User-ID ODER Speaker-Name suchen (ODER-Logik)
-    const senderId = String(message.author.id);
-    const senderName = message.author.username;
+    const blocks = Array.isArray(channelConfig.blocks) ? channelConfig.blocks : [];
+    if (blocks.length === 0) {
+      // Prompt trotzdem in den Kontext aufnehmen
+      await setAddUserMessage(message, chatContext);
+      wasRejected = true; // keine Antwort senden
+      return; // silent deny
+    }
 
-    const block = channelConfig.blocks.find(
-      (b) =>
-        (Array.isArray(b.user) && b.user.map(String).includes(senderId)) ||
-        (Array.isArray(b.speaker) && b.speaker.includes(senderName))
-    );
+    // Absenderdaten
+    const senderId = String(message.author?.id || "");
+    const senderName = message.member?.displayName || message.author?.username || "";
+
+    // Passenden Block via ODER-Logik suchen
+    const block = blocks.find(b => {
+      const okUser = Array.isArray(b.user) && b.user.map(String).includes(senderId);
+      const okSpeaker = Array.isArray(b.speaker) && b.speaker.includes(senderName);
+      return okUser || okSpeaker;
+    });
 
     if (!block) {
-      // Kein Permission-Block gefunden -> still ablehnen (❌), KEIN AI-Call
-      denied = true;
-      return;
+      // Prompt trotzdem in den Kontext aufnehmen
+      await setAddUserMessage(message, chatContext);
+      wasRejected = true; // keine Antwort senden
+      return; // silent deny
     }
 
-    // 🔹 Block-Tools ermitteln und temporär in den Context injizieren
-    const requestedToolNames = Array.isArray(block.tools) ? block.tools : [];
-    const { tools: blockTools, registry: blockRegistry } = getToolRegistry(requestedToolNames);
-
-    const prevTools = chatContext.tools;
-    const prevRegistry = chatContext.toolRegistry;
-
-    chatContext.tools = blockTools;           // z.B. enthält getImage
-    chatContext.toolRegistry = blockRegistry; // Funktionen-Mapping inkl. getImage
-
-    // AI-Call mit block-spezifischem model/apikey
-    const useModel = block.model || model;
-    const useApiKey = block.apikey || apiKey;
-
-    output = await getAIResponse(chatContext, null, null, useModel, useApiKey);
-
-    // Tools/Registry zurücksetzen
-    chatContext.tools = prevTools;
-    chatContext.toolRegistry = prevRegistry;
+    // ✅ Erlaubt: (User-Message ist i.d.R. schon im Kontext; NICHT doppelt hinzufügen)
+    const output = await getAIResponse(
+      chatContext,
+      null,           // tokenlimit (Default aus aiCore)
+      null,           // sequenceLimit
+      block.model || model || "gpt-4" // Modell aus Block bevorzugen
+    );
 
     if (output) {
       await setReplyAsWebhook(message, output, channelConfig || {});
-      chatContext.add("assistant", channelConfig?.botname || "AI", output);
+      chatContext.add("assistant", channelConfig.botname || "AI", output);
+    } else {
+      // Kein Output von der AI => kurze Fehlermarkierung, aber keine Textantwort
+      await setMessageReaction(message, "❌");
     }
+
   } catch (err) {
+    // Fehler: keine Textantwort posten (still), nur kurze Fehler-Reaktion
     console.error("[ERROR]: Failed to process request:", err);
-    denied = true;
+    wasRejected = true;
   } finally {
     state.isAIProcessing--;
     if (state.isAIProcessing === 0) {
@@ -89,11 +94,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     }
     try {
       await message.reactions.removeAll();
-      if (denied) {
-        await message.react("❌");
-      } else if (output) {
-        await message.react("✅");
-      }
+      await message.react(wasRejected ? "❌" : "✅");
     } catch (err) {
       console.warn("[WARN]: Could not modify final reactions:", err);
     }
@@ -115,7 +116,7 @@ async function setVoiceChannel(message, guildTextChannels, activeRecordings, cha
     channelId: channel.id,
     guildId: message.guild.id,
     adapterCreator: message.guild.voiceAdapterCreator,
-    selfDeaf: false
+    selfDeaf: false,
   });
   guildTextChannels.set(message.guild.id, message.channel.id);
   setStartListening(connection, message.guild.id, guildTextChannels, activeRecordings, client);
@@ -129,10 +130,7 @@ async function setTTS(message, client, guildTextChannels) {
   const expectedChannelId = guildTextChannels.get(guildId);
   if (message.channel.id !== expectedChannelId) return;
 
-  const meta = getChannelConfig(message.channelId);
-  if (!meta) return; // keine Channel-Config -> keine Ausgabe
-
-  const { botname, voice } = meta;
+  const { botname, voice } = getChannelConfig(message.channelId);
 
   const isDirectBot = message.author.id === client.user.id;
   let isAIWebhook = false;
@@ -140,7 +138,7 @@ async function setTTS(message, client, guildTextChannels) {
   if (message.webhookId) {
     try {
       const webhooks = await message.channel.fetchWebhooks();
-      const matching = webhooks.find((w) => w.id === message.webhookId);
+      const matching = webhooks.find(w => w.id === message.webhookId);
       if (matching && matching.name === botname) {
         isAIWebhook = true;
       }
@@ -151,6 +149,7 @@ async function setTTS(message, client, guildTextChannels) {
 
   if (!isDirectBot && !isAIWebhook) return;
 
+  // Bot muss im Voice-Channel sitzen
   const botMember = await message.guild.members.fetch(client.user.id);
   const botVC = botMember.voice.channelId;
   if (!botVC) return;
@@ -158,11 +157,12 @@ async function setTTS(message, client, guildTextChannels) {
   const connection = getVoiceConnection(guildId);
   if (!connection || connection.joinConfig.channelId !== botVC) return;
 
+  // Inhalt für TTS säubern
   const cleaned = message.content
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
-    .replace(/https?:\/\/\S+/g, "Link")
-    .replace(/<@!?(\d+)>/g, "jemand")
-    .replace(/:[^:\s]+:/g, "");
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, 'Link')
+    .replace(/<@!?(\d+)>/g, 'jemand')
+    .replace(/:[^:\s]+:/g, '');
 
   if (cleaned.trim()) {
     await getSpeech(connection, guildId, cleaned, client, voice);
