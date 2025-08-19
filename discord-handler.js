@@ -1,8 +1,8 @@
-// Version 2.2
+// Version 2.3
 // Handler for Discord related actions
-// ✨ Korrektur: user (ID) und speaker (Name) werden unabhängig geprüft (ODER-Logik)
+// ✨ ODER-Logik: user (ID) ODER speaker (Name) müssen matchen
 // ✨ Block-Check: Es muss mindestens 1 Block existieren
-// ✨ Robustere Fehlerausgaben
+// ✨ Pro-Block-Einstellungen: model, apikey, tools werden pro Request gesetzt
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence } = require('./discord-helper.js');
@@ -11,13 +11,14 @@ const {
     setStartListening,
     getSpeech,
     setMessageReaction,
-    getChannelMeta,
+    getChannelConfig,
     setReplyAsWebhook
 } = require('./discord-helper.js');
 const { getContextAsChunks } = require('./helper.js');
+const { getToolRegistry } = require('./tools.js');
 
 // Run an AI request
-async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
+async function getProcessAIRequest(message, chatContext, client, state, fallbackModel, fallbackApiKey) {
     if (state.isAIProcessing >= 3) return setMessageReaction(message, "❌");
 
     state.isAIProcessing++;
@@ -26,14 +27,14 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     try {
         await message.react("⏳");
 
-        const channelMeta = getChannelMeta(message.channelId);
-        if (!channelMeta) {
+        const channelConfig = getChannelConfig(message.channelId);
+        if (!channelConfig) {
             await message.reply("❌ No channel configuration found.");
             return;
         }
 
         // Block-Check: mindestens 1 Block muss existieren
-        if (!Array.isArray(channelMeta.blocks) || channelMeta.blocks.length === 0) {
+        if (!Array.isArray(channelConfig.blocks) || channelConfig.blocks.length === 0) {
             await message.reply(`❌ No permission blocks defined in channel ${message.channelId}`);
             return;
         }
@@ -42,9 +43,9 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         const senderId = String(message.author.id);
         const senderName = message.author.username;
 
-        const block = channelMeta.blocks.find(b =>
-            (b.user && b.user.includes(senderId)) ||
-            (b.speaker && b.speaker.includes(senderName))
+        const block = channelConfig.blocks.find(b =>
+            (Array.isArray(b.user) && b.user.map(String).includes(senderId)) ||
+            (Array.isArray(b.speaker) && b.speaker.includes(senderName))
         );
 
         if (!block) {
@@ -54,11 +55,29 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
             return;
         }
 
-        // Anfrage an AI
-        const output = await getAIResponse(chatContext, null, null, block.model || model, block.apikey || apiKey);
+        // Tools/Registry für diesen Request nach Block einschränken
+        const requestedToolNames = Array.isArray(block.tools) ? block.tools : [];
+        const { tools: blockTools, registry: blockRegistry } = getToolRegistry(requestedToolNames);
+
+        // Vorherige Tools/Registry sichern und für den Call überschreiben
+        const prevTools = chatContext.tools;
+        const prevRegistry = chatContext.toolRegistry;
+        chatContext.tools = blockTools;
+        chatContext.toolRegistry = blockRegistry;
+
+        // Anfrage an AI mit block-spezifischem model/apikey
+        const useModel = block.model || fallbackModel || "gpt-4-turbo";
+        const useApiKey = block.apikey || fallbackApiKey || null;
+
+        const output = await getAIResponse(chatContext, null, null, useModel, useApiKey);
+
+        // Tools/Registry wiederherstellen (für nachfolgende Nutzer im selben Channel)
+        chatContext.tools = prevTools;
+        chatContext.toolRegistry = prevRegistry;
+
         if (output) {
-            await setReplyAsWebhook(message, output, channelMeta || {});
-            chatContext.add("assistant", channelMeta?.botname || "AI", output);
+            await setReplyAsWebhook(message, output, channelConfig || {});
+            chatContext.add("assistant", channelConfig?.botname || "AI", output);
         } else {
             await message.reply("[ERROR]: No response from AI.");
         }
@@ -107,10 +126,7 @@ async function setTTS(message, client, guildTextChannels) {
     const expectedChannelId = guildTextChannels.get(guildId);
     if (message.channel.id !== expectedChannelId) return;
 
-    const meta = getChannelMeta(message.channelId);
-    if (!meta) return; // keine Channel-Config -> keine Ausgabe
-
-    const { botname, voice } = meta;
+    const { botname, voice } = getChannelConfig(message.channelId);
 
     const isDirectBot = message.author.id === client.user.id;
     let isAIWebhook = false;
