@@ -1,5 +1,5 @@
 // discord-helper.js
-// Version 3.0
+// Version 3.1
 // - Voice-Transkription (Whisper) -> als Webhook-Nachricht im Textkanal posten (username = Sprecher)
 // - Diese Webhook-Nachrichten werden wie normale User-Messages vom Bot verarbeitet und landen dadurch im Chat-Kontext
 // - TTS-Ausgabe für AI-Antworten im Voice-Channel
@@ -98,7 +98,6 @@ async function setReplyAsWebhook(message, text, { botname = 'AI', avatarUrl = nu
 
 /**
  * Fügt eine eingehende Textnachricht in den Chat-Kontext.
- * Achtung: Der eigentliche Kontext wird im Bot an Context gebunden – hier nur die Brücke.
  * Erwartet: chatContext (Context-Instanz), message (Discord.js Message)
  */
 async function setAddUserMessage(message, chatContext) {
@@ -283,6 +282,37 @@ function writeWavFile(filePath, pcmBuffer) {
 }
 
 /**
+ * (Optional) sehr einfacher VAD / Plausibilitätscheck.
+ * Standard: 48 kHz, Mindestlänge ~1.0 s, leichte SNR/Volume-Schwellen.
+ */
+function getIsSpeechDetected(filePath, sampleRate = 48000) {
+  try {
+    const pcmData = fs.readFileSync(filePath);
+    const frameSize = sampleRate / 10; // 100ms
+    const minLengthSeconds = 1.0;      // vorher 2.5 (zu streng)
+    const durationSeconds = pcmData.length / (sampleRate * 2);
+    if (durationSeconds < minLengthSeconds) return false;
+
+    // sehr simple Heuristik
+    let voicedFrames = 0;
+    const totalFrames = Math.floor(pcmData.length / (frameSize * 2));
+    for (let i = 0; i < pcmData.length; i += frameSize * 2) {
+      const chunk = pcmData.slice(i, i + frameSize * 2);
+      let sum = 0;
+      for (let j = 0; j < chunk.length; j += 2) {
+        const s = chunk.readInt16LE(j);
+        sum += Math.abs(s);
+      }
+      const avg = sum / (chunk.length / 2);
+      if (avg > 400) voicedFrames++; // grobe Lautstärkeleitplanke
+    }
+    return voicedFrames > Math.max(3, totalFrames * 0.15);
+  } catch {
+    return true; // im Zweifel transkribieren
+  }
+}
+
+/**
  * Startet die Voice-Aufnahme & Transkription.
  * - connection: VoiceConnection
  * - guildId: Guild-ID
@@ -293,7 +323,7 @@ function writeWavFile(filePath, pcmBuffer) {
  * Ablauf:
  *   1) abonnieren wir alle Sprecher (connection.receiver)
  *   2) für jeden Sprach-Chunk -> decode nach PCM, baue WAV, an Whisper -> Text
- *   3) sende den Text als Webhook-Nachricht (username = Sprecher, avatar = Useravatar)
+ *   3) sende den Text als Webhook-Nachricht (username = Sprechername, avatar = Useravatar)
  *      => Bot-Handler sieht das als "Webhook-Speaker" und legt es in den passenden Kontext.
  */
 async function setStartListening(connection, guildId, guildTextChannels, activeRecordings, client) {
@@ -312,8 +342,8 @@ async function setStartListening(connection, guildId, guildTextChannels, activeR
 
   receiver.speaking.on('start', async (userId) => {
     try {
-      const user = await guild.members.fetch(userId).catch(() => null);
-      if (!user) return;
+      const member = await guild.members.fetch(userId).catch(() => null);
+      if (!member) return;
 
       // Opus -> PCM
       const opusStream = receiver.subscribe(userId, {
@@ -344,24 +374,31 @@ async function setStartListening(connection, guildId, guildTextChannels, activeR
           // sehr kurze/kleine Aufnahme ignorieren (~ < 0.3s)
           if (pcmBuffer.length < 48000 * 2 * 0.3) return;
 
-          // WAV schreiben, an Whisper schicken
+          // WAV schreiben
           const tmpDir = path.join(__dirname, 'tmp');
           await fsp.mkdir(tmpDir, { recursive: true });
           const wavPath = path.join(tmpDir, `rec_${guildId}_${userId}_${Date.now()}.wav`);
           writeWavFile(wavPath, pcmBuffer);
 
+          // einfacher VAD / Reject sehr kurzer Stille
+          if (!getIsSpeechDetected(wavPath, 48000)) {
+            await getSafeDelete(wavPath);
+            return;
+          }
+
+          // an Whisper
           const text = await getTranscription(wavPath); // nutzt whisper-1
           await getSafeDelete(wavPath);
 
           if (!text || !text.trim() || text.startsWith('[ERROR]')) return;
 
           // Als Webhook posten => username = Sprechername, avatar = User-Avatar
-          const display = user.displayName || user.user.username || 'user';
-          const avatar = user.user.displayAvatarURL?.() || null;
+          const display = member.displayName || member.user.username || 'user';
+          const avatar = member.user.displayAvatarURL?.() || null;
 
           await hook.send({
             content: text.trim(),
-            username: display,
+            username: display,           // << wichtig: pro Nachricht Sprechername setzen
             avatarURL: avatar || undefined,
             allowedMentions: { parse: [] },
           });
