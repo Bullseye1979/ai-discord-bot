@@ -1,11 +1,9 @@
 // bot.js
-// Version 2.1 (Patched)
-// Initiates the bot and manages the messages to discord and exposes the documents directory via HTTP
-// ✨ Änderungen:
-// - getSpeakerName: nutzt bei Webhooks den per-Message Autor-Namen (message.author.username)
-// - Mapping speaker -> effectiveUserId (Guild-Member-Suche)
-// - Session-Key auf user:<effectiveUserId>, damit Voice (Webhook) & Text im selben Kontext landen
-// - Restliche Logik unverändert
+// Version 2.2 (Unified Channel Context)
+// - KEINE sessionKey-Prefixe mehr (weder "speaker:" noch "user:").
+// - Eine gemeinsame Session pro Kanal: sessionKey = `channel:<channelId>`.
+// - Webhook-Sprechername korrekt: per-message Username (message.author.username).
+// - setAddUserMessage sorgt dafür, dass der Sendername = Username/Displayname im Kontext steht.
 
 const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
@@ -72,15 +70,14 @@ const client = new Client({
     ]
 });
 
-// contextStorage: pro Channel eine Map je Sender (user:<id> / speaker:<name>)
-const contextStorage = new Map();
+// Ein gemeinsamer Kontext pro Kanal
+const contextStorage = new Map();       // channelId -> Context
 const guildTextChannels = new Map();
 const activeRecordings = new Map();
 const state = { isAIProcessing: 0 };
 
-// Utility: Sprechername von Webhook ermitteln (per-Message Autorname)
+// Utility: Webhook-Sprechername (per-Message Username, NICHT der Webhook-Name)
 async function getSpeakerName(message) {
-    // Für Webhook-Nachrichten liefert Discord in message.author den per-Message gesetzten Namen
     return message.webhookId ? (message.author?.username || null) : null;
 }
 
@@ -92,64 +89,36 @@ client.on('messageCreate', async (message) => {
     const channelMeta = getChannelConfig(message.channelId);
     if (!channelMeta) return;
 
-    // 2) Sender-Typ bestimmen
+    // 2) Sender-Typ bestimmen (nur noch für spätere Checks; der Kontext ist kanalweit)
     const isWebhook = !!message.webhookId;
-    const rawUserId = isWebhook ? null : message.author?.id;
+    const userId = isWebhook ? null : message.author?.id;
     const speaker = isWebhook ? (await getSpeakerName(message)) : null;
 
-    // 2b) Speaker → echten Guild-User auflösen (damit Voice & Text denselben Kontext nutzen)
-    let effectiveUserId = rawUserId;
-    if (!effectiveUserId && speaker) {
-        try {
-            const members = await message.guild.members.fetch();
-            const match = members.find(m =>
-                m.displayName === speaker || m.user.username === speaker
-            );
-            if (match) effectiveUserId = match.id;
-        } catch {
-            // kein harter Fehler – fallback bleibt speaker-basiert
-        }
-    }
-
-    // 3) Passenden Block auflösen (user/speaker/defaults). Wenn null -> NICHT reagieren.
-    //    Für Block-Checks geben wir sowohl userId (effectiveUserId, falls vorhanden) als auch speaker rein.
-    const resolved = getChannelConfig(message.channelId, { userId: effectiveUserId || rawUserId, speaker });
-    if (!resolved) return;
-
-    // 4) Context-Storage pro Sender
-    //    → Wenn wir effectiveUserId haben, nutzen wir *immer* user:<id> (gemeinsamer Kontext).
-    //    → Nur wenn keine ID auflösbar ist, fallback auf speaker:<name>.
-    const sessionKey = effectiveUserId
-        ? `user:${effectiveUserId}`
-        : (speaker ? `speaker:${speaker}` : `user:${rawUserId}`);
-
+    // 3) Kanalweiter Kontext (ein Topf pro Kanal)
+    const sessionKey = `channel:${message.channelId}`;
     if (!contextStorage.has(message.channelId)) {
-        contextStorage.set(message.channelId, new Map());
+        const ctx = new Context(channelMeta.persona, channelMeta.instructions, channelMeta.tools, channelMeta.toolRegistry);
+        contextStorage.set(message.channelId, ctx);
     }
-    const channelMap = contextStorage.get(message.channelId);
+    const chatContext = contextStorage.get(message.channelId);
 
-    if (!channelMap.has(sessionKey)) {
-        const ctx = new Context(resolved.persona, resolved.instructions, resolved.tools, resolved.toolRegistry);
-        channelMap.set(sessionKey, ctx);
-    }
-    const chatContext = channelMap.get(sessionKey);
-
-    // 5) Erst TTS-Weiterleitung prüfen (wenn Bot im Voice-Channel etc.)
+    // 4) Erst TTS-Weiterleitung prüfen (falls Bot im Voice-Channel, liest er AI-Webhook aus)
     await setTTS(message, client, guildTextChannels);
 
-    // 6) User-Message in passenden Kontext legen (gilt für Text *und* Webhook/Voice-Transkripte)
+    // 5) ALLE Nachrichten (User & Webhook) in den Kontext legen
+    //    Der Sendername im Kontext ist Username/Displayname (wird in setAddUserMessage korrekt ermittelt)
     await setAddUserMessage(message, chatContext);
 
-    // 7) Trigger prüfen
-    const trigger = (resolved.name || "bot").trim().toLowerCase();
+    // 6) Trigger prüfen
+    const trigger = (channelMeta.name || "bot").trim().toLowerCase();
     const content = (message.content || "").trim().toLowerCase();
 
-    // Bot-Messages ohne Trigger ignorieren
+    // Bot-Messages ohne Trigger ignorieren (verhindert Selbstgespräche bei Bot/AI)
     if (message.author.bot && !content.startsWith(trigger) && !content.startsWith(`!${trigger}`)) return;
 
     const isTrigger = content.startsWith(trigger) || content.startsWith(`!${trigger}`);
 
-    // 8) Befehle
+    // 7) Befehle
     if (message.content.startsWith('!context')) {
         const chunks = await chatContext.getContextAsChunks();
         for (const chunk of chunks) {
@@ -161,14 +130,15 @@ client.on('messageCreate', async (message) => {
         return setVoiceChannel(message, guildTextChannels, activeRecordings, chatContext, client);
     }
     if (message.content.startsWith('!clear')) {
-        // löscht alle Sessions für diesen Channel
-        await setClearChat(message, channelMap);
+        // löscht den gemeinsamen Kanal-Kontext
+        contextStorage.delete(message.channelId);
+        await message.react('✅').catch(() => {});
         return;
     }
 
-    // 9) Antwort nur bei Trigger
+    // 8) Antwort nur bei Trigger
     if (isTrigger) {
-        return getProcessAIRequest(message, chatContext, client, state, resolved.model, resolved.apikey);
+        return getProcessAIRequest(message, chatContext, client, state, channelMeta.model, channelMeta.apikey);
     }
 });
 
