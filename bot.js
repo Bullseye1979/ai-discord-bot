@@ -10,7 +10,7 @@ const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const path = require('path');
 const Context = require('./context.js');
-const { getChannelMeta, resolveChannelConfig, setAddUserMessage, setBotPresence } = require('./discord-helper.js');
+const { getChannelConfig, resolveChannelConfig, setAddUserMessage, setBotPresence } = require('./discord-helper.js');
 const fs = require("fs");
 const { getImage } = require("./image"); // nutzt DALL·E
 const {
@@ -96,7 +96,7 @@ client.on('messageCreate', async (message) => {
     if (!message.guild) return;
 
     // 1) Existiert eine Channel-Config? -> Wenn nein: GAR NICHT reagieren
-    const channelMeta = getChannelMeta(message.channelId);
+    const channelMeta = getChannelConfig(message.channelId);
     if (!channelMeta) return;
 
     // 2) Sender-Typ bestimmen
