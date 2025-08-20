@@ -1,5 +1,6 @@
-// discord-helper.js — v1.4
+// discord-helper.js — v1.5
 // Hilfsfunktionen für Discord + Chunking + Summaries-Posting (einzeln)
+// WICHTIG: getChannelConfig() liefert jetzt auch summaryPrompt zurück.
 
 const fs = require("fs");
 const path = require("path");
@@ -47,9 +48,10 @@ function getDefaultPersona() {
       botname: json.botname || "",
       selectedTools: json.tools || [],
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
+      summaryPrompt: json.summaryPrompt || json.summary_prompt || "" // <— NEU: Fallback aus default.json (falls vorhanden)
     };
   } catch {
-    return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [] };
+    return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [], summaryPrompt: "" };
   }
 }
 
@@ -66,12 +68,14 @@ function getChannelConfig(channelId) {
     botname = def.botname,
     selectedTools = def.selectedTools,
     blocks = def.blocks,
+    summaryPrompt = def.summaryPrompt // <— NEU: initialer Wert
   } = def;
 
   if (fs.existsSync(configPath)) {
     try {
       const raw = fs.readFileSync(configPath, "utf8");
       const cfg = JSON.parse(raw);
+
       if (typeof cfg.voice === "string") voice = cfg.voice;
       if (typeof cfg.botname === "string") botname = cfg.botname;
       if (typeof cfg.name === "string") name = cfg.name;
@@ -79,7 +83,11 @@ function getChannelConfig(channelId) {
       if (typeof cfg.instructions === "string") instructions = cfg.instructions;
       if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
       if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
-      // summaryPrompt wird an anderer Stelle aus cfg gelesen
+
+      // ✨ NEU: summaryPrompt aus der Channel-Config übernehmen (camelCase oder snake_case)
+      if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
+      else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
+
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -92,17 +100,21 @@ function getChannelConfig(channelId) {
     ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
     : `https://ralfreschke.de/documents/avatars/default.png`;
 
-  return { name, botname, voice, persona, avatarUrl, instructions, tools: ctxTools, toolRegistry, blocks };
+  return {
+    name,
+    botname,
+    voice,
+    persona,
+    avatarUrl,
+    instructions,
+    tools: ctxTools,
+    toolRegistry,
+    blocks,          // Berechtigungen
+    summaryPrompt    // <— WICHTIG: jetzt verfügbar für bot.js / context.js
+  };
 }
 
 // ---------- Chunking & Senden ----------
-function splitByParagraphs(text) {
-  return String(text ?? "")
-    .split(/\n{2,}/g)
-    .map((p) => p.trim())
-    .filter(Boolean);
-}
-
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -149,7 +161,7 @@ async function postSummariesIndividually(channel, summaries, leftover) {
   }
 }
 
-// ---------- Bot-UI ----------
+// ---------- Status/Bots ----------
 async function setBotPresence(client, activityText, status, activityType = 4) {
   if (client?.user) {
     await client.user.setPresence({
@@ -170,7 +182,7 @@ async function setAddUserMessage(message, chatContext) {
   await chatContext.add("user", senderName, content);
 }
 
-// ---------- Voice (unverändert, ggf. von dir bereits genutzt) ----------
+// ---------- Voice (falls genutzt) ----------
 function setEnqueueTTS(guildId, task) {
   if (!queueMap.has(guildId)) queueMap.set(guildId, []);
   const q = queueMap.get(guildId);
@@ -241,7 +253,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
 module.exports = {
   getUserTools,
   getDefaultPersona,
-  getChannelConfig,
+  getChannelConfig,     // <- liefert summaryPrompt jetzt mit
   setBotPresence,
   setAddUserMessage,
   splitIntoChunks,
