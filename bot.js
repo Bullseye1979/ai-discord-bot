@@ -1,9 +1,10 @@
-// bot.js
-// Version 2.2 (Unified Channel Context)
-// - KEINE sessionKey-Prefixe mehr (weder "speaker:" noch "user:").
-// - Eine gemeinsame Session pro Kanal: sessionKey = `channel:<channelId>`.
-// - Webhook-Sprechername korrekt: per-message Username (message.author.username).
-// - setAddUserMessage sorgt dafür, dass der Sendername = Username/Displayname im Kontext steht.
+// Version 2.1
+// Initiates the bot and manages the messages to discord and exposes the documents directory via HTTP
+// - Reagiert NICHT, wenn es keine Channel-Config gibt (kein globaler Fallback).
+// - Block-Auflösung pro Nachricht (user/speaker) via getChannelConfig.
+// - Eigene Konversation pro Sender (sessionKey: user:<id> / speaker:<name>).
+// - Model + API-Key pro Block.
+// - Context erhält channelId (für SQL-Logging).
 
 const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
@@ -11,7 +12,7 @@ const path = require('path');
 const Context = require('./context.js');
 const { getChannelConfig, setAddUserMessage, setBotPresence } = require('./discord-helper.js');
 const fs = require("fs");
-const { getImage } = require("./image"); // nutzt DALL·E
+const { getImage } = require("./image");
 const {
     setMessageReaction,
     getProcessAIRequest,
@@ -20,7 +21,7 @@ const {
     setTTS
 } = require('./discord-handler.js');
 
-// -------- Avatare aus Channel-Config erzeugen (unverändert) --------
+// -------- Avatare aus Channel-Config erzeugen --------
 async function setAvatars() {
     const configDir = path.join(__dirname, "channel-config");
     const avatarDir = path.join(__dirname, "documents", "avatars");
@@ -70,15 +71,23 @@ const client = new Client({
     ]
 });
 
-// Ein gemeinsamer Kontext pro Kanal
-const contextStorage = new Map();       // channelId -> Context
+// contextStorage: pro Channel eine Map je Sender (user:<id> / speaker:<name>)
+const contextStorage = new Map();
 const guildTextChannels = new Map();
 const activeRecordings = new Map();
 const state = { isAIProcessing: 0 };
 
-// Utility: Webhook-Sprechername (per-Message Username, NICHT der Webhook-Name)
+// Utility: Speaker-Name von Webhook ermitteln
 async function getSpeakerName(message) {
-    return message.webhookId ? (message.author?.username || null) : null;
+    if (!message.webhookId) return null;
+    try {
+        const webhooks = await message.channel.fetchWebhooks();
+        const matching = webhooks.find(w => w.id === message.webhookId);
+        if (matching) return matching.name || null;
+    } catch (err) {
+        return message.author?.username || null;
+    }
+    return null;
 }
 
 client.on('messageCreate', async (message) => {
@@ -89,36 +98,51 @@ client.on('messageCreate', async (message) => {
     const channelMeta = getChannelConfig(message.channelId);
     if (!channelMeta) return;
 
-    // 2) Sender-Typ bestimmen (nur noch für spätere Checks; der Kontext ist kanalweit)
+    // 2) Sender-Typ bestimmen
     const isWebhook = !!message.webhookId;
     const userId = isWebhook ? null : message.author?.id;
     const speaker = isWebhook ? (await getSpeakerName(message)) : null;
 
-    // 3) Kanalweiter Kontext (ein Topf pro Kanal)
-    const sessionKey = `channel:${message.channelId}`;
-    if (!contextStorage.has(message.channelId)) {
-        const ctx = new Context(channelMeta.persona, channelMeta.instructions, channelMeta.tools, channelMeta.toolRegistry);
-        contextStorage.set(message.channelId, ctx);
-    }
-    const chatContext = contextStorage.get(message.channelId);
+    // 3) Block-Config erneut auflösen (benötigt user/speaker)
+    const resolved = getChannelConfig(message.channelId, { userId, speaker });
+    if (!resolved) return;
 
-    // 4) Erst TTS-Weiterleitung prüfen (falls Bot im Voice-Channel, liest er AI-Webhook aus)
+    // 4) Context-Storage pro Sender (damit unterschiedliche Blocks getrennt laufen)
+    const sessionKey = speaker ? `speaker:${speaker}` : `user:${userId}`;
+    if (!contextStorage.has(message.channelId)) {
+        contextStorage.set(message.channelId, new Map());
+    }
+    const channelMap = contextStorage.get(message.channelId);
+
+    if (!channelMap.has(sessionKey)) {
+        // ➕ channelId an Context übergeben (für SQL-Logging)
+        const ctx = new Context(
+            resolved.persona,
+            resolved.instructions,
+            resolved.tools,
+            resolved.toolRegistry,
+            message.channelId
+        );
+        channelMap.set(sessionKey, ctx);
+    }
+    const chatContext = channelMap.get(sessionKey);
+
+    // 5) Erst TTS-Weiterleitung prüfen (wenn Bot im Voice-Channel etc.)
     await setTTS(message, client, guildTextChannels);
 
-    // 5) ALLE Nachrichten (User & Webhook) in den Kontext legen
-    //    Der Sendername im Kontext ist Username/Displayname (wird in setAddUserMessage korrekt ermittelt)
+    // 6) User-Message in passenden Kontext legen
     await setAddUserMessage(message, chatContext);
 
-    // 6) Trigger prüfen
-    const trigger = (channelMeta.name || "bot").trim().toLowerCase();
+    // 7) Trigger prüfen
+    const trigger = (resolved.name || "bot").trim().toLowerCase();
     const content = (message.content || "").trim().toLowerCase();
 
-    // Bot-Messages ohne Trigger ignorieren (verhindert Selbstgespräche bei Bot/AI)
+    // Bot-Messages ohne Trigger ignorieren
     if (message.author.bot && !content.startsWith(trigger) && !content.startsWith(`!${trigger}`)) return;
 
     const isTrigger = content.startsWith(trigger) || content.startsWith(`!${trigger}`);
 
-    // 7) Befehle
+    // 8) Befehle
     if (message.content.startsWith('!context')) {
         const chunks = await chatContext.getContextAsChunks();
         for (const chunk of chunks) {
@@ -130,15 +154,13 @@ client.on('messageCreate', async (message) => {
         return setVoiceChannel(message, guildTextChannels, activeRecordings, chatContext, client);
     }
     if (message.content.startsWith('!clear')) {
-        // löscht den gemeinsamen Kanal-Kontext
-        contextStorage.delete(message.channelId);
-        await message.react('✅').catch(() => {});
+        await setClearChat(message, channelMap);
         return;
     }
 
-    // 8) Antwort nur bei Trigger
+    // 9) Antwort nur bei Trigger
     if (isTrigger) {
-        return getProcessAIRequest(message, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+        return getProcessAIRequest(message, chatContext, client, state, resolved.model, resolved.apikey);
     }
 });
 

@@ -1,149 +1,98 @@
-// Version 1.0
-// Provides an object for the context
+// Version 2.2
+// Context-Management mit SQL-Speicherung (inkl. channelId) und ohne Summarizer
 
-// Requirements
+const mysql = require('mysql2/promise');
+require('dotenv').config();
 
-const { SUMMARIZE_THRESHOLD } = require('./config');
-const axios = require("axios");
-const persona = null;
-const instructions = null;
-const tools = null;
-const toolRegistry = null;
+// --- MySQL Pool -------------------------------------------------------------
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,       // z.B. 127.0.0.1
+    user: process.env.DB_USER,       // z.B. bot_user
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,   // z.B. discord_ai
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
 
-
-//Class
+// ISO → MySQL DATETIME (UTC)
+function toMySQLDateTime(date = new Date()) {
+    const pad = (n) => String(n).padStart(2, "0");
+    const yyyy = date.getUTCFullYear();
+    const MM = pad(date.getUTCMonth() + 1);
+    const dd = pad(date.getUTCDate());
+    const hh = pad(date.getUTCHours());
+    const mm = pad(date.getUTCMinutes());
+    const ss = pad(date.getUTCSeconds());
+    return `${yyyy}-${MM}-${dd} ${hh}:${mm}:${ss}`;
+}
 
 class Context {
-
-    // Constructor
-
-    constructor(persona_arg, instructions_arg, tools_arg, toolRegistry_arg) {
+    constructor(persona_arg, instructions_arg, tools_arg, toolRegistry_arg, channelId = "global") {
         this.messages = [];
-        this.isSummarizing = false;
         this.persona = persona_arg;
         this.instructions = instructions_arg;
-        this.add("system","",this.persona+"\n"+this.instructions);
         this.tools = tools_arg;
         this.toolRegistry = toolRegistry_arg;
+        this.channelId = channelId;
+
+        // Systemprompt als erste Nachricht
+        const sys = `${this.persona || ""}\n${this.instructions || ""}`.trim();
+        if (sys) {
+            // bewusst awaited, damit SQL-Fehler geloggt würden, aber Flow weitergeht
+            this.add("system", "system", sys);
+        }
     }
 
-
-    // Add a new standard context entry
-
+    // Eintrag hinzufügen + in DB loggen
     async add(role, sender, message) {
         const safeName = (sender || "system")
             .toLowerCase()
-            .replace(/\s+/g, "_")             // Leerzeichen → Unterstrich
-            .replace(/[^a-z0-9_]/gi, "")      // nur a-z, 0-9, _
-            .slice(0, 64);                    // maximal 64 Zeichen
+            .replace(/\s+/g, "_")
+            .replace(/[^a-z0-9_]/gi, "")
+            .slice(0, 64);
 
-        const formattedMessage = {
-            role: role,
-            content: message,
-            name: safeName
+        const now = new Date();
+        const entry = {
+            role,
+            content: String(message ?? ""),
+            name: safeName,
+            timestamp: now.toISOString(),
+            channelId: this.channelId
         };
 
-        this.messages.push(formattedMessage);
+        this.messages.push(entry);
 
-        const tokenLimit = 15000;
-        const estimatedTokens = this.messages.reduce((sum, msg) => {
-            const messageLength = msg.content ? msg.content.length : 0;
-            return sum + Math.ceil(messageLength / 4);
-        }, 0);
-
-        if (
-            this.messages.length > SUMMARIZE_THRESHOLD * 2 ||
-            estimatedTokens > tokenLimit * 0.8
-        ) {
-            await this.summarize();
-        }
-
-        return formattedMessage;
-    }
-
-
-
-    // Ensure that the context is compressed
-
-    async summarize() {
-        if (this.isSummarizing) {
-            return this.messages;
-        }
-
-        this.isSummarizing = true;
+        // Best-effort DB-Insert
         try {
-            if (this.messages.length < 4) {
-                this.isSummarizing = false;
-                return this.messages;
-            }
-            const midpoint = Math.floor(this.messages.length / 2);
-            const oldMessages = this.messages.slice(0, midpoint);
-            const newMessages = this.messages.slice(midpoint);
-            const response = await axios.post("https://api.openai.com/v1/chat/completions", {
-                model: "gpt-4-turbo",
-                messages: [
-                    {
-                        role: "system",
-                        content: `Summarize the following chat history as compactly as possible:
-                                  - Use the shortest possible phrasing, preferably in Mandarin (if appropriate).
-                                  - Remove all irrelevant, redundant, and embellished content.
-                                  - Goal: maximum information density in minimal space.`
-                    },
-                    {
-                        role: "user",
-                        content: `[BEGIN CONTEXT]\n${JSON.stringify(oldMessages)}\n[END CONTEXT]`
-                    }
-                ],
-                temperature: 0.2,
-                max_tokens: 1000
-            }, {
-                headers: {
-                    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-                    "Content-Type": "application/json"
-                }
-            });
-            if (!response.data.choices?.[0]?.message?.content) {
-                console.error("[ERROR]:", response.data);
-                return this.messages;
-            }
-            const summary = response.data.choices[0].message.content.trim();
-            this.messages = [
-                { role: "assistant", content: `Summary of the context:\n${summary}` },
-                ...newMessages
-            ];
-            this.messages.unshift({ role: "system", content: this.persona+"\n"+this.instructions });
-            return this.messages;
-        } catch (error) {
-            console.error("[ERROR]: Error during summarization:", error);
-            return this.messages;
-        } finally {
-            this.isSummarizing = false;
+            await pool.execute(
+                `INSERT INTO context_log (timestamp, channel_id, role, sender, content) VALUES (?, ?, ?, ?, ?)`,
+                [toMySQLDateTime(now), this.channelId, role, safeName, entry.content]
+            );
+        } catch (err) {
+            console.error("[DB ERROR] Insert failed:", err.message);
         }
+
+        return entry;
     }
 
-
-    // Cuts the context in small chunks that are more digestable
-
+    // Kontext als lesbare Blöcke zurückgeben (Debugging)
     async getContextAsChunks() {
         const maxLength = 1900;
-        const jsonMessages = this.messages.map(msg => ({
-            role: msg.role,
-            name: msg.name,
-            content: msg.content
+        const jsonMessages = this.messages.map(m => ({
+            role: m.role,
+            name: m.name,
+            timestamp: m.timestamp,
+            channelId: m.channelId,
+            content: m.content
         }));
-
-        const fullText = JSON.stringify(jsonMessages, null, 2);
-        const chunks = [];
-        for (let i = 0; i < fullText.length; i += maxLength) {
-            chunks.push(fullText.slice(i, i + maxLength));
+        const full = JSON.stringify(jsonMessages, null, 2);
+        const out = [];
+        for (let i = 0; i < full.length; i += maxLength) {
+            out.push(full.slice(i, i + maxLength));
         }
-
-        return chunks;
+        return out;
     }
-
 }
-
-
-// Exports
 
 module.exports = Context;

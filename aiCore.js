@@ -1,6 +1,6 @@
-// Version 1.3
+// Version 1.4
 // Provides the AI Functionality for the main process (tool_calls, length management, final answer)
-// ✅ Revert: 'name' bleibt im Kontext; keine Speaker-Tags im Content
+// - Kontext-Klone erhalten jetzt die channelId, damit DB-Logs konsistent sind.
 
 require('dotenv').config();
 const axios = require('axios');
@@ -14,14 +14,16 @@ async function getAIResponse(
     model = "gpt-4-turbo",
     apiKey = null
 ) {
-    // Falls irgendwo null reinkommt, fangen wir das ab
     if (tokenlimit == null) tokenlimit = 4096;
 
+    // ➕ channelId aus dem Original übernehmen
+    const channelId = context_orig?.channelId || "global";
+
     // Arbeits-Kontexte (separat, um History/Tools sauber zu halten)
-    const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
+    const context = new Context("", "", context_orig.tools, context_orig.toolRegistry, channelId);
     context.messages = [...context_orig.messages];
 
-    const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry);
+    const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry, channelId);
     handoverContext.messages = [...context_orig.messages];
 
     const toolRegistry = context.toolRegistry;
@@ -42,12 +44,9 @@ async function getAIResponse(
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
     do {
-        // 🔁 Nachrichten an die API: 'name' bleibt im Objekt, keine Speaker-Tags im Text
         const messagesToSend = context.messages.map(m => {
-            // nur Felder weiterreichen, die die API kennt
             const out = { role: m.role, content: m.content };
             if (m.name) out.name = m.name;
-            // Wenn vorherige Assistant-Message Tool-Calls enthält, kann das Modell darauf referenzieren
             if (m.tool_calls) out.tool_calls = m.tool_calls;
             if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
             return out;
@@ -121,13 +120,13 @@ async function getAIResponse(
                 }
             }
         } else {
-            // Wenn das letzte Resultat (z. B. Bild-URL) separat geloggt werden soll
+            // Falls das letzte Toolresult separat in den Original-Kontext geschrieben werden soll
             if (lastmessage) {
-                context_orig.add("assistant", "", lastmessage);
+                await context_orig.add("assistant", "", lastmessage);
             }
         }
 
-        // Fortsetzungslogik, falls wir am Tokenlimit abgebrochen haben
+        // Fortsetzungslogik
         continueResponse = !hasToolCalls && finishReason === "length";
         if (continueResponse) {
             context.messages.push({ role: "user", content: "continue" });
