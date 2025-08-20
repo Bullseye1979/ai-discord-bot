@@ -1,6 +1,4 @@
-// context.js — v4.5 (Cutoff + SQL + Kontextaufbau nach Vorgabe)
-// Kontext nach !summarize: System + 5 Summaries (älteste->neueste) + ALLE Einzel-Messages >= Cutoff
-
+// context.js — v4.6 (Cutoff + SQL + Kontextaufbau nach Vorgabe)
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
@@ -86,10 +84,8 @@ class Context {
       if (!rowsDesc?.length) return;
       const asc = rowsDesc.slice().reverse();
       const head = this.messages[0]?.role === "system" ? 1 : 0;
-      // Summary-Slot leeren
       let i = head;
       while (i < this.messages.length && this.messages[i]?.name === "summary") this.messages.splice(i, 1);
-      // Einfügen
       this.messages.splice(
         head,
         0,
@@ -102,9 +98,7 @@ class Context {
 
   async add(role, sender, content) {
     const entry = { role, name: sanitize(sender), content: String(content ?? "") };
-    try {
-      await this._initLoaded;
-    } catch {}
+    try { await this._initLoaded; } catch {}
     this.messages.push(entry);
 
     try {
@@ -119,27 +113,23 @@ class Context {
     return entry;
   }
 
-  // ALLE Nachrichten >= cutoff (für Sammel-Nachricht und Kontext-Anteil)
   async getMessagesAfter(cutoffMs) {
     const db = await getPool();
     const [rows] = await db.execute(
       `SELECT timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id=? AND timestamp >= ?
-        ORDER BY id ASC`,
+       FROM context_log
+       WHERE channel_id=? AND timestamp >= ?
+       ORDER BY id ASC`,
       [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
     );
     return rows || [];
   }
 
-  // Zusammenfassen bis Cutoff; Kontext danach = System + 5 Summaries (ASC) + alle >= Cutoff (Einzel)
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
     try {
       const db = await getPool();
-
-      // letzte Summary-Zeit
       const [lastSum] = await db.execute(
         `SELECT timestamp FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
@@ -147,18 +137,13 @@ class Context {
       const lastTs = lastSum?.[0]?.timestamp || null;
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      let sql = `SELECT timestamp, role, sender, content
-                   FROM context_log
-                  WHERE channel_id=? AND timestamp <= ?
-                  ORDER BY id ASC`;
+      let sql = `SELECT timestamp, role, sender, content FROM context_log WHERE channel_id=? AND timestamp <= ? ORDER BY id ASC`;
       const params = [this.channelId, cutoff];
       if (lastTs) {
-        sql = `SELECT timestamp, role, sender, content
-                 FROM context_log
-                WHERE channel_id=? AND timestamp > ? AND timestamp <= ?
-                ORDER BY id ASC`;
+        sql = `SELECT timestamp, role, sender, content FROM context_log WHERE channel_id=? AND timestamp > ? AND timestamp <= ? ORDER BY id ASC`;
         params.splice(1, 0, lastTs);
       }
+
       const [rows] = await db.execute(sql, params);
 
       if (rows?.length) {
@@ -170,7 +155,6 @@ class Context {
           .map((r) => `[${new Date(r.timestamp).toISOString()}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
           .join("\n");
 
-        // KI-Call
         const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId);
         await sumCtx.add("user", "system", text);
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
@@ -183,7 +167,6 @@ class Context {
         }
       }
 
-      // Kontext neu aufbauen: System + 5 Summaries (ASC) + alle >= Cutoff
       const [desc] = await db.execute(
         `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
         [this.channelId]
@@ -229,7 +212,7 @@ class Context {
     const out = [];
     for (let i = 0; i < full.length; i += max) out.push(full.slice(i, i + max));
     return out;
-    }
+  }
 }
 
 module.exports = Context;

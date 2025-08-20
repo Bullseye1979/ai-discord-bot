@@ -1,199 +1,204 @@
-// Version 2.6
+// discord-handler.js — v2.6
 // Handler für Discord-Aktionen
-// + Command: !summarize
-//   - erzeugt Summary (seit letzter), speichert in DB,
-//   - löscht alle Nachrichten im Channel,
-//   - postet die letzten 5 Summaries in **chronologischer Reihenfolge** (älteste → neueste)
-//   - nutzt Channel-spezifischen Summary-Prompt aus getChannelConfig()
+// + !summarize mit Cutoff, Kontext-Neuaufbau, Message-Wiederherstellung
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
-const { setEmptyChat, setBotPresence, setMessageReaction, setAddUserMessage, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
+const {
+  getChannelConfig,
+  setBotPresence,
+  setAddUserMessage,
+  postSummariesIndividually,
+  getSpeech,
+} = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
-const { getContextAsChunks } = require("./helper.js");
 const { getToolRegistry } = require("./tools.js");
 
-// Run an AI request
+// Run AI request
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
-    if (state.isAIProcessing >= 3) {
-        try { await setMessageReaction(message, "❌"); } catch {}
-        return;
+  if (state.isAIProcessing >= 3) {
+    try { await message.react("❌"); } catch {}
+    return;
+  }
+
+  state.isAIProcessing++;
+  await setBotPresence(client, "⏳", "dnd");
+
+  try {
+    await message.react("⏳");
+
+    const channelMeta = getChannelConfig(message.channelId);
+    if (!channelMeta) {
+      await message.react("❌");
+      return;
     }
 
-    state.isAIProcessing++;
-    await setBotPresence(client, "⏳", "dnd");
+    const senderId = String(message.author?.id || "");
+    const senderName = message.member?.displayName || message.author?.username || "";
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
-    try {
-        await message.react("⏳");
-
-        const channelMeta = getChannelConfig(message.channelId);
-        if (!channelMeta) {
-            await setMessageReaction(message, "❌");
-            return;
-        }
-
-        const senderId = String(message.author?.id || "");
-        const senderName = message.member?.displayName || message.author?.username || "";
-        const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-
-        const matchingBlock = blocks.find(b => {
-            const okUser = Array.isArray(b.user) && b.user.map(String).includes(senderId);
-            const okSpeaker = Array.isArray(b.speaker) && b.speaker.includes(senderName);
-            return okUser || okSpeaker;
-        });
-
-        if (!matchingBlock) {
-            await setMessageReaction(message, "❌");
-            return;
-        }
-
-        const effectiveModel = matchingBlock.model || model;
-        const effectiveApiKey = matchingBlock.apikey || apiKey;
-
-        if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-            const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
-            chatContext.tools = blockTools;
-            chatContext.toolRegistry = blockRegistry;
-        } else {
-            chatContext.tools = channelMeta.tools;
-            chatContext.toolRegistry = channelMeta.toolRegistry;
-        }
-
-        const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
-
-        if (output && output.trim()) {
-            await setReplyAsWebhook(message, output, {
-                botname: channelMeta.botname,
-                avatarUrl: channelMeta.avatarUrl
-            });
-            chatContext.add("assistant", channelMeta?.botname || "AI", output);
-            await setMessageReaction(message, "✅");
-        } else {
-            await setMessageReaction(message, "❌");
-        }
-    } catch (err) {
-        console.error("[ERROR]: Failed to process request:", err);
-        try { await setMessageReaction(message, "❌"); } catch {}
-    } finally {
-        state.isAIProcessing--;
-        if (state.isAIProcessing === 0) {
-            await setBotPresence(client, "✅", "online");
-        }
-    }
-}
-
-// Chat löschen
-async function setClearChat(message, contextStorage) {
-    if (!message.member.permissions.has("ManageMessages")) return;
-    await setEmptyChat(message.channel);
-    contextStorage.delete(message.channelId);
-}
-
-// Enter a voice channel and start listening
-async function setVoiceChannel(message, guildTextChannels, activeRecordings, chatContext, client) {
-    const channel = message.member?.voice?.channel;
-    if (!channel) return;
-    joinVoiceChannel({
-        channelId: channel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
-        selfDeaf: false,
+    const matchingBlock = blocks.find(b => {
+      const okUser = Array.isArray(b.user) && b.user.map(String).includes(senderId);
+      const okSpeaker = Array.isArray(b.speaker) && b.speaker.includes(senderName);
+      return okUser || okSpeaker;
     });
-    guildTextChannels.set(message.guild.id, message.channel.id);
-    const { setStartListening } = require("./discord-helper.js");
-    setStartListening(getVoiceConnection(message.guild.id), message.guild.id, guildTextChannels, activeRecordings, client);
+
+    if (!matchingBlock) {
+      await message.react("❌");
+      return;
+    }
+
+    const effectiveModel = matchingBlock.model || model;
+    const effectiveApiKey = matchingBlock.apikey || apiKey;
+
+    if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
+    } else {
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+
+    const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
+
+    if (output?.trim()) {
+      await message.channel.send({ content: output });
+      chatContext.add("assistant", channelMeta?.botname || "AI", output);
+      await message.react("✅");
+    } else {
+      await message.react("❌");
+    }
+  } catch (err) {
+    console.error("[ERROR]: Failed to process request:", err);
+    try { await message.react("❌"); } catch {}
+  } finally {
+    state.isAIProcessing--;
+    if (state.isAIProcessing === 0) {
+      await setBotPresence(client, "✅", "online");
+    }
+  }
 }
 
-// Handle speech output in voice chat
+// Handle voice join
+async function setVoiceChannel(message, guildTextChannels, activeRecordings, chatContext, client) {
+  const channel = message.member?.voice?.channel;
+  if (!channel) return;
+  joinVoiceChannel({
+    channelId: channel.id,
+    guildId: message.guild.id,
+    adapterCreator: message.guild.voiceAdapterCreator,
+    selfDeaf: false,
+  });
+  guildTextChannels.set(message.guild.id, message.channel.id);
+  const { setStartListening } = require("./discord-helper.js");
+  setStartListening(getVoiceConnection(message.guild.id), message.guild.id, guildTextChannels, activeRecordings, client);
+}
+
+// TTS bei AI-Antworten
 async function setTTS(message, client, guildTextChannels) {
-    if (!message.guild) return;
+  if (!message.guild) return;
 
-    const guildId = message.guild.id;
-    const expectedChannelId = guildTextChannels.get(guildId);
-    if (message.channel.id !== expectedChannelId) return;
+  const guildId = message.guild.id;
+  const expectedChannelId = guildTextChannels.get(guildId);
+  if (message.channel.id !== expectedChannelId) return;
 
-    const meta = getChannelConfig(message.channelId);
-    if (!meta) return;
+  const meta = getChannelConfig(message.channelId);
+  if (!meta) return;
 
-    const { botname, voice } = meta;
+  const { botname, voice } = meta;
 
-    const isDirectBot = message.author.id === client.user.id;
-    let isAIWebhook = false;
+  const isDirectBot = message.author.id === client.user.id;
+  let isAIWebhook = false;
 
-    if (message.webhookId) {
-        try {
-            const webhooks = await message.channel.fetchWebhooks();
-            const matching = webhooks.find(w => w.id === message.webhookId);
-            if (matching && matching.name === botname) {
-                isAIWebhook = true;
-            }
-        } catch (err) {
-            console.warn("[TTS] Webhook check failed:", err.message);
-        }
+  if (message.webhookId) {
+    try {
+      const webhooks = await message.channel.fetchWebhooks();
+      const matching = webhooks.find(w => w.id === message.webhookId);
+      if (matching && matching.name === botname) {
+        isAIWebhook = true;
+      }
+    } catch (err) {
+      console.warn("[TTS] Webhook check failed:", err.message);
     }
+  }
 
-    if (!isDirectBot && !isAIWebhook) return;
+  if (!isDirectBot && !isAIWebhook) return;
 
-    const botMember = await message.guild.members.fetch(client.user.id);
-    const botVC = botMember.voice.channelId;
-    if (!botVC) return;
+  const botMember = await message.guild.members.fetch(client.user.id);
+  const botVC = botMember.voice.channelId;
+  if (!botVC) return;
 
-    const connection = getVoiceConnection(guildId);
-    if (!connection || connection.joinConfig.channelId !== botVC) return;
+  const connection = getVoiceConnection(guildId);
+  if (!connection || connection.joinConfig.channelId !== botVC) return;
 
-    const cleaned = message.content
-        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
-        .replace(/https?:\/\/\S+/g, 'Link')
-        .replace(/<@!?(\d+)>/g, 'jemand')
-        .replace(/:[^:\s]+:/g, '');
+  const cleaned = message.content
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, 'Link')
+    .replace(/<@!?(\d+)>/g, 'jemand')
+    .replace(/:[^:\s]+:/g, '');
 
-    if (cleaned.trim()) {
-        await getSpeech(connection, guildId, cleaned, client, voice);
-    }
+  if (cleaned.trim()) {
+    await getSpeech(connection, guildId, cleaned, client, voice);
+  }
 }
 
-// --- Command: !summarize -----------------------------------------------------
+// --- !summarize ---
 async function handleSummarize(message, chatContext) {
-    try {
-        // Channel-Config holen, um den kanal-spezifischen Summary-Prompt zu bekommen
-        const channelMeta = getChannelConfig(message.channelId);
-        const customPrompt = channelMeta?.summaryPrompt || null;
+  const channelMeta = getChannelConfig(message.channelId);
+  const customPrompt = channelMeta?.summaryPrompt || null;
 
-        // 1) Summary erzeugen & speichern (mit channel-spezifischem Prompt)
-        await chatContext.generateAndStoreSummary(message.channelId, customPrompt);
+  const cutoffMs = Date.now();
 
-        // 2) Channel leeren
-        await setEmptyChat(message.channel);
+  try {
+    const progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
 
-        // 3) Letzte 5 Summaries posten - in **chronologischer Reihenfolge**
-        const listDesc = await chatContext.getLastSummaries(message.channelId, 5);
-        if (!listDesc || listDesc.length === 0) {
-            await setReplyAsWebhook(message, "Keine gespeicherten Zusammenfassungen vorhanden.", {});
-            return;
+    // 1. Zusammenfassung erzeugen
+    await chatContext.summarizeSince(cutoffMs, customPrompt);
+
+    // 2. Channel leeren
+    const me = message.guild.members.me;
+    const perms = message.channel.permissionsFor(me);
+    if (!perms?.has("ManageMessages") || !perms?.has("ReadMessageHistory")) {
+      await message.channel.send("⚠️ I lack permissions to delete messages.");
+    } else {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      let beforeId = null;
+      while (true) {
+        const fetched = await message.channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
+        if (!fetched || fetched.size === 0) break;
+        for (const msg of fetched.values()) {
+          if (msg.pinned) continue;
+          try {
+            await msg.delete();
+          } catch {}
+          await sleep(120);
         }
-
-        // DB liefert DESC -> für Discord besser ASC (älteste oben)
-        const listAsc = [...listDesc].reverse();
-
-        const text = listAsc
-            .map(r => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`)
-            .join(`\n\n---\n\n`);
-
-        await setReplyAsWebhook(message, text, {
-            botname: channelMeta?.botname,
-            avatarUrl: channelMeta?.avatarUrl
-        });
-    } catch (err) {
-        console.error("[SUMMARIZE ERROR]:", err);
-        await setReplyAsWebhook(message, "Fehler beim Erstellen/Veröffentlichen der Zusammenfassung.", {});
+        const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
+        if (!oldest) break;
+        beforeId = oldest.id;
+      }
     }
+
+    // 3. Summaries posten
+    const last5Desc = await chatContext.getLastSummaries(5);
+    const summariesAsc = (last5Desc || []).slice().reverse().map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
+
+    const afterRows = await chatContext.getMessagesAfter(cutoffMs);
+    const leftover = afterRows?.length ? afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n") : "";
+
+    await postSummariesIndividually(message.channel, summariesAsc, leftover);
+
+    await message.channel.send("✅ **Summary completed.**");
+    if (progress?.deletable) await progress.delete();
+  } catch (err) {
+    console.error("[!summarize ERROR]:", err);
+    await message.channel.send("❌ Fehler beim Zusammenfassen.");
+  }
 }
 
 module.exports = {
-    setMessageReaction,
-    getContextAsChunks,
-    getProcessAIRequest,
-    setClearChat,
-    setVoiceChannel,
-    setTTS,
-    handleSummarize
+  getProcessAIRequest,
+  setVoiceChannel,
+  setTTS,
+  handleSummarize
 };

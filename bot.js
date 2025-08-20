@@ -1,6 +1,5 @@
 // bot.js — v2.9
-// !summarize mit Cutoff, Chat leeren, 5 Summaries einzeln posten (gechunked), 6. Nachricht für "after cutoff" (gechunked).
-// Interner Kontext nach Vorgabe: System + 5 Summaries + alle Einzel-Nachrichten >= Cutoff (ohne Sammel-Nachricht).
+// Discord-Client + !summarize mit Cutoff, Chunked Posting und individuellem Prompt
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -10,7 +9,6 @@ const {
   getChannelConfig,
   setAddUserMessage,
   setBotPresence,
-  sendChunked,
   postSummariesIndividually,
 } = require("./discord-helper.js");
 
@@ -32,11 +30,14 @@ async function deleteAllMessages(channel) {
   if (!perms?.has(PermissionsBitField.Flags.ManageMessages) || !perms?.has(PermissionsBitField.Flags.ReadMessageHistory)) {
     throw new Error("Missing permissions: ManageMessages and/or ReadMessageHistory");
   }
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let beforeId = null;
+
   while (true) {
     const fetched = await channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
     if (!fetched || fetched.size === 0) break;
+
     for (const msg of fetched.values()) {
       if (msg.pinned) continue;
       try {
@@ -44,6 +45,7 @@ async function deleteAllMessages(channel) {
       } catch {}
       await sleep(120);
     }
+
     const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
     if (!oldest) break;
     beforeId = oldest.id;
@@ -69,10 +71,12 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key);
 
-  // ---- Commands ----
+  // --- Commands ---
   if (message.content.startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
-    for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
+    for (const c of chunks) {
+      await message.channel.send({ content: `\`\`\`json\n${c}\n\`\`\`` });
+    }
     return;
   }
 
@@ -85,40 +89,39 @@ client.on("messageCreate", async (message) => {
     const cutoffMs = Date.now();
     const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
 
-    // 1) Zusammenfassen bis Cutoff -> Kontext wird: System + 5 Summaries + alle >= Cutoff
     try {
+      // 1) Zusammenfassen (nur bis Cutoff)
       await chatContext.summarizeSince(cutoffMs, customPrompt);
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
     }
 
-    // 2) Alle Messages im Channel löschen
     try {
+      // 2) Channel leeren
       await deleteAllMessages(message.channel);
     } catch (e) {
       console.error("[!summarize] deleteAllMessages error:", e?.message || e);
       await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
     }
 
-    // 3) 5 Summaries (älteste -> neueste) als einzelne Nachrichten posten (gechunked)
-    let summariesAsc = [];
     try {
+      // 3) Summaries posten
       const last5Desc = await chatContext.getLastSummaries(5);
-      summariesAsc = (last5Desc || []).slice().reverse().map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
-      if (summariesAsc.length === 0) {
-        await message.channel.send("No summaries available yet.");
-      } else {
-        // 4) Sammeltext (nur Anzeige) für "after cutoff"
-        const afterRows = await chatContext.getMessagesAfter(cutoffMs);
-        const leftover = afterRows?.length ? afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n") : "";
+      const summariesAsc = (last5Desc || []).slice().reverse().map(
+        (r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`
+      );
 
-        await postSummariesIndividually(message.channel, summariesAsc, leftover);
-      }
+      // 4) Nachrichten nach Cutoff anzeigen
+      const afterRows = await chatContext.getMessagesAfter(cutoffMs);
+      const leftover = afterRows?.length ? afterRows.map(
+        (r) => `**${r.sender}**: ${r.content}`
+      ).join("\n") : "";
+
+      await postSummariesIndividually(message.channel, summariesAsc, leftover);
     } catch (e) {
       console.error("[!summarize] posting summaries error:", e?.message || e);
     }
 
-    // 5) Abschluss
     try {
       await message.channel.send("✅ **Summary completed.**");
     } catch {}
@@ -129,7 +132,7 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ---- Normaler Flow ----
+  // --- Normaler Nachrichtenfluss ---
   await setAddUserMessage(message, chatContext);
 
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();
@@ -148,7 +151,7 @@ client.on("messageCreate", async (message) => {
 })();
 client.once("ready", () => setBotPresence(client, "✅ Started", "online"));
 
-// HTTP /documents (optional)
+// Express /documents (optional)
 const expressApp = express();
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(

@@ -11,7 +11,6 @@ const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const { getTranscription, getTTS } = require("./aiService.js");
-require("dotenv").config();
 
 ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
 
@@ -34,7 +33,7 @@ function getUserTools(nameOrDisplayName) {
   return { tools: activeTools, toolRegistry };
 }
 
-// ---------- Default Persona (falls genutzt) ----------
+// ---------- Default Persona ----------
 function getDefaultPersona() {
   const defaultPath = path.join(__dirname, "channel-config", "default.json");
   try {
@@ -48,7 +47,7 @@ function getDefaultPersona() {
       botname: json.botname || "",
       selectedTools: json.tools || [],
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
-      summaryPrompt: json.summaryPrompt || json.summary_prompt || "" // <— NEU: Fallback aus default.json (falls vorhanden)
+      summaryPrompt: json.summaryPrompt || json.summary_prompt || ""
     };
   } catch {
     return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [], summaryPrompt: "" };
@@ -68,7 +67,7 @@ function getChannelConfig(channelId) {
     botname = def.botname,
     selectedTools = def.selectedTools,
     blocks = def.blocks,
-    summaryPrompt = def.summaryPrompt // <— NEU: initialer Wert
+    summaryPrompt = def.summaryPrompt
   } = def;
 
   if (fs.existsSync(configPath)) {
@@ -83,8 +82,6 @@ function getChannelConfig(channelId) {
       if (typeof cfg.instructions === "string") instructions = cfg.instructions;
       if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
       if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
-
-      // ✨ NEU: summaryPrompt aus der Channel-Config übernehmen (camelCase oder snake_case)
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
@@ -109,12 +106,12 @@ function getChannelConfig(channelId) {
     instructions,
     tools: ctxTools,
     toolRegistry,
-    blocks,          // Berechtigungen
-    summaryPrompt    // <— WICHTIG: jetzt verfügbar für bot.js / context.js
+    blocks,
+    summaryPrompt
   };
 }
 
-// ---------- Chunking & Senden ----------
+// ---------- Chunking ----------
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -150,7 +147,6 @@ async function sendChunked(channel, content) {
   }
 }
 
-// summaries: Array<string> (älteste -> neueste), leftover?: string
 async function postSummariesIndividually(channel, summaries, leftover) {
   for (let i = 0; i < summaries.length; i++) {
     const header = `**Summary ${i + 1}/${summaries.length}**`;
@@ -161,7 +157,7 @@ async function postSummariesIndividually(channel, summaries, leftover) {
   }
 }
 
-// ---------- Status/Bots ----------
+// ---------- Präsenz & Kontext ----------
 async function setBotPresence(client, activityText, status, activityType = 4) {
   if (client?.user) {
     await client.user.setPresence({
@@ -171,7 +167,6 @@ async function setBotPresence(client, activityText, status, activityType = 4) {
   }
 }
 
-// ---------- Kontext / Messages ----------
 async function setAddUserMessage(message, chatContext) {
   let content = message.content || "";
   if (message.attachments?.size > 0) {
@@ -182,7 +177,7 @@ async function setAddUserMessage(message, chatContext) {
   await chatContext.add("user", senderName, content);
 }
 
-// ---------- Voice (falls genutzt) ----------
+// ---------- TTS für Sprachkanal ----------
 function setEnqueueTTS(guildId, task) {
   if (!queueMap.has(guildId)) queueMap.set(guildId, []);
   const q = queueMap.get(guildId);
@@ -224,7 +219,6 @@ async function getSpeech(connection, guildId, text, client, voice) {
   setEnqueueTTS(guildId, async () => {
     let player = playerMap.get(guildId);
     if (!player) {
-      const { createAudioPlayer } = require("@discordjs/voice");
       player = createAudioPlayer();
       playerMap.set(guildId, player);
       connection.subscribe(player);
@@ -244,7 +238,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
         });
         await new Promise((r) => setTimeout(r, 100));
       } catch (e) {
-        console.error("[ERROR]:", e);
+        console.error("[TTS ERROR]:", e);
       }
     }
   });
@@ -253,10 +247,11 @@ async function getSpeech(connection, guildId, text, client, voice) {
 module.exports = {
   getUserTools,
   getDefaultPersona,
-  getChannelConfig,     // <- liefert summaryPrompt jetzt mit
+  getChannelConfig,
   setBotPresence,
   setAddUserMessage,
   splitIntoChunks,
   sendChunked,
   postSummariesIndividually,
+  getSpeech
 };
