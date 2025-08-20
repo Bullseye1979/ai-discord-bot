@@ -1,9 +1,12 @@
-// context.js — angepasst: Prompt-Debug + korrekter Cutoff
+// context.js — v4.6 (Cutoff + SQL + Kontextaufbau nach Vorgabe + Custom Prompt aus Channel)
+// Kontext nach !summarize: System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
+
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
 
 let pool;
+
 async function getPool() {
   if (!pool) {
     pool = await mysql.createPool({
@@ -55,6 +58,7 @@ function toMySQLDateTime(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
+
 const sanitize = (s) => String(s || "system").toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/gi, "").slice(0, 64);
 
 class Context {
@@ -66,8 +70,10 @@ class Context {
     this.toolRegistry = toolRegistry || {};
     this.channelId = channelId;
     this.isSummarizing = false;
+
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
+
     this._initLoaded = this._injectInitialSummaries();
   }
 
@@ -106,42 +112,53 @@ class Context {
     return entry;
   }
 
-  async getMessagesAfter(mysqlTimestamp) {
+  async getMessagesAfter(cutoffMs) {
     const db = await getPool();
     const [rows] = await db.execute(
-      `SELECT timestamp, role, sender, content FROM context_log WHERE channel_id=? AND timestamp > ? ORDER BY id ASC`,
-      [this.channelId, mysqlTimestamp]
+      `SELECT timestamp, role, sender, content
+         FROM context_log
+        WHERE channel_id=? AND timestamp >= ?
+        ORDER BY id ASC`,
+      [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
     );
     return rows || [];
   }
 
-  async summarizeSince(nowMs, customPrompt = null) {
+  async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
+
     try {
       const db = await getPool();
 
-      // Letzter Summary-Zeitpunkt
       const [lastSum] = await db.execute(
         `SELECT timestamp FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
-      const lastTimestamp = lastSum?.[0]?.timestamp || "1970-01-01 00:00:00";
+      const lastTs = lastSum?.[0]?.timestamp || null;
+      const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      const [rows] = await db.execute(
-        `SELECT timestamp, role, sender, content
-           FROM context_log
-          WHERE channel_id=? AND timestamp > ? AND timestamp <= ?
-          ORDER BY id ASC`,
-        [this.channelId, lastTimestamp, toMySQLDateTime(new Date(nowMs))]
-      );
+      let sql = `SELECT timestamp, role, sender, content
+                   FROM context_log
+                  WHERE channel_id=? AND timestamp <= ?
+                  ORDER BY id ASC`;
+      const params = [this.channelId, cutoff];
+      if (lastTs) {
+        sql = `SELECT timestamp, role, sender, content
+                 FROM context_log
+                WHERE channel_id=? AND timestamp > ? AND timestamp <= ?
+                ORDER BY id ASC`;
+        params.splice(1, 0, lastTs);
+      }
+
+      const [rows] = await db.execute(sql, params);
 
       if (rows?.length) {
         const prompt =
           (customPrompt && customPrompt.trim()) ||
-          `Create a concise, structured chat summary in English. Cover decisions, tasks, facts, and links. Use short headings and bullet points. Neutral tone.`;
+          `Create a concise, structured chat summary in English. Only summarize in-character Dungeons & Dragons content. Ignore all real-world or out-of-character messages such as food orders or personal comments. Use a cinematic and immersive tone.`;
 
-        console.log(`📝 [SUMMARY PROMPT USED]:\n${prompt}\n`);
+        console.debug(`[SUMMARY] Prompt used for summary:\n${prompt}`);
 
         const text = rows
           .map((r) => `[${new Date(r.timestamp).toISOString()}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
@@ -159,6 +176,7 @@ class Context {
         }
       }
 
+      // Kontext neu aufbauen
       const [desc] = await db.execute(
         `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
         [this.channelId]
@@ -170,7 +188,7 @@ class Context {
       if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
       for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
 
-      const afterRows = await this.getMessagesAfter(toMySQLDateTime(new Date(nowMs)));
+      const afterRows = await this.getMessagesAfter(cutoffMs);
       for (const r of afterRows) {
         newMsgs.push({ role: r.role, name: r.sender, content: r.content });
       }

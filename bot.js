@@ -1,6 +1,5 @@
-// bot.js — v3.0
-// !summarize mit Cutoff, Chat leeren, 5 Summaries einzeln posten (gechunked), 6. Nachricht für "after cutoff" (gechunked).
-// Kontext nach Vorgabe: System + 5 Summaries + alle Einzel-Nachrichten >= Cutoff
+// bot.js — v3.0 (mit Cutoff, Summaries, Kontextpflege & Debug)
+// !summarize: erstellt Summary, leert Chat, postet 5 Summaries (älteste → neueste) + nicht zusammengefasste Nachrichten.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -69,13 +68,14 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key);
 
-  // ---- Commands ----
+  // ---- COMMAND: !context ----
   if (message.content.startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
     for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
     return;
   }
 
+  // ---- COMMAND: !summarize ----
   if (message.content.startsWith("!summarize")) {
     let progress = null;
     try {
@@ -85,12 +85,14 @@ client.on("messageCreate", async (message) => {
     const cutoffMs = Date.now();
     const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
 
+    // 1) Zusammenfassung erzeugen
     try {
       await chatContext.summarizeSince(cutoffMs, customPrompt);
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
     }
 
+    // 2) Alle Nachrichten im Channel löschen
     try {
       await deleteAllMessages(message.channel);
     } catch (e) {
@@ -98,23 +100,28 @@ client.on("messageCreate", async (message) => {
       await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
     }
 
-    let summariesAsc = [];
-    let lastSummaryTime = "1970-01-01 00:00:00";
+    // 3) 5 Summaries (älteste → neueste) posten + ggf. nicht zusammengefasste Nachrichten
     try {
       const last5Desc = await chatContext.getLastSummaries(5);
-      summariesAsc = (last5Desc || []).slice().reverse().map((r) => {
-        lastSummaryTime = r.timestamp;
-        return `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`;
-      });
+      const summariesAsc = (last5Desc || []).slice().reverse().map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
 
-      const afterRows = await chatContext.getMessagesAfter(lastSummaryTime);
-      const leftover = afterRows?.length ? afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n") : "";
+      let leftover = "";
+      const afterRows = await chatContext.getMessagesAfter(cutoffMs);
+      if (afterRows?.length) {
+        leftover = afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n");
+        console.debug("[!summarize] Non-summarized messages after cutoff:\n", leftover);
+      }
 
-      await postSummariesIndividually(message.channel, summariesAsc, leftover);
+      if (summariesAsc.length === 0) {
+        await message.channel.send("No summaries available yet.");
+      } else {
+        await postSummariesIndividually(message.channel, summariesAsc, leftover);
+      }
     } catch (e) {
       console.error("[!summarize] posting summaries error:", e?.message || e);
     }
 
+    // 4) Abschluss
     try {
       await message.channel.send("✅ **Summary completed.**");
     } catch {}
@@ -125,9 +132,12 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ---- Normaler Flow ----
-  await setAddUserMessage(message, chatContext);
+  // ---- NORMALE NACHRICHT ----
+  if (!message.content.startsWith("!context") && !message.content.startsWith("!summarize")) {
+    await setAddUserMessage(message, chatContext);
+  }
 
+  // Trigger prüfen (Name oder !name)
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();
   const content = (message.content || "").trim().toLowerCase();
   const isTrigger = content.startsWith(trigger) || content.startsWith(`!${trigger}`);
@@ -138,13 +148,13 @@ client.on("messageCreate", async (message) => {
   return getProcessAIRequest(message, chatContext, client, state, channelMeta.model, channelMeta.apikey);
 });
 
-// Start
+// Start Discord Bot
 (async () => {
   client.login(process.env.DISCORD_TOKEN);
 })();
 client.once("ready", () => setBotPresence(client, "✅ Started", "online"));
 
-// HTTP /documents (optional)
+// Static Hosting für /documents (optional)
 const expressApp = express();
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(

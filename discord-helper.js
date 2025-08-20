@@ -1,4 +1,4 @@
-// discord-helper.js — v1.5
+// discord-helper.js — v1.6
 // Hilfsfunktionen für Discord + Chunking + Summaries-Posting (einzeln)
 // WICHTIG: getChannelConfig() liefert jetzt auch summaryPrompt zurück.
 
@@ -11,6 +11,7 @@ const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const { getTranscription, getTTS } = require("./aiService.js");
+require("dotenv").config();
 
 ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
 
@@ -33,7 +34,7 @@ function getUserTools(nameOrDisplayName) {
   return { tools: activeTools, toolRegistry };
 }
 
-// ---------- Default Persona ----------
+// ---------- Default Persona (falls genutzt) ----------
 function getDefaultPersona() {
   const defaultPath = path.join(__dirname, "channel-config", "default.json");
   try {
@@ -82,6 +83,7 @@ function getChannelConfig(channelId) {
       if (typeof cfg.instructions === "string") instructions = cfg.instructions;
       if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
       if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
+
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
@@ -111,7 +113,7 @@ function getChannelConfig(channelId) {
   };
 }
 
-// ---------- Chunking ----------
+// ---------- Chunking & Senden ----------
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -147,6 +149,7 @@ async function sendChunked(channel, content) {
   }
 }
 
+// summaries: Array<string> (älteste → neueste), leftover?: string
 async function postSummariesIndividually(channel, summaries, leftover) {
   for (let i = 0; i < summaries.length; i++) {
     const header = `**Summary ${i + 1}/${summaries.length}**`;
@@ -157,7 +160,7 @@ async function postSummariesIndividually(channel, summaries, leftover) {
   }
 }
 
-// ---------- Präsenz & Kontext ----------
+// ---------- Status/Bots ----------
 async function setBotPresence(client, activityText, status, activityType = 4) {
   if (client?.user) {
     await client.user.setPresence({
@@ -167,7 +170,9 @@ async function setBotPresence(client, activityText, status, activityType = 4) {
   }
 }
 
+// ---------- Kontext / Messages ----------
 async function setAddUserMessage(message, chatContext) {
+  if (message.content.startsWith("!context")) return;
   let content = message.content || "";
   if (message.attachments?.size > 0) {
     const links = message.attachments.map((a) => a.url).join("\n");
@@ -177,7 +182,7 @@ async function setAddUserMessage(message, chatContext) {
   await chatContext.add("user", senderName, content);
 }
 
-// ---------- TTS für Sprachkanal ----------
+// ---------- Voice-TTS (optional) ----------
 function setEnqueueTTS(guildId, task) {
   if (!queueMap.has(guildId)) queueMap.set(guildId, []);
   const q = queueMap.get(guildId);
