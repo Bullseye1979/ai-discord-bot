@@ -1,9 +1,10 @@
-// Version 2.5
+// Version 2.6
 // Handler für Discord-Aktionen
-// + Neuer Command: !summarize
+// + Command: !summarize
 //   - erzeugt Summary (seit letzter), speichert in DB,
 //   - löscht alle Nachrichten im Channel,
-//   - postet die letzten 5 Summaries
+//   - postet die letzten 5 Summaries in **chronologischer Reihenfolge** (älteste → neueste)
+//   - nutzt Channel-spezifischen Summary-Prompt aus getChannelConfig()
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence, setMessageReaction, setAddUserMessage, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
@@ -150,27 +151,37 @@ async function setTTS(message, client, guildTextChannels) {
     }
 }
 
-// --- Neuer Command: !summarize ----------------------------------------------
+// --- Command: !summarize -----------------------------------------------------
 async function handleSummarize(message, chatContext) {
     try {
-        // 1) Summary erzeugen & speichern
-        const created = await chatContext.generateAndStoreSummary(message.channelId);
+        // Channel-Config holen, um den kanal-spezifischen Summary-Prompt zu bekommen
+        const channelMeta = getChannelConfig(message.channelId);
+        const customPrompt = channelMeta?.summaryPrompt || null;
+
+        // 1) Summary erzeugen & speichern (mit channel-spezifischem Prompt)
+        await chatContext.generateAndStoreSummary(message.channelId, customPrompt);
 
         // 2) Channel leeren
         await setEmptyChat(message.channel);
 
-        // 3) Letzte 5 Summaries posten
-        const list = await chatContext.getLastSummaries(message.channelId, 5);
-        if (!list || list.length === 0) {
+        // 3) Letzte 5 Summaries posten - in **chronologischer Reihenfolge**
+        const listDesc = await chatContext.getLastSummaries(message.channelId, 5);
+        if (!listDesc || listDesc.length === 0) {
             await setReplyAsWebhook(message, "Keine gespeicherten Zusammenfassungen vorhanden.", {});
             return;
         }
-        // Neueste zuerst anzeigen
-        const text = list
+
+        // DB liefert DESC -> für Discord besser ASC (älteste oben)
+        const listAsc = [...listDesc].reverse();
+
+        const text = listAsc
             .map(r => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`)
             .join(`\n\n---\n\n`);
 
-        await setReplyAsWebhook(message, text, {});
+        await setReplyAsWebhook(message, text, {
+            botname: channelMeta?.botname,
+            avatarUrl: channelMeta?.avatarUrl
+        });
     } catch (err) {
         console.error("[SUMMARIZE ERROR]:", err);
         await setReplyAsWebhook(message, "Fehler beim Erstellen/Veröffentlichen der Zusammenfassung.", {});
