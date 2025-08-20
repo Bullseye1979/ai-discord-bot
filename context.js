@@ -1,10 +1,9 @@
-// context.js — v4.6 (Cutoff + SQL + Kontextaufbau nach Vorgabe)
+// context.js — angepasst: Prompt-Debug + korrekter Cutoff
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
 
 let pool;
-
 async function getPool() {
   if (!pool) {
     pool = await mysql.createPool({
@@ -67,10 +66,8 @@ class Context {
     this.toolRegistry = toolRegistry || {};
     this.channelId = channelId;
     this.isSummarizing = false;
-
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
-
     this._initLoaded = this._injectInitialSummaries();
   }
 
@@ -84,13 +81,7 @@ class Context {
       if (!rowsDesc?.length) return;
       const asc = rowsDesc.slice().reverse();
       const head = this.messages[0]?.role === "system" ? 1 : 0;
-      let i = head;
-      while (i < this.messages.length && this.messages[i]?.name === "summary") this.messages.splice(i, 1);
-      this.messages.splice(
-        head,
-        0,
-        ...asc.map((r) => ({ role: "assistant", name: "summary", content: r.summary }))
-      );
+      this.messages.splice(head, 0, ...asc.map((r) => ({ role: "assistant", name: "summary", content: r.summary })));
     } catch (e) {
       console.error("[DB] load initial summaries failed:", e.message);
     }
@@ -98,7 +89,9 @@ class Context {
 
   async add(role, sender, content) {
     const entry = { role, name: sanitize(sender), content: String(content ?? "") };
-    try { await this._initLoaded; } catch {}
+    try {
+      await this._initLoaded;
+    } catch {}
     this.messages.push(entry);
 
     try {
@@ -113,43 +106,42 @@ class Context {
     return entry;
   }
 
-  async getMessagesAfter(cutoffMs) {
+  async getMessagesAfter(mysqlTimestamp) {
     const db = await getPool();
     const [rows] = await db.execute(
-      `SELECT timestamp, role, sender, content
-       FROM context_log
-       WHERE channel_id=? AND timestamp >= ?
-       ORDER BY id ASC`,
-      [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
+      `SELECT timestamp, role, sender, content FROM context_log WHERE channel_id=? AND timestamp > ? ORDER BY id ASC`,
+      [this.channelId, mysqlTimestamp]
     );
     return rows || [];
   }
 
-  async summarizeSince(cutoffMs, customPrompt = null) {
+  async summarizeSince(nowMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
     try {
       const db = await getPool();
+
+      // Letzter Summary-Zeitpunkt
       const [lastSum] = await db.execute(
         `SELECT timestamp FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
-      const lastTs = lastSum?.[0]?.timestamp || null;
-      const cutoff = toMySQLDateTime(new Date(cutoffMs));
+      const lastTimestamp = lastSum?.[0]?.timestamp || "1970-01-01 00:00:00";
 
-      let sql = `SELECT timestamp, role, sender, content FROM context_log WHERE channel_id=? AND timestamp <= ? ORDER BY id ASC`;
-      const params = [this.channelId, cutoff];
-      if (lastTs) {
-        sql = `SELECT timestamp, role, sender, content FROM context_log WHERE channel_id=? AND timestamp > ? AND timestamp <= ? ORDER BY id ASC`;
-        params.splice(1, 0, lastTs);
-      }
-
-      const [rows] = await db.execute(sql, params);
+      const [rows] = await db.execute(
+        `SELECT timestamp, role, sender, content
+           FROM context_log
+          WHERE channel_id=? AND timestamp > ? AND timestamp <= ?
+          ORDER BY id ASC`,
+        [this.channelId, lastTimestamp, toMySQLDateTime(new Date(nowMs))]
+      );
 
       if (rows?.length) {
         const prompt =
           (customPrompt && customPrompt.trim()) ||
-          `Create a concise, structured chat summary in German. Cover decisions, tasks, facts, and links. Use short headings and bullet points. Neutral tone.`;
+          `Create a concise, structured chat summary in English. Cover decisions, tasks, facts, and links. Use short headings and bullet points. Neutral tone.`;
+
+        console.log(`📝 [SUMMARY PROMPT USED]:\n${prompt}\n`);
 
         const text = rows
           .map((r) => `[${new Date(r.timestamp).toISOString()}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
@@ -178,7 +170,7 @@ class Context {
       if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
       for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
 
-      const afterRows = await this.getMessagesAfter(cutoffMs);
+      const afterRows = await this.getMessagesAfter(toMySQLDateTime(new Date(nowMs)));
       for (const r of afterRows) {
         newMsgs.push({ role: r.role, name: r.sender, content: r.content });
       }

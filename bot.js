@@ -1,5 +1,6 @@
-// bot.js — v2.9
-// Discord-Client + !summarize mit Cutoff, Chunked Posting und individuellem Prompt
+// bot.js — v3.0
+// !summarize mit Cutoff, Chat leeren, 5 Summaries einzeln posten (gechunked), 6. Nachricht für "after cutoff" (gechunked).
+// Kontext nach Vorgabe: System + 5 Summaries + alle Einzel-Nachrichten >= Cutoff
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -9,6 +10,7 @@ const {
   getChannelConfig,
   setAddUserMessage,
   setBotPresence,
+  sendChunked,
   postSummariesIndividually,
 } = require("./discord-helper.js");
 
@@ -30,14 +32,11 @@ async function deleteAllMessages(channel) {
   if (!perms?.has(PermissionsBitField.Flags.ManageMessages) || !perms?.has(PermissionsBitField.Flags.ReadMessageHistory)) {
     throw new Error("Missing permissions: ManageMessages and/or ReadMessageHistory");
   }
-
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let beforeId = null;
-
   while (true) {
     const fetched = await channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
     if (!fetched || fetched.size === 0) break;
-
     for (const msg of fetched.values()) {
       if (msg.pinned) continue;
       try {
@@ -45,7 +44,6 @@ async function deleteAllMessages(channel) {
       } catch {}
       await sleep(120);
     }
-
     const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
     if (!oldest) break;
     beforeId = oldest.id;
@@ -71,12 +69,10 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key);
 
-  // --- Commands ---
+  // ---- Commands ----
   if (message.content.startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
-    for (const c of chunks) {
-      await message.channel.send({ content: `\`\`\`json\n${c}\n\`\`\`` });
-    }
+    for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
     return;
   }
 
@@ -90,32 +86,29 @@ client.on("messageCreate", async (message) => {
     const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
 
     try {
-      // 1) Zusammenfassen (nur bis Cutoff)
       await chatContext.summarizeSince(cutoffMs, customPrompt);
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
     }
 
     try {
-      // 2) Channel leeren
       await deleteAllMessages(message.channel);
     } catch (e) {
       console.error("[!summarize] deleteAllMessages error:", e?.message || e);
       await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
     }
 
+    let summariesAsc = [];
+    let lastSummaryTime = "1970-01-01 00:00:00";
     try {
-      // 3) Summaries posten
       const last5Desc = await chatContext.getLastSummaries(5);
-      const summariesAsc = (last5Desc || []).slice().reverse().map(
-        (r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`
-      );
+      summariesAsc = (last5Desc || []).slice().reverse().map((r) => {
+        lastSummaryTime = r.timestamp;
+        return `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`;
+      });
 
-      // 4) Nachrichten nach Cutoff anzeigen
-      const afterRows = await chatContext.getMessagesAfter(cutoffMs);
-      const leftover = afterRows?.length ? afterRows.map(
-        (r) => `**${r.sender}**: ${r.content}`
-      ).join("\n") : "";
+      const afterRows = await chatContext.getMessagesAfter(lastSummaryTime);
+      const leftover = afterRows?.length ? afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n") : "";
 
       await postSummariesIndividually(message.channel, summariesAsc, leftover);
     } catch (e) {
@@ -132,7 +125,7 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // --- Normaler Nachrichtenfluss ---
+  // ---- Normaler Flow ----
   await setAddUserMessage(message, chatContext);
 
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();
@@ -151,7 +144,7 @@ client.on("messageCreate", async (message) => {
 })();
 client.once("ready", () => setBotPresence(client, "✅ Started", "online"));
 
-// Express /documents (optional)
+// HTTP /documents (optional)
 const expressApp = express();
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(
