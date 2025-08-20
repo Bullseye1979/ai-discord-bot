@@ -1,20 +1,18 @@
-// Version 2.4
-// Handler for Discord related actions
-// - Prüft Berechtigungen per ODER-Logik (userId || speakerName)
-// - Speichert auch abgelehnte Prompts im Kontext
-// - Keine Chat-Antwort bei Ablehnung, nur rotes ❌
-// - Verwendet getChannelConfig (nicht getChannelMeta)
-// - Reaktionen: ⏳ während Verarbeitung, ✅ bei Erfolg, ❌ bei Ablehnung/Fehler
+// Version 2.5
+// Handler für Discord-Aktionen
+// + Neuer Command: !summarize
+//   - erzeugt Summary (seit letzter), speichert in DB,
+//   - löscht alle Nachrichten im Channel,
+//   - postet die letzten 5 Summaries
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { setEmptyChat, setBotPresence, setMessageReaction, setAddUserMessage, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
 const { getContextAsChunks } = require("./helper.js");
-const { getToolRegistry } = require("./tools.js"); // <-- wichtig für Block-Tools
+const { getToolRegistry } = require("./tools.js");
 
 // Run an AI request
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
-    // Rate limit
     if (state.isAIProcessing >= 3) {
         try { await setMessageReaction(message, "❌"); } catch {}
         return;
@@ -26,14 +24,12 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     try {
         await message.react("⏳");
 
-        // Channel-Config laden (keine Config => keine Reaktion außer ❌, keine AI-Calls)
         const channelMeta = getChannelConfig(message.channelId);
         if (!channelMeta) {
             await setMessageReaction(message, "❌");
             return;
         }
 
-        // Block-Matching: ODER-Logik (userId || speakerName)
         const senderId = String(message.author?.id || "");
         const senderName = message.member?.displayName || message.author?.username || "";
         const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
@@ -49,22 +45,18 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
             return;
         }
 
-        // Tools/Model/API-Key aus Block verwenden (falls vorhanden)
         const effectiveModel = matchingBlock.model || model;
         const effectiveApiKey = matchingBlock.apikey || apiKey;
 
-        // ✅ FIX: Wenn der Block eigene Tools definiert, Registry dafür neu bauen
         if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
             const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
             chatContext.tools = blockTools;
             chatContext.toolRegistry = blockRegistry;
         } else {
-            // sonst Channel-weite Tools
             chatContext.tools = channelMeta.tools;
             chatContext.toolRegistry = channelMeta.toolRegistry;
         }
 
-        // AI-Aufruf
         const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
 
         if (output && output.trim()) {
@@ -110,7 +102,7 @@ async function setVoiceChannel(message, guildTextChannels, activeRecordings, cha
     setStartListening(getVoiceConnection(message.guild.id), message.guild.id, guildTextChannels, activeRecordings, client);
 }
 
-// Handle speech output in voice chat (liest Chatnachrichten vor)
+// Handle speech output in voice chat
 async function setTTS(message, client, guildTextChannels) {
     if (!message.guild) return;
 
@@ -158,11 +150,39 @@ async function setTTS(message, client, guildTextChannels) {
     }
 }
 
+// --- Neuer Command: !summarize ----------------------------------------------
+async function handleSummarize(message, chatContext) {
+    try {
+        // 1) Summary erzeugen & speichern
+        const created = await chatContext.generateAndStoreSummary(message.channelId);
+
+        // 2) Channel leeren
+        await setEmptyChat(message.channel);
+
+        // 3) Letzte 5 Summaries posten
+        const list = await chatContext.getLastSummaries(message.channelId, 5);
+        if (!list || list.length === 0) {
+            await setReplyAsWebhook(message, "Keine gespeicherten Zusammenfassungen vorhanden.", {});
+            return;
+        }
+        // Neueste zuerst anzeigen
+        const text = list
+            .map(r => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`)
+            .join(`\n\n---\n\n`);
+
+        await setReplyAsWebhook(message, text, {});
+    } catch (err) {
+        console.error("[SUMMARIZE ERROR]:", err);
+        await setReplyAsWebhook(message, "Fehler beim Erstellen/Veröffentlichen der Zusammenfassung.", {});
+    }
+}
+
 module.exports = {
     setMessageReaction,
     getContextAsChunks,
     getProcessAIRequest,
     setClearChat,
     setVoiceChannel,
-    setTTS
+    setTTS,
+    handleSummarize
 };
