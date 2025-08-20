@@ -7,9 +7,10 @@
 // - Reaktionen: ⏳ während Verarbeitung, ✅ bei Erfolg, ❌ bei Ablehnung/Fehler
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
-const { setEmptyChat, setBotPresence, setMessageReaction, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
+const { setEmptyChat, setBotPresence, setMessageReaction, setAddUserMessage, getChannelConfig, setReplyAsWebhook, getSpeech } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
 const { getContextAsChunks } = require("./helper.js");
+const { getToolRegistry } = require("./tools.js"); // <-- wichtig für Block-Tools
 
 // Run an AI request
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
@@ -28,7 +29,6 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         // Channel-Config laden (keine Config => keine Reaktion außer ❌, keine AI-Calls)
         const channelMeta = getChannelConfig(message.channelId);
         if (!channelMeta) {
-            // Ablehnen: kein Reply, kein Webhook-Output, nur ❌
             await setMessageReaction(message, "❌");
             return;
         }
@@ -45,8 +45,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         });
 
         if (!matchingBlock) {
-            // Keine Berechtigung: keine Antwort, aber Kontext wurde oben schon gefüllt
-            await setMessageReaction(message, "❌"); // rotes X statt grünem Haken
+            await setMessageReaction(message, "❌");
             return;
         }
 
@@ -54,11 +53,11 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         const effectiveModel = matchingBlock.model || model;
         const effectiveApiKey = matchingBlock.apikey || apiKey;
 
-        // Tools im Context setzen (falls der Channel-Block Toolnamen vorgibt)
+        // ✅ FIX: Wenn der Block eigene Tools definiert, Registry dafür neu bauen
         if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-            // Falls dein Context-Objekt eine Setter-Methode hat, sonst direkt Zuweisung:
-            chatContext.tools = channelMeta.tools;           // bereits gefiltert in getChannelConfig (Registry passend)
-            chatContext.toolRegistry = channelMeta.toolRegistry;
+            const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+            chatContext.tools = blockTools;
+            chatContext.toolRegistry = blockRegistry;
         } else {
             // sonst Channel-weite Tools
             chatContext.tools = channelMeta.tools;
@@ -69,22 +68,17 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
 
         if (output && output.trim()) {
-            // als Webhook im Bot-Namen antworten
             await setReplyAsWebhook(message, output, {
                 botname: channelMeta.botname,
                 avatarUrl: channelMeta.avatarUrl
             });
-            // Assistentenantwort in den (originalen) Chatkontext schreiben
             chatContext.add("assistant", channelMeta?.botname || "AI", output);
-            // ✅ fertig
             await setMessageReaction(message, "✅");
         } else {
-            // Kein Output von der AI => als fehlerhaft markieren
             await setMessageReaction(message, "❌");
         }
     } catch (err) {
         console.error("[ERROR]: Failed to process request:", err);
-        // Fehler: rotes X
         try { await setMessageReaction(message, "❌"); } catch {}
     } finally {
         state.isAIProcessing--;
@@ -112,7 +106,6 @@ async function setVoiceChannel(message, guildTextChannels, activeRecordings, cha
         selfDeaf: false,
     });
     guildTextChannels.set(message.guild.id, message.channel.id);
-    // setStartListening wird in discord-helper bereitgestellt
     const { setStartListening } = require("./discord-helper.js");
     setStartListening(getVoiceConnection(message.guild.id), message.guild.id, guildTextChannels, activeRecordings, client);
 }
@@ -126,7 +119,7 @@ async function setTTS(message, client, guildTextChannels) {
     if (message.channel.id !== expectedChannelId) return;
 
     const meta = getChannelConfig(message.channelId);
-    if (!meta) return; // keine Channel-Config -> keine Ausgabe
+    if (!meta) return;
 
     const { botname, voice } = meta;
 
@@ -154,9 +147,8 @@ async function setTTS(message, client, guildTextChannels) {
     const connection = getVoiceConnection(guildId);
     if (!connection || connection.joinConfig.channelId !== botVC) return;
 
-    // Aufräumen für TTS
     const cleaned = message.content
-        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1') // Markdown-Links -> Text
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
         .replace(/https?:\/\/\S+/g, 'Link')
         .replace(/<@!?(\d+)>/g, 'jemand')
         .replace(/:[^:\s]+:/g, '');

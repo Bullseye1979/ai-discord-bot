@@ -169,7 +169,6 @@ const fullToolRegistry = {
     getPDF
 };
 
-
 function getToolRegistry(toolNames = []) {
     if (!Array.isArray(toolNames)) {
         throw new Error("getToolRegistry erwartet ein Array von Toolnamen.");
@@ -191,4 +190,4 @@ function getToolRegistry(toolNames = []) {
 }
 
 // Exports
-module.exports = { getToolRegistry };
+module.exports = { tools, getToolRegistry };
