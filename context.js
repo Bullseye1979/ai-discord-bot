@@ -1,29 +1,24 @@
-// context.js — v4.5
-// - SQL-Logging (context_log) + Summaries (summaries)
-// - summarizeSince(cutoffMs, customPrompt):
-//     * fasst NUR bis Cutoff zusammen (seit letzter Summary)
-//     * speichert neue Summary
-//     * setzt internen Kontext auf: [System] + [5 Summaries (ASC)] + [alle Nachrichten >= Cutoff (mit originalen Rollen/Namen)]
-// - getMessagesAfter(cutoffMs): liefert alle >= Cutoff (für Sammelnachricht im Chat)
+// context.js — v4.5 (Cutoff + SQL + Kontextaufbau nach Vorgabe)
+// Kontext nach !summarize: System + 5 Summaries (älteste->neueste) + ALLE Einzel-Messages >= Cutoff
 
-require('dotenv').config();
-const mysql = require('mysql2/promise');
-const { getAI } = require('./aiService.js');
+require("dotenv").config();
+const mysql = require("mysql2/promise");
+const { getAI } = require("./aiService.js");
 
 let pool;
 
 async function getPool() {
   if (!pool) {
     pool = await mysql.createPool({
-      host: process.env.DB_HOST || '127.0.0.1',
+      host: process.env.DB_HOST || "127.0.0.1",
       user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD || process.env.DB_PASS || '',
+      password: process.env.DB_PASSWORD || process.env.DB_PASS || "",
       database: process.env.DB_NAME || process.env.DB_DATABASE,
       waitForConnections: true,
       connectionLimit: 10,
       queueLimit: 0,
-      timezone: 'Z',
-      charset: 'utf8mb4_general_ci'
+      timezone: "Z",
+      charset: "utf8mb4_general_ci",
     });
     await ensureTables(pool);
   }
@@ -31,9 +26,9 @@ async function getPool() {
 }
 
 async function ensureTables(pool) {
-  const conn = await pool.getConnection();
+  const c = await pool.getConnection();
   try {
-    await conn.query(`
+    await c.query(`
       CREATE TABLE IF NOT EXISTS context_log (
         id INT AUTO_INCREMENT PRIMARY KEY,
         timestamp DATETIME NOT NULL,
@@ -45,7 +40,7 @@ async function ensureTables(pool) {
         INDEX idx_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-    await conn.query(`
+    await c.query(`
       CREATE TABLE IF NOT EXISTS summaries (
         id INT AUTO_INCREMENT PRIMARY KEY,
         timestamp DATETIME NOT NULL,
@@ -54,29 +49,30 @@ async function ensureTables(pool) {
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-  } finally { conn.release(); }
+  } finally {
+    c.release();
+  }
 }
 
 function toMySQLDateTime(date = new Date()) {
-  const pad = n => String(n).padStart(2, '0');
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth()+1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
-const sanitize = s => String(s||'system').toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/gi,'').slice(0,64);
+const sanitize = (s) => String(s || "system").toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/gi, "").slice(0, 64);
 
 class Context {
-  constructor(persona='', instructions='', tools=[], toolRegistry={}, channelId='global') {
+  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global") {
     this.messages = [];
-    this.persona = persona || '';
-    this.instructions = instructions || '';
+    this.persona = persona || "";
+    this.instructions = instructions || "";
     this.tools = tools || [];
     this.toolRegistry = toolRegistry || {};
     this.channelId = channelId;
     this.isSummarizing = false;
 
     const sys = `${this.persona}\n${this.instructions}`.trim();
-    if (sys) this.messages.push({ role:'system', name:'system', content: sys });
+    if (sys) this.messages.push({ role: "system", name: "system", content: sys });
 
-    // initial: 5 Summaries einfügen
     this._initLoaded = this._injectInitialSummaries();
   }
 
@@ -89,18 +85,26 @@ class Context {
       );
       if (!rowsDesc?.length) return;
       const asc = rowsDesc.slice().reverse();
-      const head = this.messages[0]?.role === 'system' ? 1 : 0;
-      // alte Summary-Blöcke direkt nach System entfernen
-      let i=head; while (i < this.messages.length && this.messages[i]?.name==='summary') this.messages.splice(i,1);
-      this.messages.splice(head,0,...asc.map(r=>({role:'assistant', name:'summary', content:r.summary})));
+      const head = this.messages[0]?.role === "system" ? 1 : 0;
+      // Summary-Slot leeren
+      let i = head;
+      while (i < this.messages.length && this.messages[i]?.name === "summary") this.messages.splice(i, 1);
+      // Einfügen
+      this.messages.splice(
+        head,
+        0,
+        ...asc.map((r) => ({ role: "assistant", name: "summary", content: r.summary }))
+      );
     } catch (e) {
-      console.error('[DB] load initial summaries failed:', e.message);
+      console.error("[DB] load initial summaries failed:", e.message);
     }
   }
 
   async add(role, sender, content) {
-    const entry = { role, name: sanitize(sender), content: String(content ?? '') };
-    try { await this._initLoaded; } catch {}
+    const entry = { role, name: sanitize(sender), content: String(content ?? "") };
+    try {
+      await this._initLoaded;
+    } catch {}
     this.messages.push(entry);
 
     try {
@@ -110,12 +114,12 @@ class Context {
         [toMySQLDateTime(new Date()), this.channelId, role, entry.name, entry.content]
       );
     } catch (e) {
-      console.error('[DB] insert context_log failed:', e.message);
+      console.error("[DB] insert context_log failed:", e.message);
     }
     return entry;
   }
 
-  // alle Nachrichten >= cutoff (für Sammelnachricht & Kontext-Anteil)
+  // ALLE Nachrichten >= cutoff (für Sammel-Nachricht und Kontext-Anteil)
   async getMessagesAfter(cutoffMs) {
     const db = await getPool();
     const [rows] = await db.execute(
@@ -128,23 +132,21 @@ class Context {
     return rows || [];
   }
 
-  // fasst NUR bis Cutoff zusammen; setzt den internen Kontext neu,
-  // danach: System + 5 Summaries (ASC) + alle >= Cutoff (als Einzel-Messages)
-  async summarizeSince(cutoffMs, customPrompt=null) {
+  // Zusammenfassen bis Cutoff; Kontext danach = System + 5 Summaries (ASC) + alle >= Cutoff (Einzel)
+  async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
     try {
       const db = await getPool();
 
-      // 1) Bestimme Zeit der letzten Summary
+      // letzte Summary-Zeit
       const [lastSum] = await db.execute(
         `SELECT timestamp FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
       const lastTs = lastSum?.[0]?.timestamp || null;
-
-      // 2) Einträge bis Cutoff (und > lastTs, falls vorhanden) laden
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
+
       let sql = `SELECT timestamp, role, sender, content
                    FROM context_log
                   WHERE channel_id=? AND timestamp <= ?
@@ -155,21 +157,23 @@ class Context {
                  FROM context_log
                 WHERE channel_id=? AND timestamp > ? AND timestamp <= ?
                 ORDER BY id ASC`;
-        params.splice(1,0,lastTs);
+        params.splice(1, 0, lastTs);
       }
       const [rows] = await db.execute(sql, params);
 
-      // 3) Nur wenn es was Neues gibt, eine neue Summary erstellen
       if (rows?.length) {
-        const prompt = (customPrompt && customPrompt.trim())
-          ? customPrompt
-          : `Create a concise, structured chat summary in German. Cover decisions, tasks, facts, and links. Use short headings and bullet points. Neutral tone.`;
+        const prompt =
+          (customPrompt && customPrompt.trim()) ||
+          `Create a concise, structured chat summary in German. Cover decisions, tasks, facts, and links. Use short headings and bullet points. Neutral tone.`;
 
-        const text = rows.map(r=>`[${new Date(r.timestamp).toISOString()}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`).join('\n');
+        const text = rows
+          .map((r) => `[${new Date(r.timestamp).toISOString()}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
+          .join("\n");
 
+        // KI-Call
         const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId);
-        await sumCtx.add('user','system',text);
-        const summary = (await getAI(sumCtx, 900, 'gpt-4-turbo'))?.trim() || "";
+        await sumCtx.add("user", "system", text);
+        const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
 
         if (summary) {
           await db.execute(
@@ -179,7 +183,7 @@ class Context {
         }
       }
 
-      // 4) Interner Kontext NEU: System + 5 Summaries (ASC) + alle >= Cutoff (Einzel-Messages)
+      // Kontext neu aufbauen: System + 5 Summaries (ASC) + alle >= Cutoff
       const [desc] = await db.execute(
         `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
         [this.channelId]
@@ -188,30 +192,25 @@ class Context {
 
       const newMsgs = [];
       const sys = `${this.persona}\n${this.instructions}`.trim();
-      if (sys) newMsgs.push({ role:'system', name:'system', content: sys });
-      for (const r of asc) newMsgs.push({ role:'assistant', name:'summary', content: r.summary });
+      if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
+      for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
 
-      // Nachrichten >= Cutoff (mit originalen Rollen/Namen)
       const afterRows = await this.getMessagesAfter(cutoffMs);
       for (const r of afterRows) {
-        newMsgs.push({
-          role: r.role,
-          name: r.sender,
-          content: r.content
-        });
+        newMsgs.push({ role: r.role, name: r.sender, content: r.content });
       }
 
       this.messages = newMsgs;
       return this.messages;
     } catch (e) {
-      console.error('[SUMMARIZE] failed:', e);
+      console.error("[SUMMARIZE] failed:", e);
       return this.messages;
     } finally {
       this.isSummarizing = false;
     }
   }
 
-  async getLastSummaries(limit=5) {
+  async getLastSummaries(limit = 5) {
     const db = await getPool();
     const [rows] = await db.execute(
       `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
@@ -222,10 +221,15 @@ class Context {
 
   async getContextAsChunks() {
     const max = 1900;
-    const full = JSON.stringify(this.messages.map(m=>({role:m.role,name:m.name,content:m.content})), null, 2);
-    const out=[]; for (let i=0;i<full.length;i+=max) out.push(full.slice(i,i+max));
+    const full = JSON.stringify(
+      this.messages.map((m) => ({ role: m.role, name: m.name, content: m.content })),
+      null,
+      2
+    );
+    const out = [];
+    for (let i = 0; i < full.length; i += max) out.push(full.slice(i, i + max));
     return out;
-  }
+    }
 }
 
 module.exports = Context;
