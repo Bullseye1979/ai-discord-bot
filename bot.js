@@ -64,27 +64,21 @@ client.on("messageCreate", async (message) => {
     : !!message.channel.parentId; // fallback
   const effectiveChannelId = isThread ? (message.channel.parentId || message.channelId) : message.channelId;
 
-  // Parent-ID nutzen, wenn die Nachricht in einem Thread steht
-  const baseChannelId = (message.channel?.isThread?.())
-    ? message.channel.parentId
-    : message.channelId;
+// Parent-Channel statt Thread verwenden (Transcripts-Thread soll die Parent-Konfig erben)
+const inThread = (typeof message.channel?.isThread === "function") && message.channel.isThread();
+const baseChannelId = (inThread && message.channel.parentId) ? message.channel.parentId : message.channelId;
 
-  // Transcripts-Thread erkennen
-  const isTranscriptThread =
-    message.channel?.isThread?.() && message.channel.name === "Transcripts";
+// Transcripts-Thread erkennen
+const isTranscriptThread = inThread && message.channel.name === "Transcripts";
 
-  // Webhook-Spiegel im Transcripts-Thread komplett ignorieren (kein Logging/Trigger)
-  if (message.webhookId && isTranscriptThread) return;
-
-  // Parent-Channel statt Thread verwenden (Transcripts-Thread soll die Parent-Konfig erben)
-const baseChannelId = (message.channel?.isThread?.() && message.channel.parentId)
-  ? message.channel.parentId
-  : message.channelId;
+// Webhook-Spiegel im Transcripts-Thread komplett ignorieren (kein Logging/Trigger)
+if (message.webhookId && isTranscriptThread) return;
 
 const channelMeta = getChannelConfig(baseChannelId);
 if (!channelMeta) return;
 
 const key = `channel:${baseChannelId}`;
+
 
 
 
@@ -230,40 +224,40 @@ const key = `channel:${baseChannelId}`;
   }
 
 
-  // ---------------- Normaler Flow ----------------
+ // ---------------- Normaler Flow ----------------
 
 // a) Transcripts-Thread erkennen
 const inTranscriptsThread =
   message.channel?.isThread?.() && message.channel.name === "Transcripts";
 
-// b) Nur echte User-Nachrichten loggen – keine Webhooks/Bots und NICHT im Transcripts-Thread
+// b) Nur echte User-Texte loggen – keine Webhooks/Bots und NICHT im Transcripts-Thread
 if (!inTranscriptsThread && !message.author?.bot && !message.webhookId) {
   await setAddUserMessage(message, chatContext);
 }
 
-// c) TTS-Hook beibehalten (hat keinen Effekt für Transkript-Posts)
+// c) TTS-Hook (hat keinen Effekt für Transkript-Posts)
 try {
   await setTTS(message, client, guildTextChannels);
 } catch (e) {
   console.warn("[TTS] call failed:", e?.message || e);
 }
 
-// d) Inhalt für Trigger ermitteln
+// d) Inhalt vorbereiten (im Transcripts-Thread Sprecherpräfix abtrennen)
 let contentRaw = message.content || "";
 
-// Im Transcripts-Thread postet der Bot z.B. "**Alice:** Jenny ..."
-if (inTranscriptsThread && message.author?.id === client.user?.id) {
+if (inTranscriptsThread) {
+  // Form: **Sprecher:** eigentliche Aussage
   const m = contentRaw.match(/^\*\*[^:]+:\*\*\s*(.+)$/s);
-  if (m) contentRaw = m[1]; // nur der gesprochene Teil
+  if (m) contentRaw = m[1];
 }
 
-// e) Trigger-Check (Name aus Channel-Config)
+// e) Trigger-Check (Name aus Parent-Channel-Config)
 const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
 const norm = contentRaw.trim().toLowerCase();
 const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
 if (!isTrigger) return;
 
-// f) An KI weitergeben, ohne das Transkript in die DB zu schreiben (Proxy überschreibt content)
+// f) An KI weitergeben – ohne Loggen des Transkript-Posts (Proxy überschreibt content)
 const state = { isAIProcessing: 0 };
 const proxyMsg = new Proxy(message, {
   get(target, prop) {
@@ -273,6 +267,7 @@ const proxyMsg = new Proxy(message, {
 });
 
 return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+
 
 });
 
