@@ -2,6 +2,7 @@
 // Voice (TTS + optional Transcripts-Thread), Chunking, Webhook-Replies, Channel-Config (inkl. summaryPrompt)
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { tools, getToolRegistry } = require("./tools.js");
 const { EndBehaviorType, createAudioResource, StreamType } = require("@discordjs/voice");
@@ -290,10 +291,49 @@ async function setAddUserMessage(message, chatContext) {
 }
 
 
+// temp-Datei anlegen
+async function makeTmpFile(ext = ".wav") {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
+  const file = path.join(dir, `${Date.now()}${ext}`);
+  return { dir, file };
+}
+
+// PCM → WAV (über ffmpeg aus einem Readable-Stream)
+function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const { dir, file } = await makeTmpFile(".wav");
+      ffmpeg()
+        .input(pcmReadable)
+        .inputOptions([`-f s16le`, `-ar ${rate}`, `-ac ${channels}`]) // Roh-PCM-Format
+        .audioCodec("pcm_s16le")
+        .format("wav")
+        .save(file)
+        .on("end", () => resolve({ dir, file }))
+        .on("error", reject);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// Discord-ID → Anzeigename
+async function resolveSpeakerName(client, guildId, userId) {
+  try {
+    const g = await client.guilds.fetch(guildId);
+    const m = await g.members.fetch(userId).catch(() => null);
+    return m?.displayName || m?.user?.username || "Unknown";
+  } catch {
+    return "Unknown";
+  }
+}
+
+
 async function setStartListening(connection, guildId, guildTextChannels, client) {
   try {
     if (!connection || !guildId) return;
     if (activeRecordings.get(guildId)) return; // schon aktiv
+
     const textChannelId = guildTextChannels.get(guildId);
     const textChannel = textChannelId ? await client.channels.fetch(textChannelId).catch(() => null) : null;
     if (!textChannel) return;
@@ -308,41 +348,66 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
 
     receiver.speaking.on("start", (userId) => {
       try {
+        // 1) Opus abonnieren
         const opus = receiver.subscribe(userId, {
-          end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
+          end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 } // 1s Stille = Ende
         });
 
+        // 2) Opus → PCM
         const pcm = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
-        const chunks = [];
-        pcm.on("data", (c) => chunks.push(c));
+
+        // 3) PCM in PassThrough schieben, ffmpeg gleichzeitig starten
+        const pass = new PassThrough();
+        const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
+
+        let bytes = 0;
+        pcm.on("data", (chunk) => {
+          bytes += chunk.length;
+          pass.write(chunk);
+        });
         pcm.on("end", async () => {
+          pass.end();
           try {
-            const buf = Buffer.concat(chunks);
-            if (buf.length < 48000) return; // zu kurz -> ignorieren
+            const { dir, file } = await wavPromise;
 
-            // Sprache erkennen (Passe Sprache/Signatur an deine aiService.js an)
-            const text = await getTranscription(buf, "whisper-1", "auto");
+            // sehr kurze Aufnahmen überspringen (z.B. < 0.5s bei 48kHz mono 16-bit ~ 48kB)
+            const st = await fs.promises.stat(file).catch(() => null);
+            if (!st || st.size < 48000) {
+              try { await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
+              return;
+            }
+
+            // 4) Transkribieren —> WICHTIG: Dateipfad übergeben
+            // Wenn deine aiService.getTranscription einen Stream erwartet:
+            //   const text = await getTranscription(fs.createReadStream(file), "whisper-1", "auto");
+            // Wenn sie einen Dateipfad erwartet (häufiger Fall):
+            const text = await getTranscription(file, "whisper-1", "auto");
+
             if (text && text.trim()) {
-              // Sprechernamen ermitteln
-              let speaker = "Unknown";
-              try {
-                const g = await client.guilds.fetch(guildId);
-                const m = await g.members.fetch(userId).catch(() => null);
-                speaker = m?.displayName || m?.user?.username || speaker;
-              } catch {}
-
+              const speaker = await resolveSpeakerName(client, guildId, userId);
               await sendChunked(target, `**${speaker}:** ${text.trim()}`);
             }
           } catch (err) {
             console.warn("[Transcription] failed:", err?.message || err);
+          } finally {
+            // 5) Aufräumen
+            try {
+              const { dir } = await wavPromise; // dir aus dem Promise ziehen
+              await fs.promises.rm(dir, { recursive: true, force: true });
+            } catch {}
           }
+        });
+
+        pcm.on("error", (e) => {
+          console.warn("[PCM stream error]:", e?.message || e);
+          try { pass.destroy(); } catch {}
         });
       } catch (e) {
         console.warn("[Voice subscribe] failed:", e?.message || e);
       }
     });
 
-    // Aufräumen
+    // Aufräumen, wenn Verbindung endet
     connection.on("stateChange", (oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
         activeRecordings.delete(guildId);
@@ -352,7 +417,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     console.warn("[setStartListening] failed:", e?.message || e);
   }
 }
-
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
