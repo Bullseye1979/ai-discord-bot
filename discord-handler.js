@@ -111,50 +111,53 @@ async function setVoiceChannel(message, guildTextChannels, _activeRecordings, _c
 async function setTTS(message, client, guildTextChannels) {
   if (!message.guild) return;
 
+  // Nicht im Transcripts-Thread vorlesen
+  const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+  if (inThread && message.channel.name === "Transcripts") return;
+
+  // Summaries NIEMALS vorlesen
+  const txt = (message.content || "").trim();
+  const looksLikeSummary =
+    txt.startsWith("**Summary") ||
+    txt.includes("Summary in progress…") ||
+    txt.includes("Summary completed.");
+
+  if (looksLikeSummary) return;
+
+  // Nur KI-Antworten vorlesen, nicht alles
+  // Prüfe, ob es eine Webhook-Nachricht unseres Bots ist
+  const isWebhook = !!message.webhookId;
+  const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+  const meta = getChannelConfig(effectiveChannelId);
+  const isAIWebhook =
+    isWebhook &&
+    (await message.channel.fetchWebhooks().then(ws => {
+      const w = ws.find(x => x.id === message.webhookId);
+      return w && w.name === (meta?.botname || "AI");
+    }).catch(() => false));
+
+  if (!isAIWebhook) return; // Nur echte AI-Ausgaben vorlesen (keine Userposts usw.)
+
+  // Muss im selben Guild-Textkanal sein, in dem der Bot gerade "hängt"
   const guildId = message.guild.id;
   const expectedChannelId = guildTextChannels.get(guildId);
-  if (!expectedChannelId || message.channel.id !== expectedChannelId) return;
+  if (expectedChannelId && message.channel.id !== expectedChannelId) return;
 
-  const meta = getChannelConfig(message.channelId);
-  if (!meta) return;
-
-  const { botname, voice } = meta;
-
-  // Erkennen, ob Nachricht von unserem Webhook/Bot kam
-  const isDirectBot = message.author?.id === client.user.id;
-  let isAIWebhook = false;
-
-  if (message.webhookId) {
-    try {
-      const webhooks = await message.channel.fetchWebhooks();
-      const matching = webhooks.find(w => w.id === message.webhookId);
-      if (matching && matching.name === botname) {
-        isAIWebhook = true;
-      }
-    } catch (err) {
-      console.warn("[TTS] Webhook check failed:", err.message);
-    }
-  }
-
-  if (!isDirectBot && !isAIWebhook) return;
-
-  const botMember = await message.guild.members.fetch(client.user.id);
-  const botVC = botMember.voice.channelId;
-  if (!botVC) return;
-
+  // Verbindung und Voice-Channel prüfen
   const { getVoiceConnection } = require("@discordjs/voice");
   const connection = getVoiceConnection(guildId);
-  if (!connection || connection.joinConfig.channelId !== botVC) return;
+  if (!connection) return;
 
-  // Cleanup: Links/Mentions/Emotes raus
-  const cleaned = (message.content || "")
+  // Jetzt wirklich sprechen
+  const cleaned = txt
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
-    .replace(/https?:\/\/\S+/g, 'link')
+    .replace(/https?:\/\/\S+/g, 'Link')
     .replace(/<@!?(\d+)>/g, 'someone')
     .replace(/:[^:\s]+:/g, '');
 
-  if (cleaned.trim()) {
-    await getSpeech(connection, guildId, cleaned, client, voice);
+  if (cleaned) {
+    const { getSpeech } = require("./discord-helper.js");
+    await getSpeech(connection, guildId, cleaned, client, meta?.voice);
   }
 }
 

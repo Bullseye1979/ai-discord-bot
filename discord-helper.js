@@ -157,20 +157,27 @@ async function postSummariesIndividually(channel, summaries, _leftover) {
 // ---------- Webhook Reply ----------
 async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
   try {
-    const hooks = await message.channel.fetchWebhooks();
-    let hook = hooks.find((w) => w.name === botname);
+    const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    const hookChannel = isThread ? message.channel.parent : message.channel;
+
+    // Falls Parent nicht verfügbar (sollte in Threads nicht passieren), fallback
+    const hooks = await hookChannel.fetchWebhooks();
+    let hook = hooks.find((w) => w.name === (botname || "AI"));
     if (!hook) {
-      hook = await message.channel.createWebhook({
-        name: botname || "AI"
+      hook = await hookChannel.createWebhook({
+        name: botname || "AI",
+        avatar: avatarUrl || undefined
       });
     }
+
     const parts = splitIntoChunks(content);
     for (const p of parts) {
       await hook.send({
         content: p,
         username: botname || "AI",
         avatarURL: avatarUrl || undefined,
-        allowedMentions: { parse: [] }
+        allowedMentions: { parse: [] },
+        threadId: isThread ? message.channel.id : undefined
       });
     }
   } catch (e) {
@@ -178,10 +185,6 @@ async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
     // Fallback ohne Webhook
     await sendChunked(message.channel, content);
   }
-}
-
-async function setMessageReaction(message, emoji) {
-  try { await message.react(emoji); } catch {}
 }
 
 // ---------- Transcripts-Thread ----------

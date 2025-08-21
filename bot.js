@@ -1,4 +1,4 @@
-// bot.js — v3.3
+// bot.js — v3.4
 // Commands: !context (nur anzeigen, nicht loggen), !summarize (Cutoff + Statusmeldung),
 // !purge-db (DB wipe für Channel), !joinvc / !leavevc (Voice),
 // TTS für AI-Antworten, Transcripts-Thread-Mirroring in discord-handler
@@ -58,17 +58,23 @@ async function deleteAllMessages(channel) {
 client.on("messageCreate", async (message) => {
   if (!message.guild) return;
 
-  const channelMeta = getChannelConfig(message.channelId);
+  // -------- Parent-Channel-Logik für Threads --------
+  const isThread = typeof message.channel.isThread === "function"
+    ? message.channel.isThread()
+    : !!message.channel.parentId; // fallback
+  const effectiveChannelId = isThread ? (message.channel.parentId || message.channelId) : message.channelId;
+
+  const channelMeta = getChannelConfig(effectiveChannelId);
   if (!channelMeta) return;
 
-  const key = `channel:${message.channelId}`;
+  const key = `channel:${effectiveChannelId}`;
   if (!contextStorage.has(key)) {
     const ctx = new Context(
       channelMeta.persona,
       channelMeta.instructions,
       channelMeta.tools,
       channelMeta.toolRegistry,
-      message.channelId
+      effectiveChannelId // Kontext/DB-Schlüssel = Parent
     );
     contextStorage.set(key, ctx);
   }
@@ -77,14 +83,14 @@ client.on("messageCreate", async (message) => {
   // ---------------- Commands (vor Logging!) ----------------
 
   // !context: nur anzeigen, NICHT loggen
-  if (message.content.startsWith("!context")) {
+  if ((message.content || "").startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
     for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
     return;
   }
 
   // !purge-db: Channel-Einträge in beiden Tabellen löschen (Admin / ManageGuild)
-  if (message.content.startsWith("!purge-db")) {
+  if ((message.content || "").startsWith("!purge-db")) {
     const member = message.member;
     const hasPerm =
       member.permissions.has(PermissionsBitField.Flags.Administrator) ||
@@ -107,23 +113,27 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // !joinvc: Voice beitreten + TTS bereit
-  if (message.content.startsWith("!joinvc")) {
-  const vc = message.member?.voice?.channel;
-  if (!vc) { await message.reply("Join a voice channel first."); return; }
-  const conn = joinVoiceChannel({
-    channelId: vc.id,
-    guildId: message.guild.id,
-    adapterCreator: message.guild.voiceAdapterCreator,
-    selfDeaf: false,
-  });
-  guildTextChannels.set(message.guild.id, message.channel.id);
-  setStartListening(conn, message.guild.id, guildTextChannels, client);
-  return;
-}
+  // !joinvc: Voice beitreten + TTS bereit (Textkanal immer Parent mappen)
+  if ((message.content || "").startsWith("!joinvc")) {
+    const vc = message.member?.voice?.channel;
+    if (!vc) { await message.reply("Join a voice channel first."); return; }
+
+    const conn = joinVoiceChannel({
+      channelId: vc.id,
+      guildId: message.guild.id,
+      adapterCreator: message.guild.voiceAdapterCreator,
+      selfDeaf: false,
+    });
+
+    const mappedTextChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+    guildTextChannels.set(message.guild.id, mappedTextChannelId);
+
+    setStartListening(conn, message.guild.id, guildTextChannels, client);
+    return;
+  }
 
   // !leavevc: Voice verlassen
-  if (message.content.startsWith("!leavevc")) {
+  if ((message.content || "").startsWith("!leavevc")) {
     const conn = getVoiceConnection(message.guild.id);
     if (conn) {
       try { conn.destroy(); } catch {}
@@ -136,7 +146,7 @@ client.on("messageCreate", async (message) => {
   }
 
   // !summarize: Statusmeldung (EN), Cutoff, Summary, Channel leeren, 5 Summaries, Cursor bump, Abschluss
-  if (message.content.startsWith("!summarize")) {
+  if ((message.content || "").startsWith("!summarize")) {
     let progress = null;
     try {
       progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
@@ -198,17 +208,19 @@ client.on("messageCreate", async (message) => {
 
   // ---------------- Normaler Flow ----------------
 
-  // Zuerst in Kontext loggen (User/Anhänge) – aber nicht für !context etc.
-  await setAddUserMessage(message, chatContext);
+  // Nur echte User-Nachrichten in den Kontext loggen (keine Webhooks/Bot)
+  if (!message.author?.bot && !message.webhookId) {
+    await setAddUserMessage(message, chatContext);
+  }
 
-  // TTS: Falls wir in einem Textkanal arbeiten, der mit Voice verknüpft ist
+  // TTS anstoßen (Filter-Logik in setTTS sorgt dafür, dass Transcripts/Summaries stumm bleiben)
   try {
     await setTTS(message, client, guildTextChannels);
   } catch (e) {
     console.warn("[TTS] call failed:", e.message);
   }
 
-  // Trigger für KI
+  // Trigger für KI (aus Parent-Channel-Config)
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();
   const content = (message.content || "").trim().toLowerCase();
   const isTrigger = content.startsWith(trigger) || content.startsWith(`!${trigger}`);
