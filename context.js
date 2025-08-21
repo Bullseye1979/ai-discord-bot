@@ -1,12 +1,15 @@
-// context.js — v4.7.1 (auf Basis v4.7)
-// Neu:
-//  - Vorhandene Summaries im Kontext klar markieren: <<<PRIOR_SUMMARY_START ...>>> ... <<<PRIOR_SUMMARY_END>>>
-//  - System-Hinweis, wie diese Marker zu interpretieren sind (Kontext, nicht erneut zusammenfassen)
-//  - Der Input an den Summarizer wird zwischen <<<BEGIN NEW MESSAGES>>> ... <<<END NEW MESSAGES>>> gekapselt
+// context.js — v4.7.2 (v4.7 + vollständige Debug-Ausgabe des Summarizer-Kontexts)
+//
+// Debug-Logs (standardmäßig AN; mit SUMMARY_DEBUG=0 ausschalten):
+//  - Cursor + Cutoff
+//  - Ausgewählte DB-Zeilen (die tatsächlich zusammengefasst werden)
+//  - Voller Summarizer-Kontext (sumCtx.messages), so wie er an getAI() geht
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
+
+const DEBUG_SUMMARY = process.env.SUMMARY_DEBUG !== "0";
 
 let pool;
 
@@ -49,13 +52,13 @@ async function ensureTables(pool) {
         timestamp DATETIME NOT NULL,
         channel_id VARCHAR(64) NOT NULL,
         summary MEDIUMTEXT NOT NULL,
-        -- bis zu welcher context_log.id wurde zusammengefasst
+        -- NEU: bis zu welcher context_log.id wurde zusammengefasst
         last_context_id INT NULL,
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // falls Spalte bereits vorhanden, Fehler ignorieren
+    // Falls Spalte in bestehender DB fehlt: nachrüsten (MariaDB/10.3+ versteht IF NOT EXISTS)
     await c.query(`
       ALTER TABLE summaries
       ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
@@ -86,10 +89,7 @@ class Context {
     this.channelId = channelId;
     this.isSummarizing = false;
 
-    // System: Persona + Instruktionen + kurzer Hinweis zu Summary-Markern
-    const markerNote =
-      "NOTE: Assistant messages named 'summary' or text enclosed by <<<PRIOR_SUMMARY_START...>>> and <<<PRIOR_SUMMARY_END>>> are prior summaries for context only. Do NOT re-summarize or quote them unless explicitly instructed.";
-    const sys = [this.persona, this.instructions, markerNote].filter(Boolean).join("\n").trim();
+    const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
 
     this._initLoaded = this._injectInitialSummaries();
@@ -103,27 +103,17 @@ class Context {
         [this.channelId]
       );
       if (!rowsDesc?.length) return;
-
-      const asc = rowsDesc.slice().reverse(); // älteste -> neueste
+      const asc = rowsDesc.slice().reverse();
       const head = this.messages[0]?.role === "system" ? 1 : 0;
-
-      // Vorhandene Summary-Slots entfernen (falls vorhanden)
+      // Summary-Slot leeren
       let i = head;
-      while (i < this.messages.length && this.messages[i]?.name === "summary") {
-        this.messages.splice(i, 1);
-      }
-
-      // Zusammenfassungen mit klaren Markern einfügen
-      const tagged = asc.map((r, idx) => {
-        const ts = new Date(r.timestamp).toISOString();
-        const body =
-          `<<<PRIOR_SUMMARY_START ts=${ts} idx=${idx + 1}/${asc.length}>>>` +
-          `\n${r.summary.trim()}\n` +
-          `<<<PRIOR_SUMMARY_END>>>`;
-        return { role: "assistant", name: "summary", content: body };
-      });
-
-      this.messages.splice(head, 0, ...tagged);
+      while (i < this.messages.length && this.messages[i]?.name === "summary") this.messages.splice(i, 1);
+      // Einfügen
+      this.messages.splice(
+        head,
+        0,
+        ...asc.map((r) => ({ role: "assistant", name: "summary", content: r.summary }))
+      );
     } catch (e) {
       console.error("[DB] load initial summaries failed:", e.message);
     }
@@ -131,7 +121,9 @@ class Context {
 
   async add(role, sender, content) {
     const entry = { role, name: sanitize(sender), content: String(content ?? "") };
-    try { await this._initLoaded; } catch {}
+    try {
+      await this._initLoaded;
+    } catch {}
     this.messages.push(entry);
 
     try {
@@ -161,7 +153,7 @@ class Context {
 
   // Cursor-basierte Zusammenfassung (keine Dopplungen):
   // - NUR context_log.id > last_context_id
-  // - UND timestamp <= cutoff
+  // - UND timestamp <= cutoff  (schützt vor "während des Laufs" gesendeten Nachrichten)
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
@@ -169,7 +161,7 @@ class Context {
     try {
       const db = await getPool();
 
-      // letzte Cursor-Position (bis wohin bereits zusammengefasst)
+      // Letzte Cursor-Position holen
       const [lastSum] = await db.execute(
         `SELECT last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
@@ -177,7 +169,8 @@ class Context {
       const lastCursor = lastSum?.[0]?.last_context_id ?? null;
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      let rows;
+      let rows, maxId = null;
+
       if (lastCursor != null) {
         const [r] = await db.execute(
           `SELECT id, timestamp, role, sender, content
@@ -198,30 +191,64 @@ class Context {
         rows = r || [];
       }
 
-      if (rows?.length) {
-        const maxId = rows[rows.length - 1].id;
+      if (DEBUG_SUMMARY) {
+        console.debug(
+          `[SUMMARY][DEBUG] Channel=${this.channelId} last_context_id=${lastCursor ?? "null"} cutoff=${cutoff} rows=${rows?.length || 0}`
+        );
+        if (rows?.length) {
+          const preview = rows
+            .map(
+              (r) =>
+                `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`
+            )
+            .join("\n");
+          console.debug(`[SUMMARY][DEBUG] Selected rows to summarize:\n${preview}`);
+        }
+      }
 
-        // Prompt: ggf. aus Channel-Config, sonst Default
-        const basePrompt =
+      if (rows.length) {
+        maxId = rows[rows.length - 1].id;
+
+        const prompt =
           (customPrompt && customPrompt.trim()) ||
-          `Summarize ONLY the content between <<<BEGIN NEW MESSAGES>>> and <<<END NEW MESSAGES>>>. Treat any earlier assistant messages or any content between <<<PRIOR_SUMMARY_START...>>> and <<<PRIOR_SUMMARY_END>>> as prior summaries (context only) — do NOT re-summarize or quote them. Focus strictly on in-character D&D events; ignore real-world chatter.`;
+          `Create a concise, structured chat summary in English. Only summarize in-character Dungeons & Dragons content. Ignore all real-world or out-of-character messages such as food orders or personal comments. Use a cinematic and immersive tone.`;
 
-        console.debug(`[SUMMARY] Using cursor last_context_id=${lastCursor ?? "null"}, cutoff=${cutoff}`);
-        console.debug(`[SUMMARY] Prompt used:\n${basePrompt}`);
+        if (DEBUG_SUMMARY) {
+          console.debug(`[SUMMARY][DEBUG] Prompt used:\n${prompt}`);
+        }
 
-        // Zu verdichtende Zeilen — zusätzlich hart markiert
-        const payload = rows
+        const textPayload = rows
           .map(
             (r) =>
               `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`
           )
           .join("\n");
-        const wrapped = `<<<BEGIN NEW MESSAGES>>>\n${payload}\n<<<END NEW MESSAGES>>>`;
 
-        // Eigener Summarizer-Kontext (darf die Marker-Hinweise im System behalten)
-        const sumCtx = new Context("You are a channel summary generator.", basePrompt, [], {}, this.channelId);
-        await sumCtx.add("user", "system", wrapped);
+        // Summarizer-Kontext aufbauen
+        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId);
 
+        // WICHTIG: _injectInitialSummaries() läuft im Konstruktor → sumCtx enthält jetzt evtl. schon 5 alte Summaries.
+        // Danach fügen wir die neue Nutzlast als user-Message hinzu:
+        await sumCtx.add("user", "system", textPayload);
+
+        // DEBUG: Vollständigen Nachrichten-Stack, der an getAI() geht, ausgeben
+        if (DEBUG_SUMMARY) {
+          try {
+            const dbg = sumCtx.messages.map((m, i) => ({
+              idx: i,
+              role: m.role,
+              name: m.name,
+              content: m.content,
+            }));
+            console.debug(`[SUMMARY][DEBUG] ===== BEGIN SUMMARIZER CONTEXT (messages) =====`);
+            console.debug(JSON.stringify(dbg, null, 2));
+            console.debug(`[SUMMARY][DEBUG] ===== END SUMMARIZER CONTEXT (messages) =====`);
+          } catch (e) {
+            console.warn("[SUMMARY][DEBUG] Failed to serialize sumCtx.messages:", e.message);
+          }
+        }
+
+        // KI-Call
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
 
         if (summary) {
@@ -232,7 +259,9 @@ class Context {
           );
         }
       } else {
-        console.debug("[SUMMARY] No new messages since last cursor/cutoff → no new summary row inserted.");
+        if (DEBUG_SUMMARY) {
+          console.debug("[SUMMARY][DEBUG] No new messages since last cursor/cutoff → no new summary row inserted.");
+        }
       }
 
       // Kontext neu aufbauen: System + 5 Summaries (ASC) + alle >= Cutoff
@@ -243,20 +272,9 @@ class Context {
       const asc = (desc || []).slice().reverse();
 
       const newMsgs = [];
-      const sys = [this.persona, this.instructions, 
-        "NOTE: Assistant messages named 'summary' or text enclosed by <<<PRIOR_SUMMARY_START...>>> and <<<PRIOR_SUMMARY_END>>> are prior summaries for context only. Do NOT re-summarize or quote them unless explicitly instructed."
-      ].filter(Boolean).join("\n").trim();
+      const sys = `${this.persona}\n${this.instructions}`.trim();
       if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
-
-      for (let i = 0; i < asc.length; i++) {
-        const r = asc[i];
-        const ts = new Date(r.timestamp).toISOString();
-        const body =
-          `<<<PRIOR_SUMMARY_START ts=${ts} idx=${i + 1}/${asc.length}>>>` +
-          `\n${r.summary.trim()}\n` +
-          `<<<PRIOR_SUMMARY_END>>>`;
-        newMsgs.push({ role: "assistant", name: "summary", content: body });
-      }
+      for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
 
       const afterRows = await this.getMessagesAfter(cutoffMs);
       for (const r of afterRows) {
