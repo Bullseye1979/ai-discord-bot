@@ -1,15 +1,9 @@
-// context.js — v4.7.2 (v4.7 + vollständige Debug-Ausgabe des Summarizer-Kontexts)
-//
-// Debug-Logs (standardmäßig AN; mit SUMMARY_DEBUG=0 ausschalten):
-//  - Cursor + Cutoff
-//  - Ausgewählte DB-Zeilen (die tatsächlich zusammengefasst werden)
-//  - Voller Summarizer-Kontext (sumCtx.messages), so wie er an getAI() geht
+// context.js — v4.8 (Skip-Initial-Summaries + Cursor-Fix + SQL-Filter + Debug)
+// Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
-
-const DEBUG_SUMMARY = process.env.SUMMARY_DEBUG !== "0";
 
 let pool;
 
@@ -52,13 +46,10 @@ async function ensureTables(pool) {
         timestamp DATETIME NOT NULL,
         channel_id VARCHAR(64) NOT NULL,
         summary MEDIUMTEXT NOT NULL,
-        -- NEU: bis zu welcher context_log.id wurde zusammengefasst
         last_context_id INT NULL,
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-
-    // Falls Spalte in bestehender DB fehlt: nachrüsten (MariaDB/10.3+ versteht IF NOT EXISTS)
     await c.query(`
       ALTER TABLE summaries
       ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
@@ -80,7 +71,15 @@ const sanitize = (s) =>
     .slice(0, 64);
 
 class Context {
-  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global") {
+  /**
+   * @param {string} persona
+   * @param {string} instructions
+   * @param {Array} tools
+   * @param {Object} toolRegistry
+   * @param {string} channelId
+   * @param {Object|boolean} optionsOrSkip - { skipInitialSummaries?: boolean } oder boolean (Back-Compat)
+   */
+  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global", optionsOrSkip = {}) {
     this.messages = [];
     this.persona = persona || "";
     this.instructions = instructions || "";
@@ -89,10 +88,20 @@ class Context {
     this.channelId = channelId;
     this.isSummarizing = false;
 
+    let opts = {};
+    if (typeof optionsOrSkip === "boolean") {
+      opts.skipInitialSummaries = optionsOrSkip;
+    } else if (optionsOrSkip && typeof optionsOrSkip === "object") {
+      opts = optionsOrSkip;
+    }
+    this._opts = { skipInitialSummaries: !!opts.skipInitialSummaries };
+
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
 
-    this._initLoaded = this._injectInitialSummaries();
+    // Nur für "normale" Chat-Kontexte die letzten 5 Summaries injizieren;
+    // Summarizer-Kontext setzt skipInitialSummaries = true
+    this._initLoaded = this._opts.skipInitialSummaries ? Promise.resolve() : this._injectInitialSummaries();
   }
 
   async _injectInitialSummaries() {
@@ -105,10 +114,6 @@ class Context {
       if (!rowsDesc?.length) return;
       const asc = rowsDesc.slice().reverse();
       const head = this.messages[0]?.role === "system" ? 1 : 0;
-      // Summary-Slot leeren
-      let i = head;
-      while (i < this.messages.length && this.messages[i]?.name === "summary") this.messages.splice(i, 1);
-      // Einfügen
       this.messages.splice(
         head,
         0,
@@ -151,9 +156,10 @@ class Context {
     return rows || [];
   }
 
-  // Cursor-basierte Zusammenfassung (keine Dopplungen):
-  // - NUR context_log.id > last_context_id
-  // - UND timestamp <= cutoff  (schützt vor "während des Laufs" gesendeten Nachrichten)
+  // Cursor-basierte Zusammenfassung:
+  // - Nur context_log.id > last_context_id
+  // - timestamp <= cutoff
+  // - strenger Filter: NUR user & kein "system"-Sender, keine Status-/Summary-/Marker-Texte
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
@@ -169,86 +175,69 @@ class Context {
       const lastCursor = lastSum?.[0]?.last_context_id ?? null;
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      let rows, maxId = null;
+      // Auswahl der "neuen" Nachrichten (nur user, kein system-sender, keine Status/Summary/Marker)
+      const commonWhere =
+        `channel_id=? AND timestamp <= ? AND role='user' AND sender <> 'system'` +
+        ` AND content NOT LIKE '⏳ %'` +
+        ` AND content NOT LIKE '✅ %'` +
+        ` AND content NOT LIKE 'Summary %'` +
+        ` AND content NOT LIKE '<<<BEGIN NEW MESSAGES>>%'` +
+        ` AND content NOT LIKE '<<<END NEW MESSAGES>>%'`;
 
+      let rows = [];
       if (lastCursor != null) {
-        const [r] = await db.execute(
+        const sql =
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE channel_id=? AND id > ? AND timestamp <= ?
-            ORDER BY id ASC`,
-          [this.channelId, lastCursor, cutoff]
-        );
+            WHERE ${commonWhere} AND id > ?
+            ORDER BY id ASC`;
+        const [r] = await db.execute(sql, [this.channelId, cutoff, lastCursor]);
         rows = r || [];
       } else {
-        const [r] = await db.execute(
+        const sql =
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE channel_id=? AND timestamp <= ?
-            ORDER BY id ASC`,
-          [this.channelId, cutoff]
-        );
+            WHERE ${commonWhere}
+            ORDER BY id ASC`;
+        const [r] = await db.execute(sql, [this.channelId, cutoff]);
         rows = r || [];
       }
 
-      if (DEBUG_SUMMARY) {
-        console.debug(
-          `[SUMMARY][DEBUG] Channel=${this.channelId} last_context_id=${lastCursor ?? "null"} cutoff=${cutoff} rows=${rows?.length || 0}`
-        );
-        if (rows?.length) {
-          const preview = rows
-            .map(
-              (r) =>
-                `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`
-            )
-            .join("\n");
-          console.debug(`[SUMMARY][DEBUG] Selected rows to summarize:\n${preview}`);
+      let maxId = rows.length ? rows[rows.length - 1].id : null;
+
+      // Debug: Übersicht der Auswahl
+      console.debug(`[SUMMARY][DEBUG] Channel=${this.channelId} last_context_id=${lastCursor ?? "null"} cutoff=${cutoff} rows=${rows.length}`);
+      if (rows.length) {
+        console.debug(`[SUMMARY][DEBUG] Selected rows to summarize:`);
+        for (const r of rows) {
+          console.debug(`[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`);
         }
       }
 
       if (rows.length) {
-        maxId = rows[rows.length - 1].id;
-
         const prompt =
           (customPrompt && customPrompt.trim()) ||
-          `Create a concise, structured chat summary in English. Only summarize in-character Dungeons & Dragons content. Ignore all real-world or out-of-character messages such as food orders or personal comments. Use a cinematic and immersive tone.`;
+          `You are a Dungeon Master writing a dramatic session recap. Summarize only the in-character Dungeons & Dragons events such as combat, roleplay, exploration, and dialogue. Completely ignore all out-of-character chatter like food orders, technical issues, jokes, or real-world references. If uncertain, only include messages that clearly advance the fantasy narrative. Write in English, using a vivid, high-fantasy style. Do not repeat events already present in earlier summaries; summarize only the NEW messages provided.`;
 
-        if (DEBUG_SUMMARY) {
-          console.debug(`[SUMMARY][DEBUG] Prompt used:\n${prompt}`);
-        }
+        console.debug(`[SUMMARY][DEBUG] Prompt used:\n${prompt}`);
 
-        const textPayload = rows
+        const text = rows
           .map(
             (r) =>
               `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`
           )
           .join("\n");
 
-        // Summarizer-Kontext aufbauen
-        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId);
+        // Summarizer-Kontext OHNE Auto-Injection der letzten 5 Summaries!
+        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId, { skipInitialSummaries: true });
+        // Zusätzlich: Debug, was genau der Summarizer bekommt
+        console.debug("[SUMMARY][DEBUG] ===== BEGIN SUMMARIZER CONTEXT (messages) =====");
+        console.debug(JSON.stringify(sumCtx.messages.map((m, i) => ({ idx: i, role: m.role, name: m.name, content: m.content })), null, 2));
+        console.debug("— adding payload —");
+        await sumCtx.add("user", "system", text);
+        console.debug(JSON.stringify(sumCtx.messages.map((m, i) => ({ idx: i, role: m.role, name: m.name, content: m.content })), null, 2));
+        console.debug("[SUMMARY][DEBUG] ===== END SUMMARIZER CONTEXT (messages) =====");
 
-        // WICHTIG: _injectInitialSummaries() läuft im Konstruktor → sumCtx enthält jetzt evtl. schon 5 alte Summaries.
-        // Danach fügen wir die neue Nutzlast als user-Message hinzu:
-        await sumCtx.add("user", "system", textPayload);
-
-        // DEBUG: Vollständigen Nachrichten-Stack, der an getAI() geht, ausgeben
-        if (DEBUG_SUMMARY) {
-          try {
-            const dbg = sumCtx.messages.map((m, i) => ({
-              idx: i,
-              role: m.role,
-              name: m.name,
-              content: m.content,
-            }));
-            console.debug(`[SUMMARY][DEBUG] ===== BEGIN SUMMARIZER CONTEXT (messages) =====`);
-            console.debug(JSON.stringify(dbg, null, 2));
-            console.debug(`[SUMMARY][DEBUG] ===== END SUMMARIZER CONTEXT (messages) =====`);
-          } catch (e) {
-            console.warn("[SUMMARY][DEBUG] Failed to serialize sumCtx.messages:", e.message);
-          }
-        }
-
-        // KI-Call
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
 
         if (summary) {
@@ -259,9 +248,7 @@ class Context {
           );
         }
       } else {
-        if (DEBUG_SUMMARY) {
-          console.debug("[SUMMARY][DEBUG] No new messages since last cursor/cutoff → no new summary row inserted.");
-        }
+        console.debug("[SUMMARY][DEBUG] No new user messages since last cursor/cutoff → no new summary row inserted.");
       }
 
       // Kontext neu aufbauen: System + 5 Summaries (ASC) + alle >= Cutoff
@@ -274,7 +261,10 @@ class Context {
       const newMsgs = [];
       const sys = `${this.persona}\n${this.instructions}`.trim();
       if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
-      for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
+
+      for (const r of asc) {
+        newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
+      }
 
       const afterRows = await this.getMessagesAfter(cutoffMs);
       for (const r of afterRows) {
