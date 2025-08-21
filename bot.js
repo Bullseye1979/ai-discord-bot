@@ -76,10 +76,19 @@ client.on("messageCreate", async (message) => {
   // Webhook-Spiegel im Transcripts-Thread komplett ignorieren (kein Logging/Trigger)
   if (message.webhookId && isTranscriptThread) return;
 
-  const channelMeta = getChannelConfig(baseChannelId);
-  if (!channelMeta) return;
+  // Parent-Channel statt Thread verwenden (Transcripts-Thread soll die Parent-Konfig erben)
+const baseChannelId = (message.channel?.isThread?.() && message.channel.parentId)
+  ? message.channel.parentId
+  : message.channelId;
 
-  const key = `channel:${baseChannelId}`;
+const channelMeta = getChannelConfig(baseChannelId);
+if (!channelMeta) return;
+
+const key = `channel:${baseChannelId}`;
+
+
+
+
   if (!contextStorage.has(key)) {
     const ctx = new Context(
       channelMeta.persona,
@@ -220,7 +229,6 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  // ---------------- Normaler Flow ----------------
 
   // ---------------- Normaler Flow ----------------
 
