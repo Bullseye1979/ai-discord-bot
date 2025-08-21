@@ -72,27 +72,27 @@ client.on("messageCreate", async (message) => {
     : !!message.channel.parentId; // fallback
   const effectiveChannelId = isThread ? (message.channel.parentId || message.channelId) : message.channelId;
 
-// Parent-Channel statt Thread verwenden (Transcripts-Thread soll die Parent-Konfig erben)
-// Thread/Parent-Logik: Transcripts erben die Parent-Channel-Config
-const inThread = (typeof message.channel?.isThread === "function") && message.channel.isThread();
-const baseChannelId = (inThread && message.channel.parentId) ? message.channel.parentId : message.channelId;
-const isTranscriptThread = inThread && message.channel.name === "Transcripts";
+  // Parent-Channel statt Thread verwenden (Transcripts-Thread soll die Parent-Konfig erben)
+  // Thread/Parent-Logik: Transcripts erben die Parent-Channel-Config
+  const inThread = (typeof message.channel?.isThread === "function") && message.channel.isThread();
+  const baseChannelId = (inThread && message.channel.parentId) ? message.channel.parentId : message.channelId;
+  const isTranscriptThread = inThread && message.channel.name === "Transcripts";
 
-const channelMeta = getChannelConfig(baseChannelId);
-if (!channelMeta) return;
+  const channelMeta = getChannelConfig(baseChannelId);
+  if (!channelMeta) return;
 
-const key = `channel:${baseChannelId}`;
-if (!contextStorage.has(key)) {
-  const ctx = new Context(
-    channelMeta.persona,
-    channelMeta.instructions,
-    channelMeta.tools,
-    channelMeta.toolRegistry,
-    baseChannelId
-  );
-  contextStorage.set(key, ctx);
-}
-const chatContext = contextStorage.get(key);
+  const key = `channel:${baseChannelId}`;
+  if (!contextStorage.has(key)) {
+    const ctx = new Context(
+      channelMeta.persona,
+      channelMeta.instructions,
+      channelMeta.tools,
+      channelMeta.toolRegistry,
+      baseChannelId
+    );
+    contextStorage.set(key, ctx);
+  }
+  const chatContext = contextStorage.get(key);
 
 
 
@@ -131,20 +131,21 @@ const chatContext = contextStorage.get(key);
 
   // !joinvc: Voice beitreten + TTS bereit (Textkanal immer Parent mappen)
   if (message.content.startsWith("!joinvc")) {
-  const vc = message.member?.voice?.channel;
-  if (!vc) { await message.reply("Join a voice channel first."); return; }
-  const conn = joinVoiceChannel({
-    channelId: vc.id,
-    guildId: message.guild.id,
-    adapterCreator: message.guild.voiceAdapterCreator,
-    selfDeaf: false,
-  });
-  // Transcripts immer an den Parent-Textkanal binden (nicht an den Thread)
-  const baseForVC = (message.channel?.isThread?.())
-    ? message.channel.parentId
-    : message.channel.id;
+    const vc = message.member?.voice?.channel;
+    if (!vc) { await message.reply("Join a voice channel first."); return; }
+    const conn = joinVoiceChannel({
+      channelId: vc.id,
+      guildId: message.guild.id,
+      adapterCreator: message.guild.voiceAdapterCreator,
+      selfDeaf: false,
+    });
+    // Transcripts immer an den Parent-Textkanal binden (nicht an den Thread)
+    const baseForVC = (message.channel?.isThread?.())
+      ? message.channel.parentId
+      : message.channel.id;
     guildTextChannels.set(message.guild.id, baseForVC);
-    setStartListening(conn, message.guild.id, guildTextChannels, client);
+    // ✅ FIX 2: activeRecordings mitgeben
+    setStartListening(conn, message.guild.id, guildTextChannels, activeRecordings, client);
     return;
   }
 
@@ -224,98 +225,98 @@ const chatContext = contextStorage.get(key);
   }
 
 
- // ---------------- Normaler Flow ----------------
+  // ---------------- Normaler Flow ----------------
 
-// a) Transcripts-Thread erkennen
-const inTranscriptsThread =
-  message.channel?.isThread?.() && message.channel.name === "Transcripts";
+  // a) Transcripts-Thread erkennen
+  const inTranscriptsThread =
+    message.channel?.isThread?.() && message.channel.name === "Transcripts";
 
-if (!inTranscriptsThread && !message.author?.bot && !message.webhookId) {
-  // normaler Text im Haupt-/Parent-Channel
-  await setAddUserMessage(message, chatContext);
+  if (!inTranscriptsThread && !message.author?.bot && !message.webhookId) {
+    // normaler Text im Haupt-/Parent-Channel
+    await setAddUserMessage(message, chatContext);
 
-} else if (inTranscriptsThread) {
-  // nur echte Transkriptzeilen verarbeiten (Pattern: **Sprecher:** text)
-  const parsed = parseTranscriptLine(message.content || "");
-  if (parsed && parsed.text) {
-    await chatContext.add("user", parsed.speaker, parsed.text);
-  } else {
-    // alles andere im Transcripts-Thread ignorieren (z.B. AI-Spiegelungen)
-    return;
-  }
-}
-
-// c) TTS-Hook (hat keinen Effekt für Transkript-Posts)
-try {
-  await setTTS(message, client, guildTextChannels);
-} catch (e) {
-  console.warn("[TTS] call failed:", e?.message || e);
-}
-
-// d) Inhalt + Sprecher extrahieren (Transcripts: "**Sprecher:** Text")
-let contentRaw = message.content || "";
-let speakerForProxy = null;
-
-if (inTranscriptsThread) {
-  const parsed = parseTranscriptLine(contentRaw);
-  if (parsed) {
-    contentRaw = parsed.text;
-    speakerForProxy = parsed.speaker || null;
-  }
-}
-
-// e) Trigger-Check (Name aus Parent-Channel-Config)
-// - Im normalen Kanal: Prefix ("jenny ..." oder "!jenny ...")
-// - Im Transcripts-Thread: reicht "… jenny …" irgendwo im Satz
-const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
-const norm = (contentRaw || "").trim().toLowerCase();
-
-const isTrigger =
-  norm.startsWith(triggerName) ||
-  norm.startsWith(`!${triggerName}`) ||
-  (inTranscriptsThread && norm.includes(triggerName));
-
-if (!isTrigger) return;
-
-// f) An KI weitergeben – Proxy stellt sicher, dass:
-//   - content = gesprochener Text (ohne "**Sprecher:**")
-//   - author.bot = false (damit Handler nicht blockt)
-//   - member.displayName / author.username = Sprechername (falls vorhanden)
-const state = { isAIProcessing: 0 };
-
-const proxyMsg = new Proxy(message, {
-  get(target, prop) {
-    if (prop === "content") return contentRaw;
-
-    if (prop === "author") {
-      const base = Reflect.get(target, "author");
-      // author.bot auf false zwingen + username ggf. auf Sprecher setzen
-      return {
-        ...base,
-        bot: false,
-        username: speakerForProxy || base?.username || "user",
-      };
+  } else if (inTranscriptsThread) {
+    // nur echte Transkriptzeilen verarbeiten (Pattern: **Sprecher:** text)
+    const parsed = parseTranscriptLine(message.content || "");
+    if (parsed && parsed.text) {
+      await chatContext.add("user", parsed.speaker, parsed.text);
+    } else {
+      // alles andere im Transcripts-Thread ignorieren (z.B. AI-Spiegelungen)
+      return;
     }
+  }
 
-    if (prop === "member") {
-      const base = Reflect.get(target, "member");
-      if (!base) return base;
-      return new Proxy(base, {
-        get(tb, pb) {
-          if (pb === "displayName") {
-            return speakerForProxy || tb.displayName || tb?.user?.username || "user";
+  // c) TTS-Hook (hat keinen Effekt für Transkript-Posts)
+  try {
+    await setTTS(message, client, guildTextChannels);
+  } catch (e) {
+    console.warn("[TTS] call failed:", e?.message || e);
+  }
+
+  // d) Inhalt + Sprecher extrahieren (Transcripts: "**Sprecher:** Text")
+  let contentRaw = message.content || "";
+  let speakerForProxy = null;
+
+  if (inTranscriptsThread) {
+    const parsed = parseTranscriptLine(contentRaw);
+    if (parsed) {
+      contentRaw = parsed.text;
+      speakerForProxy = parsed.speaker || null;
+    }
+  }
+
+  // e) Trigger-Check (Name aus Parent-Channel-Config)
+  // - Im normalen Kanal: Prefix ("jenny ..." oder "!jenny ...")
+  // - Im Transcripts-Thread: reicht "… jenny …" irgendwo im Satz
+  const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
+  const norm = (contentRaw || "").trim().toLowerCase();
+
+  const isTrigger =
+    norm.startsWith(triggerName) ||
+    norm.startsWith(`!${triggerName}`) ||
+    (inTranscriptsThread && norm.includes(triggerName));
+
+  if (!isTrigger) return;
+
+  // f) An KI weitergeben – Proxy stellt sicher, dass:
+  //   - content = gesprochener Text (ohne "**Sprecher:**")
+  //   - author.bot = false (damit Handler nicht blockt)
+  //   - member.displayName / author.username = Sprechername (falls vorhanden)
+  const state = { isAIProcessing: 0 };
+
+  const proxyMsg = new Proxy(message, {
+    get(target, prop) {
+      if (prop === "content") return contentRaw;
+
+      if (prop === "author") {
+        const base = Reflect.get(target, "author");
+        // author.bot auf false zwingen + username ggf. auf Sprecher setzen
+        return {
+          ...base,
+          bot: false,
+          username: speakerForProxy || base?.username || "user",
+        };
+      }
+
+      if (prop === "member") {
+        const base = Reflect.get(target, "member");
+        if (!base) return base;
+        return new Proxy(base, {
+          get(tb, pb) {
+            if (pb === "displayName") {
+              return speakerForProxy || tb.displayName || tb?.user?.username || "user";
+            }
+            return Reflect.get(tb, pb);
           }
-          return Reflect.get(tb, pb);
-        }
-      });
+        });
+      }
+
+      return Reflect.get(target, prop);
     }
+  });
 
-    return Reflect.get(target, prop);
-  }
-});
-
-return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
-
+  return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+}); // ✅ FIX 1: Handler schließen!
 
 // Start
 (async () => {
