@@ -1,5 +1,8 @@
-// context.js — v4.9 (Cursor-Fix + Bot-Post-Exclusion + Cutoff + SQL + Kontexteinbau)
-// Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
+// context.js — v4.7.1 (auf Basis v4.7)
+// Neu:
+//  - Vorhandene Summaries im Kontext klar markieren: <<<PRIOR_SUMMARY_START ...>>> ... <<<PRIOR_SUMMARY_END>>>
+//  - System-Hinweis, wie diese Marker zu interpretieren sind (Kontext, nicht erneut zusammenfassen)
+//  - Der Input an den Summarizer wird zwischen <<<BEGIN NEW MESSAGES>>> ... <<<END NEW MESSAGES>>> gekapselt
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -46,10 +49,13 @@ async function ensureTables(pool) {
         timestamp DATETIME NOT NULL,
         channel_id VARCHAR(64) NOT NULL,
         summary MEDIUMTEXT NOT NULL,
+        -- bis zu welcher context_log.id wurde zusammengefasst
         last_context_id INT NULL,
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // falls Spalte bereits vorhanden, Fehler ignorieren
     await c.query(`
       ALTER TABLE summaries
       ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
@@ -71,15 +77,7 @@ const sanitize = (s) =>
     .slice(0, 64);
 
 class Context {
-  /**
-   * @param {string} persona
-   * @param {string} instructions
-   * @param {Array} tools
-   * @param {Object} toolRegistry
-   * @param {string} channelId
-   * @param {string|null} botDisplayName Optional: Botanzeige-Name, um Bot-Posts aus künftigen Summaries auszuschließen
-   */
-  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global", botDisplayName = null) {
+  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global") {
     this.messages = [];
     this.persona = persona || "";
     this.instructions = instructions || "";
@@ -87,9 +85,11 @@ class Context {
     this.toolRegistry = toolRegistry || {};
     this.channelId = channelId;
     this.isSummarizing = false;
-    this.botSender = botDisplayName ? sanitize(botDisplayName) : null; // <- wichtig für Ausschlussfilter
 
-    const sys = `${this.persona}\n${this.instructions}`.trim();
+    // System: Persona + Instruktionen + kurzer Hinweis zu Summary-Markern
+    const markerNote =
+      "NOTE: Assistant messages named 'summary' or text enclosed by <<<PRIOR_SUMMARY_START...>>> and <<<PRIOR_SUMMARY_END>>> are prior summaries for context only. Do NOT re-summarize or quote them unless explicitly instructed.";
+    const sys = [this.persona, this.instructions, markerNote].filter(Boolean).join("\n").trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
 
     this._initLoaded = this._injectInitialSummaries();
@@ -103,13 +103,27 @@ class Context {
         [this.channelId]
       );
       if (!rowsDesc?.length) return;
-      const asc = rowsDesc.slice().reverse();
+
+      const asc = rowsDesc.slice().reverse(); // älteste -> neueste
       const head = this.messages[0]?.role === "system" ? 1 : 0;
-      this.messages.splice(
-        head,
-        0,
-        ...asc.map((r) => ({ role: "assistant", name: "summary", content: r.summary }))
-      );
+
+      // Vorhandene Summary-Slots entfernen (falls vorhanden)
+      let i = head;
+      while (i < this.messages.length && this.messages[i]?.name === "summary") {
+        this.messages.splice(i, 1);
+      }
+
+      // Zusammenfassungen mit klaren Markern einfügen
+      const tagged = asc.map((r, idx) => {
+        const ts = new Date(r.timestamp).toISOString();
+        const body =
+          `<<<PRIOR_SUMMARY_START ts=${ts} idx=${idx + 1}/${asc.length}>>>` +
+          `\n${r.summary.trim()}\n` +
+          `<<<PRIOR_SUMMARY_END>>>`;
+        return { role: "assistant", name: "summary", content: body };
+      });
+
+      this.messages.splice(head, 0, ...tagged);
     } catch (e) {
       console.error("[DB] load initial summaries failed:", e.message);
     }
@@ -132,6 +146,7 @@ class Context {
     return entry;
   }
 
+  // ALLE Nachrichten >= cutoff (für Kontexteinbau nach Summary)
   async getMessagesAfter(cutoffMs) {
     const db = await getPool();
     const [rows] = await db.execute(
@@ -144,12 +159,9 @@ class Context {
     return rows || [];
   }
 
-  /**
-   * Cursor-basierte Zusammenfassung (keine Dopplungen):
-   * - NUR context_log.id > last_context_id
-   * - UND timestamp <= cutoff
-   * - UND (optional) EXCLUDE: Bot-Posts (Summary/Status), damit gepostete Summaries nie in künftige Runs gelangen
-   */
+  // Cursor-basierte Zusammenfassung (keine Dopplungen):
+  // - NUR context_log.id > last_context_id
+  // - UND timestamp <= cutoff
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
@@ -157,7 +169,7 @@ class Context {
     try {
       const db = await getPool();
 
-      // Letzte Cursor-Position holen
+      // letzte Cursor-Position (bis wohin bereits zusammengefasst)
       const [lastSum] = await db.execute(
         `SELECT last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
@@ -165,62 +177,51 @@ class Context {
       const lastCursor = lastSum?.[0]?.last_context_id ?? null;
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      // Dynamischer Ausschlussfilter für Bot-Posts (Summaries/Status)
-      // Wir schließen NUR bekannte Bot-Marker aus, damit reguläre Bot-Antworten (z. B. eigentliche KI-Antworten) erhalten bleiben.
-      const botExclusion = this.botSender
-        ? ` AND NOT (sender = ? AND (
-              content LIKE '**Summary %/%' OR
-              content LIKE 'Summary %/%' OR
-              content LIKE '⏳ %Summary%' OR
-              content LIKE '✅ %Summary%'
-            ))`
-        : "";
-
-      let params = [this.channelId];
-      let sql;
-
+      let rows;
       if (lastCursor != null) {
-        sql = `
-          SELECT id, timestamp, role, sender, content
-            FROM context_log
-           WHERE channel_id=? AND id > ? AND timestamp <= ?${botExclusion}
-           ORDER BY id ASC
-        `;
-        params.push(lastCursor, cutoff);
-        if (this.botSender) params.push(this.botSender);
+        const [r] = await db.execute(
+          `SELECT id, timestamp, role, sender, content
+             FROM context_log
+            WHERE channel_id=? AND id > ? AND timestamp <= ?
+            ORDER BY id ASC`,
+          [this.channelId, lastCursor, cutoff]
+        );
+        rows = r || [];
       } else {
-        sql = `
-          SELECT id, timestamp, role, sender, content
-            FROM context_log
-           WHERE channel_id=? AND timestamp <= ?${botExclusion}
-           ORDER BY id ASC
-        `;
-        params.push(cutoff);
-        if (this.botSender) params.push(this.botSender);
+        const [r] = await db.execute(
+          `SELECT id, timestamp, role, sender, content
+             FROM context_log
+            WHERE channel_id=? AND timestamp <= ?
+            ORDER BY id ASC`,
+          [this.channelId, cutoff]
+        );
+        rows = r || [];
       }
-
-      const [rows] = await db.execute(sql, params);
 
       if (rows?.length) {
         const maxId = rows[rows.length - 1].id;
 
-        const prompt =
+        // Prompt: ggf. aus Channel-Config, sonst Default
+        const basePrompt =
           (customPrompt && customPrompt.trim()) ||
-          `Create a concise, structured chat summary in English. Only summarize in-character Dungeons & Dragons content. Ignore all real-world or out-of-character messages such as food orders or personal comments. Use a cinematic and immersive tone.`;
+          `Summarize ONLY the content between <<<BEGIN NEW MESSAGES>>> and <<<END NEW MESSAGES>>>. Treat any earlier assistant messages or any content between <<<PRIOR_SUMMARY_START...>>> and <<<PRIOR_SUMMARY_END>>> as prior summaries (context only) — do NOT re-summarize or quote them. Focus strictly on in-character D&D events; ignore real-world chatter.`;
 
         console.debug(`[SUMMARY] Using cursor last_context_id=${lastCursor ?? "null"}, cutoff=${cutoff}`);
-        console.debug(`[SUMMARY] Prompt used:\n${prompt}`);
+        console.debug(`[SUMMARY] Prompt used:\n${basePrompt}`);
 
-        const text = rows
+        // Zu verdichtende Zeilen — zusätzlich hart markiert
+        const payload = rows
           .map(
             (r) =>
               `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`
           )
           .join("\n");
+        const wrapped = `<<<BEGIN NEW MESSAGES>>>\n${payload}\n<<<END NEW MESSAGES>>>`;
 
-        // KI-Call
-        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId, this.botSender);
-        await sumCtx.add("user", "system", text);
+        // Eigener Summarizer-Kontext (darf die Marker-Hinweise im System behalten)
+        const sumCtx = new Context("You are a channel summary generator.", basePrompt, [], {}, this.channelId);
+        await sumCtx.add("user", "system", wrapped);
+
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
 
         if (summary) {
@@ -242,11 +243,19 @@ class Context {
       const asc = (desc || []).slice().reverse();
 
       const newMsgs = [];
-      const sys = `${this.persona}\n${this.instructions}`.trim();
+      const sys = [this.persona, this.instructions, 
+        "NOTE: Assistant messages named 'summary' or text enclosed by <<<PRIOR_SUMMARY_START...>>> and <<<PRIOR_SUMMARY_END>>> are prior summaries for context only. Do NOT re-summarize or quote them unless explicitly instructed."
+      ].filter(Boolean).join("\n").trim();
       if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
 
-      for (const r of asc) {
-        newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
+      for (let i = 0; i < asc.length; i++) {
+        const r = asc[i];
+        const ts = new Date(r.timestamp).toISOString();
+        const body =
+          `<<<PRIOR_SUMMARY_START ts=${ts} idx=${i + 1}/${asc.length}>>>` +
+          `\n${r.summary.trim()}\n` +
+          `<<<PRIOR_SUMMARY_END>>>`;
+        newMsgs.push({ role: "assistant", name: "summary", content: body });
       }
 
       const afterRows = await this.getMessagesAfter(cutoffMs);
