@@ -396,7 +396,13 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
 
             if (text && text.trim()) {
               const speaker = await resolveSpeakerName(client, guildId, userId);
-              await sendChunked(target, `**${speaker}:** ${text.trim()}`);
+              let avatarURL;
+              try {
+                const g = await client.guilds.fetch(guildId);
+                const m = await g.members.fetch(userId).catch(() => null);
+                avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
+              } catch {}
+              await sendTranscriptViaWebhook(target, text.trim(), speaker, avatarURL);
             }
           } catch (err) {
             console.warn("[Transcription] failed:", err?.message || err);
@@ -428,6 +434,10 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     console.warn("[setStartListening] failed:", e?.message || e);
   }
 }
+
+
+
+
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
@@ -461,6 +471,60 @@ async function getSpeech(connection, guildId, text, client, voice) {
   });
 }
 
+const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
+
+async function getOrCreateRelayWebhookFor(parentChannel) {
+  try {
+    if (!parentChannel) return null;
+    const key = parentChannel.id;
+    if (transcriptWebhookCache.has(key)) return transcriptWebhookCache.get(key);
+
+    // Webhook am PARENT-Textkanal anlegen oder wiederverwenden
+    const hooks = await parentChannel.fetchWebhooks();
+    let hook = hooks.find(w => w.name === "Transcripts Relay");
+    if (!hook) {
+      hook = await parentChannel.createWebhook({
+        name: "Transcripts Relay",
+      });
+    }
+    transcriptWebhookCache.set(key, hook);
+    return hook;
+  } catch (e) {
+    console.error("[Transcripts Relay] webhook create/fetch failed:", e?.message || e);
+    return null;
+  }
+}
+
+async function sendTranscriptViaWebhook(targetChannelOrThread, content, username, avatarURL) {
+  try {
+    if (!targetChannelOrThread || !content?.trim()) return;
+
+    // Threads besitzen keine eigenen Webhooks -> am Parent-Kanal anlegen, aber mit threadId senden
+    const isThread = !!targetChannelOrThread?.isThread?.();
+    const parent = isThread ? targetChannelOrThread.parent : targetChannelOrThread;
+    const hook = await getOrCreateRelayWebhookFor(parent);
+    if (!hook) {
+      // Fallback ohne Webhook
+      return await sendChunked(targetChannelOrThread, `**${username}:** ${content}`);
+    }
+
+    const parts = splitIntoChunks(content);
+    for (const p of parts) {
+      await hook.send({
+        content: p,
+        username: username || "Speaker",
+        avatarURL: avatarURL || undefined,
+        allowedMentions: { parse: [] },
+        threadId: isThread ? targetChannelOrThread.id : undefined,
+      });
+    }
+  } catch (e) {
+    console.error("[Transcripts Relay] send failed:", e?.message || e);
+    // Fallback
+    try { await sendChunked(targetChannelOrThread, `**${username}:** ${content}`); } catch {}
+  }
+}
+
 module.exports = {
   getUserTools,
   getDefaultPersona,
@@ -475,4 +539,6 @@ module.exports = {
   getOrCreateTranscriptsThread,
   setStartListening,
   getSpeech,
+  sendTranscriptViaWebhook,
+
 };
