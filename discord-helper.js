@@ -147,6 +147,14 @@ async function sendChunked(channel, content) {
   }
 }
 
+async function setMessageReaction(message, emoji) {
+  try { 
+    await message.react(emoji);
+  } catch (e) {
+    console.warn("[setMessageReaction] failed:", e?.message || e);
+  }
+}
+
 async function postSummariesIndividually(channel, summaries, _leftover) {
   for (let i = 0; i < summaries.length; i++) {
     const header = `**Summary ${i + 1}/${summaries.length}**`;
