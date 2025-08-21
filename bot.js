@@ -1,5 +1,6 @@
-// bot.js — v3.0 (mit Cutoff, Summaries, Kontextpflege & Debug)
-// !summarize: erstellt Summary, leert Chat, postet 5 Summaries (älteste → neueste) + nicht zusammengefasste Nachrichten.
+// bot.js — v3.1
+// !summarize erstellt Summary, leert Chat, postet 5 Summaries (älteste → neueste).
+// KEINE "Messages after cutoff" Ausgabe mehr.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -28,13 +29,18 @@ const contextStorage = new Map();
 async function deleteAllMessages(channel) {
   const me = channel.guild.members.me;
   const perms = channel.permissionsFor(me);
-  if (!perms?.has(PermissionsBitField.Flags.ManageMessages) || !perms?.has(PermissionsBitField.Flags.ReadMessageHistory)) {
+  if (
+    !perms?.has(PermissionsBitField.Flags.ManageMessages) ||
+    !perms?.has(PermissionsBitField.Flags.ReadMessageHistory)
+  ) {
     throw new Error("Missing permissions: ManageMessages and/or ReadMessageHistory");
   }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let beforeId = null;
   while (true) {
-    const fetched = await channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
+    const fetched = await channel.messages
+      .fetch({ limit: 100, before: beforeId || undefined })
+      .catch(() => null);
     if (!fetched || fetched.size === 0) break;
     for (const msg of fetched.values()) {
       if (msg.pinned) continue;
@@ -85,7 +91,7 @@ client.on("messageCreate", async (message) => {
     const cutoffMs = Date.now();
     const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
 
-    // 1) Zusammenfassung erzeugen
+    // 1) Zusammenfassung erzeugen (bis Cutoff)
     try {
       await chatContext.summarizeSince(cutoffMs, customPrompt);
     } catch (e) {
@@ -97,25 +103,23 @@ client.on("messageCreate", async (message) => {
       await deleteAllMessages(message.channel);
     } catch (e) {
       console.error("[!summarize] deleteAllMessages error:", e?.message || e);
-      await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
+      await message.channel.send(
+        "⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History)."
+      );
     }
 
-    // 3) 5 Summaries (älteste → neueste) posten + ggf. nicht zusammengefasste Nachrichten
+    // 3) 5 Summaries (älteste → neueste) posten
     try {
       const last5Desc = await chatContext.getLastSummaries(5);
-      const summariesAsc = (last5Desc || []).slice().reverse().map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
-
-      let leftover = "";
-      const afterRows = await chatContext.getMessagesAfter(cutoffMs);
-      if (afterRows?.length) {
-        leftover = afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n");
-        console.debug("[!summarize] Non-summarized messages after cutoff:\n", leftover);
-      }
+      const summariesAsc = (last5Desc || [])
+        .slice()
+        .reverse()
+        .map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
 
       if (summariesAsc.length === 0) {
         await message.channel.send("No summaries available yet.");
       } else {
-        await postSummariesIndividually(message.channel, summariesAsc, leftover);
+        await postSummariesIndividually(message.channel, summariesAsc);
       }
     } catch (e) {
       console.error("[!summarize] posting summaries error:", e?.message || e);
@@ -133,9 +137,8 @@ client.on("messageCreate", async (message) => {
   }
 
   // ---- NORMALE NACHRICHT ----
-  if (!message.content.startsWith("!context") && !message.content.startsWith("!summarize")) {
-    await setAddUserMessage(message, chatContext);
-  }
+  // (setAddUserMessage filtert !context/!summarize bereits weg)
+  await setAddUserMessage(message, chatContext);
 
   // Trigger prüfen (Name oder !name)
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();
@@ -145,7 +148,14 @@ client.on("messageCreate", async (message) => {
 
   const { getProcessAIRequest } = require("./discord-handler.js");
   const state = { isAIProcessing: 0 };
-  return getProcessAIRequest(message, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+  return getProcessAIRequest(
+    message,
+    chatContext,
+    client,
+    state,
+    channelMeta.model,
+    channelMeta.apikey
+  );
 });
 
 // Start Discord Bot

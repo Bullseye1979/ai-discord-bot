@@ -1,12 +1,19 @@
-// discord-helper.js — v1.6
+// discord-helper.js — v1.7
 // Hilfsfunktionen für Discord + Chunking + Summaries-Posting (einzeln)
-// WICHTIG: getChannelConfig() liefert jetzt auch summaryPrompt zurück.
+// + Transcripts-Thread (Erkennen/Erstellen/Kopieren)
+// WICHTIG: getChannelConfig() liefert auch summaryPrompt zurück.
 
 const fs = require("fs");
 const path = require("path");
 const { tools, getToolRegistry } = require("./tools.js");
 const { EndBehaviorType } = require("@discordjs/voice");
-const { createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
+const {
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  StreamType,
+} = require("@discordjs/voice");
+const { ChannelType } = require("discord.js");
 const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
@@ -34,7 +41,7 @@ function getUserTools(nameOrDisplayName) {
   return { tools: activeTools, toolRegistry };
 }
 
-// ---------- Default Persona (falls genutzt) ----------
+// ---------- Default Persona (optional Fallback) ----------
 function getDefaultPersona() {
   const defaultPath = path.join(__dirname, "channel-config", "default.json");
   try {
@@ -48,10 +55,19 @@ function getDefaultPersona() {
       botname: json.botname || "",
       selectedTools: json.tools || [],
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
-      summaryPrompt: json.summaryPrompt || json.summary_prompt || ""
+      summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
     };
   } catch {
-    return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [], summaryPrompt: "" };
+    return {
+      persona: "",
+      instructions: "",
+      voice: "",
+      name: "",
+      botname: "",
+      selectedTools: [],
+      blocks: [],
+      summaryPrompt: "",
+    };
   }
 }
 
@@ -68,7 +84,7 @@ function getChannelConfig(channelId) {
     botname = def.botname,
     selectedTools = def.selectedTools,
     blocks = def.blocks,
-    summaryPrompt = def.summaryPrompt
+    summaryPrompt = def.summaryPrompt,
   } = def;
 
   if (fs.existsSync(configPath)) {
@@ -86,7 +102,6 @@ function getChannelConfig(channelId) {
 
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
-
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -109,7 +124,7 @@ function getChannelConfig(channelId) {
     tools: ctxTools,
     toolRegistry,
     blocks,
-    summaryPrompt
+    summaryPrompt,
   };
 }
 
@@ -149,15 +164,78 @@ async function sendChunked(channel, content) {
   }
 }
 
-// summaries: Array<string> (älteste → neueste), leftover?: string
-async function postSummariesIndividually(channel, summaries, leftover) {
+// summaries: Array<string> (älteste → neueste)
+async function postSummariesIndividually(channel, summaries) {
   for (let i = 0; i < summaries.length; i++) {
     const header = `**Summary ${i + 1}/${summaries.length}**`;
     await sendChunked(channel, `${header}\n\n${summaries[i]}`);
   }
-  if (leftover && leftover.trim()) {
-    await sendChunked(channel, `**Messages after cutoff (not summarized):**\n\n${leftover.trim()}`);
+}
+
+// ---------- Transcripts-Thread ----------
+async function findExistingTranscriptsThread(channel) {
+  try {
+    const active = await channel.threads.fetchActive();
+    const found = active?.threads?.find((t) => t.name === "Transcripts");
+    if (found) return found;
+  } catch (e) {}
+  // Optional: archivierte Threads durchsuchen (kann rate-limity sein)
+  try {
+    const archived = await channel.threads.fetchArchived();
+    const foundA = archived?.threads?.find((t) => t.name === "Transcripts");
+    if (foundA) return foundA;
+  } catch (e) {}
+  return null;
+}
+
+async function getOrCreateTranscriptsThread(channel) {
+  const existing = await findExistingTranscriptsThread(channel);
+  if (existing) return existing;
+
+  try {
+    // erstellt einen öffentlichen Thread ohne Startnachricht
+    const thread = await channel.threads.create({
+      name: "Transcripts",
+      autoArchiveDuration: 1440, // 24h
+      reason: "Store voice transcripts and AI copies",
+      type: ChannelType.PublicThread,
+    });
+    return thread;
+  } catch (e) {
+    console.warn("[Transcripts] Failed to create thread:", e.message);
+    return null;
   }
+}
+
+/**
+ * Kopiert Content in den Transcripts-Thread.
+ * @param {*} channel TextChannel
+ * @param {*} content string
+ * @param {*} createIfMissing boolean (default false) – ob der Thread erstellt werden soll, wenn er fehlt.
+ * @returns {Promise<boolean>} true, wenn gesendet wurde
+ */
+async function sendToTranscriptsThread(channel, content, createIfMissing = false) {
+  try {
+    let thread = await findExistingTranscriptsThread(channel);
+    if (!thread && createIfMissing) {
+      thread = await getOrCreateTranscriptsThread(channel);
+    }
+    if (!thread) return false;
+
+    const parts = splitIntoChunks(content);
+    for (const p of parts) {
+      await thread.send({ content: p });
+    }
+    return true;
+  } catch (e) {
+    console.warn("[Transcripts] Failed to send to thread:", e.message);
+    return false;
+  }
+}
+
+// Für echte Sprach-Transkripte: benutze diese Helper-Funktion
+async function postTranscript(channel, text) {
+  return sendToTranscriptsThread(channel, text, true); // erstellt, falls fehlend
 }
 
 // ---------- Status/Bots ----------
@@ -172,7 +250,9 @@ async function setBotPresence(client, activityText, status, activityType = 4) {
 
 // ---------- Kontext / Messages ----------
 async function setAddUserMessage(message, chatContext) {
-  if (message.content.startsWith("!context")) return;
+  if (message.content.startsWith("!context")) return; // nicht loggen
+  if (message.content.startsWith("!summarize")) return; // nicht loggen
+
   let content = message.content || "";
   if (message.attachments?.size > 0) {
     const links = message.attachments.map((a) => a.url).join("\n");
@@ -233,7 +313,9 @@ async function getSpeech(connection, guildId, text, client, voice) {
         const response = await getTTS(chunk, "tts-1", voice);
         const pass = new PassThrough();
         response.pipe(pass);
-        const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
+        const decoder = new prism.FFmpeg({
+          args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"],
+        });
         const pcmStream = pass.pipe(decoder);
         const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
         player.play(resource);
@@ -258,5 +340,11 @@ module.exports = {
   splitIntoChunks,
   sendChunked,
   postSummariesIndividually,
-  getSpeech
+  // Transcripts
+  findExistingTranscriptsThread,
+  getOrCreateTranscriptsThread,
+  sendToTranscriptsThread,
+  postTranscript,
+  // TTS
+  getSpeech,
 };

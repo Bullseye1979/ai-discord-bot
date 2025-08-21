@@ -1,6 +1,6 @@
-// discord-handler.js — v2.6
+// discord-handler.js — v2.7
 // Handler für Discord-Aktionen
-// + !summarize mit Cutoff, Kontext-Neuaufbau, Message-Wiederherstellung
+// + KI-Antworten zusätzlich in vorhandenen Transcripts-Thread kopieren
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const {
@@ -9,6 +9,7 @@ const {
   setAddUserMessage,
   postSummariesIndividually,
   getSpeech,
+  sendToTranscriptsThread, // neu
 } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
 const { getToolRegistry } = require("./tools.js");
@@ -36,7 +37,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     const senderName = message.member?.displayName || message.author?.username || "";
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
-    const matchingBlock = blocks.find(b => {
+    const matchingBlock = blocks.find((b) => {
       const okUser = Array.isArray(b.user) && b.user.map(String).includes(senderId);
       const okSpeaker = Array.isArray(b.speaker) && b.speaker.includes(senderName);
       return okUser || okSpeaker;
@@ -63,6 +64,10 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     if (output?.trim()) {
       await message.channel.send({ content: output });
+
+      // KI-Antwort zusätzlich in Transcripts-Thread kopieren (nur wenn vorhanden)
+      await sendToTranscriptsThread(message.channel, output, false);
+
       chatContext.add("assistant", channelMeta?.botname || "AI", output);
       await message.react("✅");
     } else {
@@ -79,7 +84,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
   }
 }
 
-// Handle voice join
+// Voice join (unverändert)
 async function setVoiceChannel(message, guildTextChannels, activeRecordings, chatContext, client) {
   const channel = message.member?.voice?.channel;
   if (!channel) return;
@@ -94,7 +99,7 @@ async function setVoiceChannel(message, guildTextChannels, activeRecordings, cha
   setStartListening(getVoiceConnection(message.guild.id), message.guild.id, guildTextChannels, activeRecordings, client);
 }
 
-// TTS bei AI-Antworten
+// TTS bei AI-Antworten (unverändert)
 async function setTTS(message, client, guildTextChannels) {
   if (!message.guild) return;
 
@@ -113,7 +118,7 @@ async function setTTS(message, client, guildTextChannels) {
   if (message.webhookId) {
     try {
       const webhooks = await message.channel.fetchWebhooks();
-      const matching = webhooks.find(w => w.id === message.webhookId);
+      const matching = webhooks.find((w) => w.id === message.webhookId);
       if (matching && matching.name === botname) {
         isAIWebhook = true;
       }
@@ -132,67 +137,13 @@ async function setTTS(message, client, guildTextChannels) {
   if (!connection || connection.joinConfig.channelId !== botVC) return;
 
   const cleaned = message.content
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
-    .replace(/https?:\/\/\S+/g, 'Link')
-    .replace(/<@!?(\d+)>/g, 'jemand')
-    .replace(/:[^:\s]+:/g, '');
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "Link")
+    .replace(/<@!?(\d+)>/g, "jemand")
+    .replace(/:[^:\s]+:/g, "");
 
   if (cleaned.trim()) {
     await getSpeech(connection, guildId, cleaned, client, voice);
-  }
-}
-
-// --- !summarize ---
-async function handleSummarize(message, chatContext) {
-  const channelMeta = getChannelConfig(message.channelId);
-  const customPrompt = channelMeta?.summaryPrompt || null;
-
-  const cutoffMs = Date.now();
-
-  try {
-    const progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
-
-    // 1. Zusammenfassung erzeugen
-    await chatContext.summarizeSince(cutoffMs, customPrompt);
-
-    // 2. Channel leeren
-    const me = message.guild.members.me;
-    const perms = message.channel.permissionsFor(me);
-    if (!perms?.has("ManageMessages") || !perms?.has("ReadMessageHistory")) {
-      await message.channel.send("⚠️ I lack permissions to delete messages.");
-    } else {
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      let beforeId = null;
-      while (true) {
-        const fetched = await message.channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
-        if (!fetched || fetched.size === 0) break;
-        for (const msg of fetched.values()) {
-          if (msg.pinned) continue;
-          try {
-            await msg.delete();
-          } catch {}
-          await sleep(120);
-        }
-        const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
-        if (!oldest) break;
-        beforeId = oldest.id;
-      }
-    }
-
-    // 3. Summaries posten
-    const last5Desc = await chatContext.getLastSummaries(5);
-    const summariesAsc = (last5Desc || []).slice().reverse().map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
-
-    const afterRows = await chatContext.getMessagesAfter(cutoffMs);
-    const leftover = afterRows?.length ? afterRows.map((r) => `**${r.sender}**: ${r.content}`).join("\n") : "";
-
-    await postSummariesIndividually(message.channel, summariesAsc, leftover);
-
-    await message.channel.send("✅ **Summary completed.**");
-    if (progress?.deletable) await progress.delete();
-  } catch (err) {
-    console.error("[!summarize ERROR]:", err);
-    await message.channel.send("❌ Fehler beim Zusammenfassen.");
   }
 }
 
@@ -200,5 +151,4 @@ module.exports = {
   getProcessAIRequest,
   setVoiceChannel,
   setTTS,
-  handleSummarize
 };
