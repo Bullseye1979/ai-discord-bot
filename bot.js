@@ -64,21 +64,34 @@ client.on("messageCreate", async (message) => {
     : !!message.channel.parentId; // fallback
   const effectiveChannelId = isThread ? (message.channel.parentId || message.channelId) : message.channelId;
 
-  const channelMeta = getChannelConfig(effectiveChannelId);
+  // Parent-ID nutzen, wenn die Nachricht in einem Thread steht
+  const baseChannelId = (message.channel?.isThread?.())
+    ? message.channel.parentId
+    : message.channelId;
+
+  // Transcripts-Thread erkennen
+  const isTranscriptThread =
+    message.channel?.isThread?.() && message.channel.name === "Transcripts";
+
+  // Webhook-Spiegel im Transcripts-Thread komplett ignorieren (kein Logging/Trigger)
+  if (message.webhookId && isTranscriptThread) return;
+
+  const channelMeta = getChannelConfig(baseChannelId);
   if (!channelMeta) return;
 
-  const key = `channel:${effectiveChannelId}`;
+  const key = `channel:${baseChannelId}`;
   if (!contextStorage.has(key)) {
     const ctx = new Context(
       channelMeta.persona,
       channelMeta.instructions,
       channelMeta.tools,
       channelMeta.toolRegistry,
-      effectiveChannelId // Kontext/DB-Schlüssel = Parent
+      baseChannelId
     );
     contextStorage.set(key, ctx);
   }
   const chatContext = contextStorage.get(key);
+
 
   // ---------------- Commands (vor Logging!) ----------------
 
@@ -114,23 +127,24 @@ client.on("messageCreate", async (message) => {
   }
 
   // !joinvc: Voice beitreten + TTS bereit (Textkanal immer Parent mappen)
-  if ((message.content || "").startsWith("!joinvc")) {
-    const vc = message.member?.voice?.channel;
-    if (!vc) { await message.reply("Join a voice channel first."); return; }
-
-    const conn = joinVoiceChannel({
-      channelId: vc.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-      selfDeaf: false,
-    });
-
-    const mappedTextChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
-    guildTextChannels.set(message.guild.id, mappedTextChannelId);
-
+  if (message.content.startsWith("!joinvc")) {
+  const vc = message.member?.voice?.channel;
+  if (!vc) { await message.reply("Join a voice channel first."); return; }
+  const conn = joinVoiceChannel({
+    channelId: vc.id,
+    guildId: message.guild.id,
+    adapterCreator: message.guild.voiceAdapterCreator,
+    selfDeaf: false,
+  });
+  // Transcripts immer an den Parent-Textkanal binden (nicht an den Thread)
+  const baseForVC = (message.channel?.isThread?.())
+    ? message.channel.parentId
+    : message.channel.id;
+    guildTextChannels.set(message.guild.id, baseForVC);
     setStartListening(conn, message.guild.id, guildTextChannels, client);
     return;
   }
+
 
   // !leavevc: Voice verlassen
   if ((message.content || "").startsWith("!leavevc")) {
@@ -209,10 +223,12 @@ client.on("messageCreate", async (message) => {
   // ---------------- Normaler Flow ----------------
 
   // Nur echte User-Nachrichten in den Kontext loggen (keine Webhooks/Bot)
-  if (!message.author?.bot && !message.webhookId) {
+  const inTranscriptsThread =
+  message.channel?.isThread?.() && message.channel.name === "Transcripts";
+
+  if (!inTranscriptsThread && !message.author?.bot && !message.webhookId) {
     await setAddUserMessage(message, chatContext);
   }
-
   // TTS anstoßen (Filter-Logik in setTTS sorgt dafür, dass Transcripts/Summaries stumm bleiben)
   try {
     await setTTS(message, client, guildTextChannels);
@@ -221,6 +237,9 @@ client.on("messageCreate", async (message) => {
   }
 
   // Trigger für KI (aus Parent-Channel-Config)
+
+  if (isTranscriptThread) return;
+
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();
   const content = (message.content || "").trim().toLowerCase();
   const isTrigger = content.startsWith(trigger) || content.startsWith(`!${trigger}`);
