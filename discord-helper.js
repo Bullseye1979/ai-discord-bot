@@ -248,6 +248,20 @@ function getSplitTextToChunks(text, maxChars = 500) {
   return chunks;
 }
 
+// ---------- Presence ----------
+
+async function setBotPresence(client, activityText = "✅ Ready", status = "online", activityType = 0) {
+  try {
+    if (!client?.user) return;
+    await client.user.setPresence({
+      activities: [{ name: activityText, type: activityType }], // 0 = Playing
+      status, // "online" | "idle" | "dnd" | "invisible"
+    });
+  } catch (e) {
+    console.warn("[presence] setBotPresence failed:", e?.message || e);
+  }
+}
+
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
@@ -289,6 +303,7 @@ module.exports = {
   setReplyAsWebhook,
   splitIntoChunks,
   sendChunked,
+  setBotPresence,
   postSummariesIndividually,
   getOrCreateTranscriptsThread,
   getSpeech,
