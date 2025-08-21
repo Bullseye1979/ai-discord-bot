@@ -1,6 +1,6 @@
-// bot.js — v3.1
-// !summarize erstellt Summary, leert Chat, postet 5 Summaries (älteste → neueste).
-// KEINE "Messages after cutoff" Ausgabe mehr.
+// bot.js — v3.2
+// !summarize: erstellt Summary, leert Chat, postet 5 Summaries (älteste → neueste).
+// Bot-Nachrichten werden geloggt — ABER Antworten auf !context werden gezielt NICHT geloggt (Ignore-IDs + Zeitfenster).
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -26,6 +26,11 @@ const client = new Client({
 
 const contextStorage = new Map();
 
+// IDs der !context-Antwort-Messages, die wir NICHT loggen wollen
+const contextDumpIgnoreIds = new Set();
+// Fallback: Zeitfenster pro Channel, falls Events früher ankommen als IDs registriert werden
+const contextDumpRecentTs = new Map(); // channelId -> timestamp(ms)
+
 async function deleteAllMessages(channel) {
   const me = channel.guild.members.me;
   const perms = channel.permissionsFor(me);
@@ -49,7 +54,10 @@ async function deleteAllMessages(channel) {
       } catch {}
       await sleep(120);
     }
-    const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
+    const oldest = fetched.reduce(
+      (acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m),
+      null
+    );
     if (!oldest) break;
     beforeId = oldest.id;
   }
@@ -57,6 +65,24 @@ async function deleteAllMessages(channel) {
 
 client.on("messageCreate", async (message) => {
   if (!message.guild) return;
+
+  // ❗️Nur Antworten auf !context NICHT loggen:
+  // a) Explizit per ID ignorieren
+  if (contextDumpIgnoreIds.has(message.id)) {
+    contextDumpIgnoreIds.delete(message.id);
+    return;
+  }
+  // b) Fallback: innerhalb kurzer Zeit und mit JSON-Codeblock
+  const recent = contextDumpRecentTs.get(message.channelId);
+  if (
+    recent &&
+    Date.now() - recent < 8000 &&
+    message.author?.bot &&
+    typeof message.content === "string" &&
+    message.content.trim().startsWith("```json")
+  ) {
+    return;
+  }
 
   const channelMeta = getChannelConfig(message.channelId);
   if (!channelMeta) return;
@@ -77,7 +103,15 @@ client.on("messageCreate", async (message) => {
   // ---- COMMAND: !context ----
   if (message.content.startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
-    for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
+    // Sende die Dumps und sammle deren IDs zum Ignorieren
+    for (const c of chunks) {
+      const sentMsgs = await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
+      for (const m of sentMsgs) {
+        if (m?.id) contextDumpIgnoreIds.add(m.id);
+      }
+    }
+    // Setze ein kurzes Zeitfenster als zusätzliche Absicherung (Race-Condition-Fallback)
+    contextDumpRecentTs.set(message.channelId, Date.now());
     return;
   }
 
@@ -137,7 +171,7 @@ client.on("messageCreate", async (message) => {
   }
 
   // ---- NORMALE NACHRICHT ----
-  // (setAddUserMessage filtert !context/!summarize bereits weg)
+  // (Loggt auch Bot/Webhook-Nachrichten — außer Commands)
   await setAddUserMessage(message, chatContext);
 
   // Trigger prüfen (Name oder !name)

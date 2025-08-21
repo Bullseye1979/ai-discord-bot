@@ -1,7 +1,6 @@
-// discord-helper.js — v1.7
-// Hilfsfunktionen für Discord + Chunking + Summaries-Posting (einzeln)
-// + Transcripts-Thread (Erkennen/Erstellen/Kopieren)
-// WICHTIG: getChannelConfig() liefert auch summaryPrompt zurück.
+// discord-helper.js — v1.8
+// Hilfsfunktionen: Tools, Channel-Config, Chunking, Summaries, Transcripts-Thread
+// Updates: sendChunked() gibt Message-Objekte zurück; setAddUserMessage loggt Bot/Webhook als assistant.
 
 const fs = require("fs");
 const path = require("path");
@@ -157,11 +156,24 @@ function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   return chunks.flatMap(hardSplit);
 }
 
+/**
+ * Sendet Text (Chunked) und gibt ein Array der gesendeten Message-Objekte zurück.
+ * @param {*} channel
+ * @param {string} content
+ * @returns {Promise<Array<import('discord.js').Message>>}
+ */
 async function sendChunked(channel, content) {
   const parts = splitIntoChunks(content);
+  const sent = [];
   for (const p of parts) {
-    await channel.send({ content: p });
+    try {
+      const msg = await channel.send({ content: p });
+      sent.push(msg);
+    } catch (e) {
+      console.warn("[sendChunked] Failed to send part:", e.message);
+    }
   }
+  return sent;
 }
 
 // summaries: Array<string> (älteste → neueste)
@@ -179,7 +191,6 @@ async function findExistingTranscriptsThread(channel) {
     const found = active?.threads?.find((t) => t.name === "Transcripts");
     if (found) return found;
   } catch (e) {}
-  // Optional: archivierte Threads durchsuchen (kann rate-limity sein)
   try {
     const archived = await channel.threads.fetchArchived();
     const foundA = archived?.threads?.find((t) => t.name === "Transcripts");
@@ -193,12 +204,11 @@ async function getOrCreateTranscriptsThread(channel) {
   if (existing) return existing;
 
   try {
-    // erstellt einen öffentlichen Thread ohne Startnachricht
     const thread = await channel.threads.create({
       name: "Transcripts",
-      autoArchiveDuration: 1440, // 24h
+      autoArchiveDuration: 1440,
       reason: "Store voice transcripts and AI copies",
-      type: ChannelType.PublicThread,
+      type: 11, // ChannelType.PublicThread (avoid importing enum)
     });
     return thread;
   } catch (e) {
@@ -207,13 +217,6 @@ async function getOrCreateTranscriptsThread(channel) {
   }
 }
 
-/**
- * Kopiert Content in den Transcripts-Thread.
- * @param {*} channel TextChannel
- * @param {*} content string
- * @param {*} createIfMissing boolean (default false) – ob der Thread erstellt werden soll, wenn er fehlt.
- * @returns {Promise<boolean>} true, wenn gesendet wurde
- */
 async function sendToTranscriptsThread(channel, content, createIfMissing = false) {
   try {
     let thread = await findExistingTranscriptsThread(channel);
@@ -233,9 +236,8 @@ async function sendToTranscriptsThread(channel, content, createIfMissing = false
   }
 }
 
-// Für echte Sprach-Transkripte: benutze diese Helper-Funktion
 async function postTranscript(channel, text) {
-  return sendToTranscriptsThread(channel, text, true); // erstellt, falls fehlend
+  return sendToTranscriptsThread(channel, text, true);
 }
 
 // ---------- Status/Bots ----------
@@ -250,16 +252,25 @@ async function setBotPresence(client, activityText, status, activityType = 4) {
 
 // ---------- Kontext / Messages ----------
 async function setAddUserMessage(message, chatContext) {
-  if (message.content.startsWith("!context")) return; // nicht loggen
-  if (message.content.startsWith("!summarize")) return; // nicht loggen
+  // Befehle nie loggen
+  const txt = message.content || "";
+  if (txt.startsWith("!context") || txt.startsWith("!summarize")) return;
 
-  let content = message.content || "";
+  // Bot/Webhook -> als assistant loggen; sonst user
+  const isBotLike = !!message.author?.bot || !!message.webhookId;
+  const role = isBotLike ? "assistant" : "user";
+
+  let content = txt;
   if (message.attachments?.size > 0) {
     const links = message.attachments.map((a) => a.url).join("\n");
     content = `${links}\n${content}`;
   }
-  const senderName = message.member?.displayName || message.author?.username || "user";
-  await chatContext.add("user", senderName, content);
+  const senderName =
+    message.member?.displayName ||
+    message.author?.username ||
+    (isBotLike ? "bot" : "user");
+
+  await chatContext.add(role, senderName, content);
 }
 
 // ---------- Voice-TTS (optional) ----------
@@ -317,7 +328,9 @@ async function getSpeech(connection, guildId, text, client, voice) {
           args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"],
         });
         const pcmStream = pass.pipe(decoder);
-        const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
+        const resource = createAudioResource(pcmStream, {
+          inputType: StreamType.Raw,
+        });
         player.play(resource);
         await new Promise((resolve, reject) => {
           player.once(AudioPlayerStatus.Idle, resolve);
