@@ -160,8 +160,7 @@ async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
     let hook = hooks.find((w) => w.name === botname);
     if (!hook) {
       hook = await message.channel.createWebhook({
-        name: botname || "AI",
-        avatar: avatarUrl || undefined
+        name: botname || "AI"
       });
     }
     const parts = splitIntoChunks(content);
