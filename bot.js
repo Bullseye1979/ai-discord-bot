@@ -108,9 +108,18 @@ client.on("messageCreate", async (message) => {
 
   // !joinvc: Voice beitreten + TTS bereit
   if (message.content.startsWith("!joinvc")) {
-    await setVoiceChannel(message, guildTextChannels, activeRecordings, chatContext, client);
-    return;
-  }
+  const vc = message.member?.voice?.channel;
+  if (!vc) { await message.reply("Join a voice channel first."); return; }
+  const conn = joinVoiceChannel({
+    channelId: vc.id,
+    guildId: message.guild.id,
+    adapterCreator: message.guild.voiceAdapterCreator,
+    selfDeaf: false,
+  });
+  guildTextChannels.set(message.guild.id, message.channel.id);
+  setStartListening(conn, message.guild.id, guildTextChannels, client);
+  return;
+}
 
   // !leavevc: Voice verlassen
   if (message.content.startsWith("!leavevc")) {

@@ -13,6 +13,8 @@ require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
+const activeRecordings = new Map();
+
 // ---------- Tools für User/Blocks ----------
 function getUserTools(nameOrDisplayName) {
   const configPath = path.join(__dirname, "permissions.json");
@@ -288,6 +290,70 @@ async function setAddUserMessage(message, chatContext) {
   }
 }
 
+
+async function setStartListening(connection, guildId, guildTextChannels, client) {
+  try {
+    if (!connection || !guildId) return;
+    if (activeRecordings.get(guildId)) return; // schon aktiv
+    const textChannelId = guildTextChannels.get(guildId);
+    const textChannel = textChannelId ? await client.channels.fetch(textChannelId).catch(() => null) : null;
+    if (!textChannel) return;
+
+    const thread = await getOrCreateTranscriptsThread(textChannel);
+    const target = thread || textChannel;
+
+    const receiver = connection.receiver;
+    if (!receiver) return;
+
+    activeRecordings.set(guildId, true);
+
+    receiver.speaking.on("start", (userId) => {
+      try {
+        const opus = receiver.subscribe(userId, {
+          end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
+        });
+
+        const pcm = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
+        const chunks = [];
+        pcm.on("data", (c) => chunks.push(c));
+        pcm.on("end", async () => {
+          try {
+            const buf = Buffer.concat(chunks);
+            if (buf.length < 48000) return; // zu kurz -> ignorieren
+
+            // Sprache erkennen (Passe Sprache/Signatur an deine aiService.js an)
+            const text = await getTranscription(buf, "whisper-1", "auto");
+            if (text && text.trim()) {
+              // Sprechernamen ermitteln
+              let speaker = "Unknown";
+              try {
+                const g = await client.guilds.fetch(guildId);
+                const m = await g.members.fetch(userId).catch(() => null);
+                speaker = m?.displayName || m?.user?.username || speaker;
+              } catch {}
+
+              await sendChunked(target, `**${speaker}:** ${text.trim()}`);
+            }
+          } catch (err) {
+            console.warn("[Transcription] failed:", err?.message || err);
+          }
+        });
+      } catch (e) {
+        console.warn("[Voice subscribe] failed:", e?.message || e);
+      }
+    });
+
+    // Aufräumen
+    connection.on("stateChange", (oldS, newS) => {
+      if (newS.status === "destroyed" || newS.status === "disconnected") {
+        activeRecordings.delete(guildId);
+      }
+    });
+  } catch (e) {
+    console.warn("[setStartListening] failed:", e?.message || e);
+  }
+}
+
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
@@ -333,5 +399,6 @@ module.exports = {
   setBotPresence,
   postSummariesIndividually,
   getOrCreateTranscriptsThread,
+  setStartListening,
   getSpeech,
 };
