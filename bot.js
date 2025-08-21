@@ -1,6 +1,7 @@
 // bot.js — v3.2
-// !summarize mit Cursor-Fix, Lock während Zusammenfassung, keine Bot/Webhook/!context-Logs,
-// 5 Summaries einzeln posten (gechunked). Keine "messages after cutoff"-Nachricht mehr.
+// !summarize: Statusmeldung (EN), Cutoff, DB-Summary, Channel leeren, 5 Summaries (gechunked) posten,
+// danach Cursor auf MAX(context_log.id) bumpen, Abschlussmeldung.
+// !purge-db: löscht alle DB-Einträge (context_log + summaries) für den Channel (Admin/ManageGuild).
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -25,8 +26,6 @@ const client = new Client({
 });
 
 const contextStorage = new Map();
-// Channels, die gerade zusammenfassen → eingehende Nachrichten werden ignoriert
-const summarizingChannels = new Set();
 
 async function deleteAllMessages(channel) {
   const me = channel.guild.members.me;
@@ -41,9 +40,7 @@ async function deleteAllMessages(channel) {
     if (!fetched || fetched.size === 0) break;
     for (const msg of fetched.values()) {
       if (msg.pinned) continue;
-      try {
-        await msg.delete();
-      } catch {}
+      try { await msg.delete(); } catch {}
       await sleep(120);
     }
     const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
@@ -52,35 +49,11 @@ async function deleteAllMessages(channel) {
   }
 }
 
-async function isFromOurBotOrWebhook(message, botname) {
-  // Eigener Bot?
-  if (message.author?.id && client.user && message.author.id === client.user.id) return true;
-  // Webhook mit unserem Bot-Namen?
-  if (message.webhookId) {
-    try {
-      const webhooks = await message.channel.fetchWebhooks();
-      const matching = webhooks.find((w) => w.id === message.webhookId);
-      if (matching && matching.name === botname) return true;
-    } catch {}
-  }
-  return false;
-}
-
 client.on("messageCreate", async (message) => {
   if (!message.guild) return;
 
   const channelMeta = getChannelConfig(message.channelId);
   if (!channelMeta) return;
-
-  // Wenn der Kanal gesperrt ist (während !summarize), keinerlei Logging/Verarbeitung
-  if (summarizingChannels.has(message.channelId)) {
-    // optional: nur kurz reagieren, aber NICHT loggen
-    try { await message.react("🔒"); } catch {}
-    return;
-  }
-
-  // Eigene Bot-/Webhook-Messages NIEMALS loggen (verhindert Echo/Loops in context_log)
-  if (await isFromOurBotOrWebhook(message, channelMeta.botname)) return;
 
   const key = `channel:${message.channelId}`;
   if (!contextStorage.has(key)) {
@@ -95,34 +68,58 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key);
 
-  // ---- Commands ----
+  // ---- Commands (vor Logging!) ----
+
+  // !context (nur anzeigen, NICHT loggen)
   if (message.content.startsWith("!context")) {
-    // !context wird NICHT geloggt und NICHT in die Summary aufgenommen
     const chunks = await chatContext.getContextAsChunks();
     for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
     return;
   }
 
-  if (message.content.startsWith("!summarize")) {
-    // Kanal sperren
-    summarizingChannels.add(message.channelId);
+  // !purge-db (DB-Einträge löschen, nur Admin/ManageGuild)
+  if (message.content.startsWith("!purge-db")) {
+    const member = message.member;
+    const hasPerm =
+      member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+      member.permissions.has(PermissionsBitField.Flags.ManageGuild);
 
+    if (!hasPerm) {
+      await message.channel.send("❌ You need **Manage Server** or **Administrator** to purge the database for this channel.");
+      return;
+    }
+
+    try {
+      const res = await chatContext.purgeChannelData();
+      await message.channel.send(
+        `🗑️ Purged database for this channel.\n- context_log deleted: **${res.contextDeleted}**\n- summaries deleted: **${res.summariesDeleted}**`
+      );
+    } catch (e) {
+      console.error("[PURGE-DB] failed:", e);
+      await message.channel.send("❌ Failed to purge database entries for this channel.");
+    }
+    return;
+  }
+
+  // !summarize
+  if (message.content.startsWith("!summarize")) {
     let progress = null;
     try {
-      progress = await message.channel.send("⏳ **Summary in progress…** Channel is temporarily locked.");
+      progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
     } catch {}
 
     const cutoffMs = Date.now();
     const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
 
-    // 1) Zusammenfassen bis Cutoff -> Kontext wird: System + 5 Summaries + alle >= Cutoff
+    // 1) Zusammenfassen bis Cutoff
+    let summaryResult = { insertedSummaryId: null, usedMaxContextId: null };
     try {
-      await chatContext.summarizeSince(cutoffMs, customPrompt);
+      summaryResult = await chatContext.summarizeSince(cutoffMs, customPrompt);
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
     }
 
-    // 2) Alle Messages im Channel löschen
+    // 2) Alle Messages im Channel löschen (sichtbar)
     try {
       await deleteAllMessages(message.channel);
     } catch (e) {
@@ -130,10 +127,15 @@ client.on("messageCreate", async (message) => {
       await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
     }
 
-    // 3) 5 Summaries (älteste -> neueste) als einzelne Nachrichten posten (gechunked)
+    // 3) 5 Summaries (älteste -> neueste) einzeln posten (gechunked)
     try {
       const last5Desc = await chatContext.getLastSummaries(5);
-      const summariesAsc = (last5Desc || []).slice().reverse().map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
+      const summariesAsc =
+        (last5Desc || [])
+          .slice()
+          .reverse()
+          .map((r, i, arr) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
+
       if (summariesAsc.length === 0) {
         await message.channel.send("No summaries available yet.");
       } else {
@@ -143,21 +145,25 @@ client.on("messageCreate", async (message) => {
       console.error("[!summarize] posting summaries error:", e?.message || e);
     }
 
-    // 4) Abschluss
+    // 4) Cursor nach **allen** neu geposteten (Summary-)Nachrichten hochsetzen
     try {
-      await message.channel.send("✅ **Summary completed.** Channel unlocked.");
+      await chatContext.bumpCursorToCurrentMax();
+    } catch (e) {
+      console.error("[!summarize] bumpCursorToCurrentMax error:", e?.message || e);
+    }
+
+    // 5) Abschluss
+    try {
+      await message.channel.send("✅ **Summary completed.**");
     } catch {}
     try {
       if (progress?.deletable) await progress.delete();
     } catch {}
 
-    // Kanal entsperren
-    summarizingChannels.delete(message.channelId);
     return;
   }
 
-  // ---- Normaler Flow ----
-  // Nur hier loggen (kein Bot/kein Webhook/kein !context)
+  // ---- Normaler Flow: erst jetzt loggen ----
   await setAddUserMessage(message, chatContext);
 
   const trigger = (channelMeta.name || "bot").trim().toLowerCase();

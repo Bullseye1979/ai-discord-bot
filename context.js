@@ -1,4 +1,4 @@
-// context.js — v4.8 (Skip-Initial-Summaries + Cursor-Fix + SQL-Filter + Debug)
+// context.js — v4.8 (Cursor + Cutoff + SQL + Summarizer ohne Altsummaries + Purge + Cursor-Bump)
 // Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
 
 require("dotenv").config();
@@ -71,15 +71,8 @@ const sanitize = (s) =>
     .slice(0, 64);
 
 class Context {
-  /**
-   * @param {string} persona
-   * @param {string} instructions
-   * @param {Array} tools
-   * @param {Object} toolRegistry
-   * @param {string} channelId
-   * @param {Object|boolean} optionsOrSkip - { skipInitialSummaries?: boolean } oder boolean (Back-Compat)
-   */
-  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global", optionsOrSkip = {}) {
+  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global", opts = {}) {
+    const { skipInitialSummaries = false } = opts;
     this.messages = [];
     this.persona = persona || "";
     this.instructions = instructions || "";
@@ -88,20 +81,10 @@ class Context {
     this.channelId = channelId;
     this.isSummarizing = false;
 
-    let opts = {};
-    if (typeof optionsOrSkip === "boolean") {
-      opts.skipInitialSummaries = optionsOrSkip;
-    } else if (optionsOrSkip && typeof optionsOrSkip === "object") {
-      opts = optionsOrSkip;
-    }
-    this._opts = { skipInitialSummaries: !!opts.skipInitialSummaries };
-
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
 
-    // Nur für "normale" Chat-Kontexte die letzten 5 Summaries injizieren;
-    // Summarizer-Kontext setzt skipInitialSummaries = true
-    this._initLoaded = this._opts.skipInitialSummaries ? Promise.resolve() : this._injectInitialSummaries();
+    this._initLoaded = skipInitialSummaries ? Promise.resolve() : this._injectInitialSummaries();
   }
 
   async _injectInitialSummaries() {
@@ -124,11 +107,14 @@ class Context {
     }
   }
 
+  _rebuildSystemOnly() {
+    const sys = `${this.persona}\n${this.instructions}`.trim();
+    this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
+  }
+
   async add(role, sender, content) {
     const entry = { role, name: sanitize(sender), content: String(content ?? "") };
-    try {
-      await this._initLoaded;
-    } catch {}
+    try { await this._initLoaded; } catch {}
     this.messages.push(entry);
 
     try {
@@ -143,7 +129,6 @@ class Context {
     return entry;
   }
 
-  // ALLE Nachrichten >= cutoff (für Kontexteinbau nach Summary)
   async getMessagesAfter(cutoffMs) {
     const db = await getPool();
     const [rows] = await db.execute(
@@ -156,99 +141,79 @@ class Context {
     return rows || [];
   }
 
-  // Cursor-basierte Zusammenfassung:
-  // - Nur context_log.id > last_context_id
-  // - timestamp <= cutoff
-  // - strenger Filter: NUR user & kein "system"-Sender, keine Status-/Summary-/Marker-Texte
   async summarizeSince(cutoffMs, customPrompt = null) {
-    if (this.isSummarizing) return this.messages;
+    if (this.isSummarizing) return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
     this.isSummarizing = true;
 
     try {
       const db = await getPool();
 
-      // Letzte Cursor-Position holen
       const [lastSum] = await db.execute(
-        `SELECT last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
       const lastCursor = lastSum?.[0]?.last_context_id ?? null;
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      // Auswahl der "neuen" Nachrichten (nur user, kein system-sender, keine Status/Summary/Marker)
-      const commonWhere =
-        `channel_id=? AND timestamp <= ? AND role='user' AND sender <> 'system'` +
-        ` AND content NOT LIKE '⏳ %'` +
-        ` AND content NOT LIKE '✅ %'` +
-        ` AND content NOT LIKE 'Summary %'` +
-        ` AND content NOT LIKE '<<<BEGIN NEW MESSAGES>>%'` +
-        ` AND content NOT LIKE '<<<END NEW MESSAGES>>%'`;
-
       let rows = [];
       if (lastCursor != null) {
-        const sql =
+        const [r] = await db.execute(
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE ${commonWhere} AND id > ?
-            ORDER BY id ASC`;
-        const [r] = await db.execute(sql, [this.channelId, cutoff, lastCursor]);
+            WHERE channel_id=? AND id > ? AND timestamp <= ?
+            ORDER BY id ASC`,
+          [this.channelId, lastCursor, cutoff]
+        );
         rows = r || [];
       } else {
-        const sql =
+        const [r] = await db.execute(
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE ${commonWhere}
-            ORDER BY id ASC`;
-        const [r] = await db.execute(sql, [this.channelId, cutoff]);
+            WHERE channel_id=? AND timestamp <= ?
+            ORDER BY id ASC`,
+          [this.channelId, cutoff]
+        );
         rows = r || [];
       }
 
-      let maxId = rows.length ? rows[rows.length - 1].id : null;
-
-      // Debug: Übersicht der Auswahl
-      console.debug(`[SUMMARY][DEBUG] Channel=${this.channelId} last_context_id=${lastCursor ?? "null"} cutoff=${cutoff} rows=${rows.length}`);
-      if (rows.length) {
-        console.debug(`[SUMMARY][DEBUG] Selected rows to summarize:`);
-        for (const r of rows) {
-          console.debug(`[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`);
-        }
-      }
+      let maxId = rows.length ? rows[rows.length - 1].id : lastCursor;
+      let insertedSummaryId = null;
 
       if (rows.length) {
         const prompt =
           (customPrompt && customPrompt.trim()) ||
-          `You are a Dungeon Master writing a dramatic session recap. Summarize only the in-character Dungeons & Dragons events such as combat, roleplay, exploration, and dialogue. Completely ignore all out-of-character chatter like food orders, technical issues, jokes, or real-world references. If uncertain, only include messages that clearly advance the fantasy narrative. Write in English, using a vivid, high-fantasy style. Do not repeat events already present in earlier summaries; summarize only the NEW messages provided.`;
+          `You are a Dungeon Master writing a dramatic session recap. Summarize only the in-character D&D events. Strictly ignore all out-of-character chatter (food orders, jokes, tech talk, meta). Write in English, vivid high-fantasy style. Do not repeat previous summaries; include only NEW events from the provided logs.`;
 
-        console.debug(`[SUMMARY][DEBUG] Prompt used:\n${prompt}`);
+        console.debug(`[SUMMARY][DEBUG] Channel=${this.channelId} last_context_id=${lastCursor ?? "null"} cutoff=${cutoff} rows=${rows.length}`);
+        console.debug(`[SUMMARY][DEBUG] Selected rows to summarize:`);
+        rows.forEach((r) => {
+          console.debug(`[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`);
+        });
 
         const text = rows
-          .map(
-            (r) =>
-              `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`
-          )
+          .map((r) => `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
           .join("\n");
 
-        // Summarizer-Kontext OHNE Auto-Injection der letzten 5 Summaries!
+        // Summarizer-Kontext OHNE automatische 5 DB-Summaries (skipInitialSummaries: true)
         const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId, { skipInitialSummaries: true });
-        // Zusätzlich: Debug, was genau der Summarizer bekommt
-        console.debug("[SUMMARY][DEBUG] ===== BEGIN SUMMARIZER CONTEXT (messages) =====");
-        console.debug(JSON.stringify(sumCtx.messages.map((m, i) => ({ idx: i, role: m.role, name: m.name, content: m.content })), null, 2));
-        console.debug("— adding payload —");
         await sumCtx.add("user", "system", text);
-        console.debug(JSON.stringify(sumCtx.messages.map((m, i) => ({ idx: i, role: m.role, name: m.name, content: m.content })), null, 2));
-        console.debug("[SUMMARY][DEBUG] ===== END SUMMARIZER CONTEXT (messages) =====");
+
+        console.debug(`[SUMMARY][DEBUG] Prompt used:\n${prompt}`);
+        console.debug(`[SUMMARY][DEBUG] ===== BEGIN SUMMARIZER CONTEXT (messages) =====`);
+        console.debug(JSON.stringify(sumCtx.messages, null, 2));
+        console.debug(`[SUMMARY][DEBUG] ===== END SUMMARIZER CONTEXT (messages) =====`);
 
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
-
         if (summary) {
-          await db.execute(
+          const [res] = await db.execute(
             `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
              VALUES (?, ?, ?, ?)`,
             [toMySQLDateTime(new Date()), this.channelId, summary, maxId]
           );
+          insertedSummaryId = res?.insertId ?? null;
         }
       } else {
-        console.debug("[SUMMARY][DEBUG] No new user messages since last cursor/cutoff → no new summary row inserted.");
+        console.debug("[SUMMARY] No new rows since last cursor/cutoff.");
       }
 
       // Kontext neu aufbauen: System + 5 Summaries (ASC) + alle >= Cutoff
@@ -262,20 +227,16 @@ class Context {
       const sys = `${this.persona}\n${this.instructions}`.trim();
       if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
 
-      for (const r of asc) {
-        newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
-      }
+      for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
 
       const afterRows = await this.getMessagesAfter(cutoffMs);
-      for (const r of afterRows) {
-        newMsgs.push({ role: r.role, name: r.sender, content: r.content });
-      }
+      for (const r of afterRows) newMsgs.push({ role: r.role, name: r.sender, content: r.content });
 
       this.messages = newMsgs;
-      return this.messages;
+      return { messages: this.messages, insertedSummaryId, usedMaxContextId: maxId };
     } catch (e) {
       console.error("[SUMMARIZE] failed:", e);
-      return this.messages;
+      return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
     } finally {
       this.isSummarizing = false;
     }
@@ -284,10 +245,47 @@ class Context {
   async getLastSummaries(limit = 5) {
     const db = await getPool();
     const [rows] = await db.execute(
-      `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
+      `SELECT id, timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
       [this.channelId, Number(limit)]
     );
     return rows || [];
+  }
+
+  async getMaxContextId() {
+    const db = await getPool();
+    const [rows] = await db.execute(
+      `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
+      [this.channelId]
+    );
+    return rows?.[0]?.maxId ?? null;
+  }
+
+  async bumpCursorToCurrentMax() {
+    try {
+      const db = await getPool();
+      const maxId = await this.getMaxContextId();
+      if (maxId == null) return null;
+      await db.execute(
+        `UPDATE summaries SET last_context_id=? WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        [maxId, this.channelId]
+      );
+      console.debug(`[SUMMARY][DEBUG] Cursor bumped to max context_log.id = ${maxId}`);
+      return maxId;
+    } catch (e) {
+      console.error("[SUMMARY] bumpCursorToCurrentMax failed:", e.message);
+      return null;
+    }
+  }
+
+  async purgeChannelData() {
+    const db = await getPool();
+    const [r1] = await db.execute(`DELETE FROM context_log WHERE channel_id=?`, [this.channelId]);
+    const [r2] = await db.execute(`DELETE FROM summaries WHERE channel_id=?`, [this.channelId]);
+    this._rebuildSystemOnly();
+    return {
+      contextDeleted: r1?.affectedRows ?? 0,
+      summariesDeleted: r2?.affectedRows ?? 0,
+    };
   }
 
   async getContextAsChunks() {
