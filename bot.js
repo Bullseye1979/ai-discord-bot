@@ -145,7 +145,7 @@ client.on("messageCreate", async (message) => {
       : message.channel.id;
     guildTextChannels.set(message.guild.id, baseForVC);
     // ✅ FIX 2: activeRecordings mitgeben
-    setStartListening(conn, message.guild.id, guildTextChannels, activeRecordings, client);
+    setStartListening(conn, message.guild.id, guildTextChannels, client);
     return;
   }
 
