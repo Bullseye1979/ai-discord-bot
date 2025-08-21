@@ -6,7 +6,7 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
 const path = require("path");
-const { getVoiceConnection } = require("@discordjs/voice");
+const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const Context = require("./context.js");
 const {
   getChannelConfig,
