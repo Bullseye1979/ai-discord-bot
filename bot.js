@@ -222,31 +222,50 @@ client.on("messageCreate", async (message) => {
 
   // ---------------- Normaler Flow ----------------
 
-  // Nur echte User-Nachrichten in den Kontext loggen (keine Webhooks/Bot)
-  const inTranscriptsThread =
+  // ---------------- Normaler Flow ----------------
+
+// a) Transcripts-Thread erkennen
+const inTranscriptsThread =
   message.channel?.isThread?.() && message.channel.name === "Transcripts";
 
-  if (!inTranscriptsThread && !message.author?.bot && !message.webhookId) {
-    await setAddUserMessage(message, chatContext);
+// b) Nur echte User-Nachrichten loggen – keine Webhooks/Bots und NICHT im Transcripts-Thread
+if (!inTranscriptsThread && !message.author?.bot && !message.webhookId) {
+  await setAddUserMessage(message, chatContext);
+}
+
+// c) TTS-Hook beibehalten (hat keinen Effekt für Transkript-Posts)
+try {
+  await setTTS(message, client, guildTextChannels);
+} catch (e) {
+  console.warn("[TTS] call failed:", e?.message || e);
+}
+
+// d) Inhalt für Trigger ermitteln
+let contentRaw = message.content || "";
+
+// Im Transcripts-Thread postet der Bot z.B. "**Alice:** Jenny ..."
+if (inTranscriptsThread && message.author?.id === client.user?.id) {
+  const m = contentRaw.match(/^\*\*[^:]+:\*\*\s*(.+)$/s);
+  if (m) contentRaw = m[1]; // nur der gesprochene Teil
+}
+
+// e) Trigger-Check (Name aus Channel-Config)
+const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
+const norm = contentRaw.trim().toLowerCase();
+const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
+if (!isTrigger) return;
+
+// f) An KI weitergeben, ohne das Transkript in die DB zu schreiben (Proxy überschreibt content)
+const state = { isAIProcessing: 0 };
+const proxyMsg = new Proxy(message, {
+  get(target, prop) {
+    if (prop === "content") return contentRaw;
+    return Reflect.get(target, prop);
   }
-  // TTS anstoßen (Filter-Logik in setTTS sorgt dafür, dass Transcripts/Summaries stumm bleiben)
-  try {
-    await setTTS(message, client, guildTextChannels);
-  } catch (e) {
-    console.warn("[TTS] call failed:", e.message);
-  }
+});
 
-  // Trigger für KI (aus Parent-Channel-Config)
+return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
 
-  if (isTranscriptThread) return;
-
-  const trigger = (channelMeta.name || "bot").trim().toLowerCase();
-  const content = (message.content || "").trim().toLowerCase();
-  const isTrigger = content.startsWith(trigger) || content.startsWith(`!${trigger}`);
-  if (!isTrigger) return;
-
-  const state = { isAIProcessing: 0 };
-  return getProcessAIRequest(message, chatContext, client, state, channelMeta.model, channelMeta.apikey);
 });
 
 // Start
