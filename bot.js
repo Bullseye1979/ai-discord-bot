@@ -1,6 +1,6 @@
-// bot.js — v3.2
-// !summarize: erstellt Summary, leert Chat, postet 5 Summaries (älteste → neueste).
-// Bot-Nachrichten werden geloggt — ABER Antworten auf !context werden gezielt NICHT geloggt (Ignore-IDs + Zeitfenster).
+// bot.js — v3.4
+// !summarize: erstellt Summary (mit Bot-Post-Exclusion), sperrt Channel währenddessen,
+// leert Chat, postet 5 Summaries (älteste → neueste), alles chunked.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -28,8 +28,57 @@ const contextStorage = new Map();
 
 // IDs der !context-Antwort-Messages, die wir NICHT loggen wollen
 const contextDumpIgnoreIds = new Set();
-// Fallback: Zeitfenster pro Channel, falls Events früher ankommen als IDs registriert werden
 const contextDumpRecentTs = new Map(); // channelId -> timestamp(ms)
+
+// -------- Channel Lock/Unlock Helper --------
+async function lockChannelForSummary(channel) {
+  const snapshot = channel.permissionOverwrites.cache.map((o) => ({
+    id: o.id,
+    type: o.type,
+    allow: o.allow.bitfield,
+    deny: o.deny.bitfield,
+  }));
+
+  const everyone = channel.guild.roles.everyone;
+  const me = channel.guild.members.me;
+
+  try {
+    await channel.permissionOverwrites.edit(
+      everyone,
+      { SendMessages: false, AddReactions: false, SendMessagesInThreads: false },
+      { reason: "Lock during summary" }
+    );
+  } catch (e) {
+    console.warn("[Lock] Failed to edit @everyone:", e.message);
+  }
+
+  try {
+    await channel.permissionOverwrites.edit(
+      me,
+      { SendMessages: true, AddReactions: true, SendMessagesInThreads: true },
+      { reason: "Allow bot during summary" }
+    );
+  } catch (e) {
+    console.warn("[Lock] Failed to allow bot:", e.message);
+  }
+
+  // Rückgabe: Restore-Funktion
+  return async () => {
+    try {
+      await channel.permissionOverwrites.set(
+        snapshot.map((o) => ({
+          id: o.id,
+          type: o.type,
+          allow: new PermissionsBitField(o.allow),
+          deny: new PermissionsBitField(o.deny),
+        })),
+        { reason: "Unlock after summary" }
+      );
+    } catch (e) {
+      console.error("[Unlock] Failed to restore overwrites:", e.message);
+    }
+  };
+}
 
 async function deleteAllMessages(channel) {
   const me = channel.guild.members.me;
@@ -43,9 +92,7 @@ async function deleteAllMessages(channel) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let beforeId = null;
   while (true) {
-    const fetched = await channel.messages
-      .fetch({ limit: 100, before: beforeId || undefined })
-      .catch(() => null);
+    const fetched = await channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
     if (!fetched || fetched.size === 0) break;
     for (const msg of fetched.values()) {
       if (msg.pinned) continue;
@@ -54,10 +101,7 @@ async function deleteAllMessages(channel) {
       } catch {}
       await sleep(120);
     }
-    const oldest = fetched.reduce(
-      (acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m),
-      null
-    );
+    const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
     if (!oldest) break;
     beforeId = oldest.id;
   }
@@ -66,13 +110,11 @@ async function deleteAllMessages(channel) {
 client.on("messageCreate", async (message) => {
   if (!message.guild) return;
 
-  // ❗️Nur Antworten auf !context NICHT loggen:
-  // a) Explizit per ID ignorieren
+  // NICHT loggen: Antworten auf !context (IDs gemerkt) ODER zeitnaher JSON-Dump
   if (contextDumpIgnoreIds.has(message.id)) {
     contextDumpIgnoreIds.delete(message.id);
     return;
   }
-  // b) Fallback: innerhalb kurzer Zeit und mit JSON-Codeblock
   const recent = contextDumpRecentTs.get(message.channelId);
   if (
     recent &&
@@ -94,7 +136,8 @@ client.on("messageCreate", async (message) => {
       channelMeta.instructions,
       channelMeta.tools,
       channelMeta.toolRegistry,
-      message.channelId
+      message.channelId,
+      channelMeta.botname // <- wichtig: botDisplayName für Exclusion
     );
     contextStorage.set(key, ctx);
   }
@@ -103,46 +146,51 @@ client.on("messageCreate", async (message) => {
   // ---- COMMAND: !context ----
   if (message.content.startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
-    // Sende die Dumps und sammle deren IDs zum Ignorieren
     for (const c of chunks) {
       const sentMsgs = await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
       for (const m of sentMsgs) {
         if (m?.id) contextDumpIgnoreIds.add(m.id);
       }
     }
-    // Setze ein kurzes Zeitfenster als zusätzliche Absicherung (Race-Condition-Fallback)
     contextDumpRecentTs.set(message.channelId, Date.now());
     return;
   }
 
   // ---- COMMAND: !summarize ----
   if (message.content.startsWith("!summarize")) {
+    // 0) Cutoff direkt am Anfang setzen (vor jeder Bot-Nachricht)
+    const cutoffMs = Date.now();
+
+    // 1) Channel sperren
+    let unlock = async () => {};
+    try {
+      unlock = await lockChannelForSummary(message.channel);
+    } catch (e) {
+      console.warn("[!summarize] Lock failed:", e.message);
+    }
+
+    // 2) Status posten (nach Lock; wird nicht in die Zusammenfassung fallen, da > cutoff)
     let progress = null;
     try {
-      progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
+      progress = await message.channel.send("⏳ **Summary in progress…** Channel is temporarily locked.");
     } catch {}
 
-    const cutoffMs = Date.now();
-    const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
-
-    // 1) Zusammenfassung erzeugen (bis Cutoff)
+    // 3) Zusammenfassen bis Cutoff (mit Bot-Post-Exclusion)
     try {
-      await chatContext.summarizeSince(cutoffMs, customPrompt);
+      await chatContext.summarizeSince(cutoffMs, channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null);
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
     }
 
-    // 2) Alle Nachrichten im Channel löschen
+    // 4) Alle Messages im Channel löschen
     try {
       await deleteAllMessages(message.channel);
     } catch (e) {
       console.error("[!summarize] deleteAllMessages error:", e?.message || e);
-      await message.channel.send(
-        "⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History)."
-      );
+      await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
     }
 
-    // 3) 5 Summaries (älteste → neueste) posten
+    // 5) 5 Summaries (älteste → neueste) einzeln & gechunked posten
     try {
       const last5Desc = await chatContext.getLastSummaries(5);
       const summariesAsc = (last5Desc || [])
@@ -159,19 +207,21 @@ client.on("messageCreate", async (message) => {
       console.error("[!summarize] posting summaries error:", e?.message || e);
     }
 
-    // 4) Abschluss
+    // 6) Abschluss + Unlock
     try {
-      await message.channel.send("✅ **Summary completed.**");
+      await message.channel.send("✅ **Summary completed.** Channel unlocked.");
     } catch {}
+    if (progress?.deletable) {
+      try { await progress.delete(); } catch {}
+    }
     try {
-      if (progress?.deletable) await progress.delete();
+      await unlock();
     } catch {}
 
     return;
   }
 
   // ---- NORMALE NACHRICHT ----
-  // (Loggt auch Bot/Webhook-Nachrichten — außer Commands)
   await setAddUserMessage(message, chatContext);
 
   // Trigger prüfen (Name oder !name)
@@ -192,13 +242,13 @@ client.on("messageCreate", async (message) => {
   );
 });
 
-// Start Discord Bot
+// Start
 (async () => {
   client.login(process.env.DISCORD_TOKEN);
 })();
 client.once("ready", () => setBotPresence(client, "✅ Started", "online"));
 
-// Static Hosting für /documents (optional)
+// HTTP /documents (optional)
 const expressApp = express();
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(

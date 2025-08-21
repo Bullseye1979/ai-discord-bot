@@ -1,5 +1,5 @@
-// context.js — v4.7 (Cursor-Fix mit last_context_id + Cutoff + SQL + Kontexteinbau)
-// Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff (wie zuvor)
+// context.js — v4.9 (Cursor-Fix + Bot-Post-Exclusion + Cutoff + SQL + Kontexteinbau)
+// Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -46,13 +46,10 @@ async function ensureTables(pool) {
         timestamp DATETIME NOT NULL,
         channel_id VARCHAR(64) NOT NULL,
         summary MEDIUMTEXT NOT NULL,
-        -- NEU: bis zu welcher context_log.id wurde zusammengefasst
         last_context_id INT NULL,
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-
-    // Falls Spalte in bestehender DB fehlt: nachrüsten (MariaDB/10.3+ versteht IF NOT EXISTS)
     await c.query(`
       ALTER TABLE summaries
       ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
@@ -74,7 +71,15 @@ const sanitize = (s) =>
     .slice(0, 64);
 
 class Context {
-  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global") {
+  /**
+   * @param {string} persona
+   * @param {string} instructions
+   * @param {Array} tools
+   * @param {Object} toolRegistry
+   * @param {string} channelId
+   * @param {string|null} botDisplayName Optional: Botanzeige-Name, um Bot-Posts aus künftigen Summaries auszuschließen
+   */
+  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global", botDisplayName = null) {
     this.messages = [];
     this.persona = persona || "";
     this.instructions = instructions || "";
@@ -82,6 +87,7 @@ class Context {
     this.toolRegistry = toolRegistry || {};
     this.channelId = channelId;
     this.isSummarizing = false;
+    this.botSender = botDisplayName ? sanitize(botDisplayName) : null; // <- wichtig für Ausschlussfilter
 
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
@@ -111,9 +117,7 @@ class Context {
 
   async add(role, sender, content) {
     const entry = { role, name: sanitize(sender), content: String(content ?? "") };
-    try {
-      await this._initLoaded;
-    } catch {}
+    try { await this._initLoaded; } catch {}
     this.messages.push(entry);
 
     try {
@@ -128,7 +132,6 @@ class Context {
     return entry;
   }
 
-  // ALLE Nachrichten >= cutoff (für Kontexteinbau nach Summary)
   async getMessagesAfter(cutoffMs) {
     const db = await getPool();
     const [rows] = await db.execute(
@@ -141,9 +144,12 @@ class Context {
     return rows || [];
   }
 
-  // Cursor-basierte Zusammenfassung (keine Dopplungen):
-  // - NUR context_log.id > last_context_id
-  // - UND timestamp <= cutoff  (schützt vor "während des Laufs" gesendeten Nachrichten)
+  /**
+   * Cursor-basierte Zusammenfassung (keine Dopplungen):
+   * - NUR context_log.id > last_context_id
+   * - UND timestamp <= cutoff
+   * - UND (optional) EXCLUDE: Bot-Posts (Summary/Status), damit gepostete Summaries nie in künftige Runs gelangen
+   */
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) return this.messages;
     this.isSummarizing = true;
@@ -159,30 +165,44 @@ class Context {
       const lastCursor = lastSum?.[0]?.last_context_id ?? null;
       const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-      let rows, maxId = null;
+      // Dynamischer Ausschlussfilter für Bot-Posts (Summaries/Status)
+      // Wir schließen NUR bekannte Bot-Marker aus, damit reguläre Bot-Antworten (z. B. eigentliche KI-Antworten) erhalten bleiben.
+      const botExclusion = this.botSender
+        ? ` AND NOT (sender = ? AND (
+              content LIKE '**Summary %/%' OR
+              content LIKE 'Summary %/%' OR
+              content LIKE '⏳ %Summary%' OR
+              content LIKE '✅ %Summary%'
+            ))`
+        : "";
+
+      let params = [this.channelId];
+      let sql;
 
       if (lastCursor != null) {
-        const [r] = await db.execute(
-          `SELECT id, timestamp, role, sender, content
-             FROM context_log
-            WHERE channel_id=? AND id > ? AND timestamp <= ?
-            ORDER BY id ASC`,
-          [this.channelId, lastCursor, cutoff]
-        );
-        rows = r || [];
+        sql = `
+          SELECT id, timestamp, role, sender, content
+            FROM context_log
+           WHERE channel_id=? AND id > ? AND timestamp <= ?${botExclusion}
+           ORDER BY id ASC
+        `;
+        params.push(lastCursor, cutoff);
+        if (this.botSender) params.push(this.botSender);
       } else {
-        const [r] = await db.execute(
-          `SELECT id, timestamp, role, sender, content
-             FROM context_log
-            WHERE channel_id=? AND timestamp <= ?
-            ORDER BY id ASC`,
-          [this.channelId, cutoff]
-        );
-        rows = r || [];
+        sql = `
+          SELECT id, timestamp, role, sender, content
+            FROM context_log
+           WHERE channel_id=? AND timestamp <= ?${botExclusion}
+           ORDER BY id ASC
+        `;
+        params.push(cutoff);
+        if (this.botSender) params.push(this.botSender);
       }
 
-      if (rows.length) {
-        maxId = rows[rows.length - 1].id;
+      const [rows] = await db.execute(sql, params);
+
+      if (rows?.length) {
+        const maxId = rows[rows.length - 1].id;
 
         const prompt =
           (customPrompt && customPrompt.trim()) ||
@@ -198,9 +218,9 @@ class Context {
           )
           .join("\n");
 
-        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId);
+        // KI-Call
+        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId, this.botSender);
         await sumCtx.add("user", "system", text);
-
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
 
         if (summary) {
