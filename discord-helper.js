@@ -262,6 +262,32 @@ async function setBotPresence(client, activityText = "✅ Ready", status = "onli
   }
 }
 
+
+// ---------- Kontext / Messages ----------
+async function setAddUserMessage(message, chatContext) {
+  try {
+    // Nichts loggen, wenn es die Kontext-Abfrage ist – die soll NICHT im Kontext/DB landen
+    const raw = message?.content || "";
+    if (raw.startsWith("!context")) return;
+
+    // Anhänge sammeln
+    let content = raw;
+    if (message.attachments?.size > 0) {
+      const links = [...message.attachments.values()].map(a => a.url).join("\n");
+      content = `${links}\n${content}`.trim();
+    }
+
+    const senderName =
+      message.member?.displayName ||
+      message.author?.username ||
+      "user";
+
+    await chatContext.add("user", senderName, content);
+  } catch (e) {
+    console.warn("[setAddUserMessage] failed:", e?.message || e);
+  }
+}
+
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
@@ -302,6 +328,7 @@ module.exports = {
   setMessageReaction,
   setReplyAsWebhook,
   splitIntoChunks,
+  setAddUserMessage,
   sendChunked,
   setBotPresence,
   postSummariesIndividually,
