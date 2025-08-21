@@ -1,28 +1,17 @@
 // discord-helper.js — v1.8
-// Hilfsfunktionen: Tools, Channel-Config, Chunking, Summaries, Transcripts-Thread
-// Updates: sendChunked() gibt Message-Objekte zurück; setAddUserMessage loggt Bot/Webhook als assistant.
+// Voice (TTS + optional Transcripts-Thread), Chunking, Webhook-Replies, Channel-Config (inkl. summaryPrompt)
 
 const fs = require("fs");
 const path = require("path");
 const { tools, getToolRegistry } = require("./tools.js");
-const { EndBehaviorType } = require("@discordjs/voice");
-const {
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  StreamType,
-} = require("@discordjs/voice");
-const { ChannelType } = require("discord.js");
+const { EndBehaviorType, createAudioResource, StreamType } = require("@discordjs/voice");
 const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const { getTranscription, getTTS } = require("./aiService.js");
 require("dotenv").config();
 
-ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
-
-const queueMap = new Map();
-const playerMap = new Map();
+ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
 // ---------- Tools für User/Blocks ----------
 function getUserTools(nameOrDisplayName) {
@@ -40,7 +29,7 @@ function getUserTools(nameOrDisplayName) {
   return { tools: activeTools, toolRegistry };
 }
 
-// ---------- Default Persona (optional Fallback) ----------
+// ---------- Default Persona ----------
 function getDefaultPersona() {
   const defaultPath = path.join(__dirname, "channel-config", "default.json");
   try {
@@ -54,19 +43,10 @@ function getDefaultPersona() {
       botname: json.botname || "",
       selectedTools: json.tools || [],
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
-      summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
+      summaryPrompt: json.summaryPrompt || json.summary_prompt || ""
     };
   } catch {
-    return {
-      persona: "",
-      instructions: "",
-      voice: "",
-      name: "",
-      botname: "",
-      selectedTools: [],
-      blocks: [],
-      summaryPrompt: "",
-    };
+    return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [], summaryPrompt: "" };
   }
 }
 
@@ -83,7 +63,7 @@ function getChannelConfig(channelId) {
     botname = def.botname,
     selectedTools = def.selectedTools,
     blocks = def.blocks,
-    summaryPrompt = def.summaryPrompt,
+    summaryPrompt = def.summaryPrompt
   } = def;
 
   if (fs.existsSync(configPath)) {
@@ -101,6 +81,7 @@ function getChannelConfig(channelId) {
 
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
+
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -123,7 +104,7 @@ function getChannelConfig(channelId) {
     tools: ctxTools,
     toolRegistry,
     blocks,
-    summaryPrompt,
+    summaryPrompt
   };
 }
 
@@ -156,124 +137,82 @@ function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   return chunks.flatMap(hardSplit);
 }
 
-/**
- * Sendet Text (Chunked) und gibt ein Array der gesendeten Message-Objekte zurück.
- * @param {*} channel
- * @param {string} content
- * @returns {Promise<Array<import('discord.js').Message>>}
- */
 async function sendChunked(channel, content) {
   const parts = splitIntoChunks(content);
-  const sent = [];
   for (const p of parts) {
-    try {
-      const msg = await channel.send({ content: p });
-      sent.push(msg);
-    } catch (e) {
-      console.warn("[sendChunked] Failed to send part:", e.message);
-    }
+    await channel.send({ content: p });
   }
-  return sent;
 }
 
-// summaries: Array<string> (älteste → neueste)
-async function postSummariesIndividually(channel, summaries) {
+async function postSummariesIndividually(channel, summaries, _leftover) {
   for (let i = 0; i < summaries.length; i++) {
     const header = `**Summary ${i + 1}/${summaries.length}**`;
     await sendChunked(channel, `${header}\n\n${summaries[i]}`);
   }
 }
 
-// ---------- Transcripts-Thread ----------
-async function findExistingTranscriptsThread(channel) {
+// ---------- Webhook Reply ----------
+async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
   try {
-    const active = await channel.threads.fetchActive();
-    const found = active?.threads?.find((t) => t.name === "Transcripts");
-    if (found) return found;
-  } catch (e) {}
-  try {
-    const archived = await channel.threads.fetchArchived();
-    const foundA = archived?.threads?.find((t) => t.name === "Transcripts");
-    if (foundA) return foundA;
-  } catch (e) {}
-  return null;
+    const hooks = await message.channel.fetchWebhooks();
+    let hook = hooks.find((w) => w.name === botname);
+    if (!hook) {
+      hook = await message.channel.createWebhook({
+        name: botname || "AI",
+        avatar: avatarUrl || undefined
+      });
+    }
+    const parts = splitIntoChunks(content);
+    for (const p of parts) {
+      await hook.send({
+        content: p,
+        username: botname || "AI",
+        avatarURL: avatarUrl || undefined,
+        allowedMentions: { parse: [] }
+      });
+    }
+  } catch (e) {
+    console.error("[Webhook Reply] failed:", e);
+    // Fallback ohne Webhook
+    await sendChunked(message.channel, content);
+  }
 }
 
-async function getOrCreateTranscriptsThread(channel) {
-  const existing = await findExistingTranscriptsThread(channel);
-  if (existing) return existing;
+async function setMessageReaction(message, emoji) {
+  try { await message.react(emoji); } catch {}
+}
 
+// ---------- Transcripts-Thread ----------
+async function getOrCreateTranscriptsThread(textChannel) {
   try {
-    const thread = await channel.threads.create({
+    const active = await textChannel.threads.fetchActive();
+    let thread = active?.threads?.find(t => t.name === "Transcripts");
+    if (thread) return thread;
+
+    const archived = await textChannel.threads.fetchArchived();
+    thread = archived?.threads?.find(t => t.name === "Transcripts");
+    if (thread) {
+      try { await thread.setArchived(false); } catch {}
+      return thread;
+    }
+
+    // neu anlegen
+    thread = await textChannel.threads.create({
       name: "Transcripts",
-      autoArchiveDuration: 1440,
-      reason: "Store voice transcripts and AI copies",
-      type: 11, // ChannelType.PublicThread (avoid importing enum)
+      autoArchiveDuration: 1440, // 24h
+      reason: "Collecting voice transcripts"
     });
     return thread;
   } catch (e) {
-    console.warn("[Transcripts] Failed to create thread:", e.message);
+    console.error("[Transcripts] create/fetch failed:", e.message);
     return null;
   }
 }
 
-async function sendToTranscriptsThread(channel, content, createIfMissing = false) {
-  try {
-    let thread = await findExistingTranscriptsThread(channel);
-    if (!thread && createIfMissing) {
-      thread = await getOrCreateTranscriptsThread(channel);
-    }
-    if (!thread) return false;
+// ---------- Voice: TTS ----------
+const queueMap = new Map();
+const playerMap = new Map();
 
-    const parts = splitIntoChunks(content);
-    for (const p of parts) {
-      await thread.send({ content: p });
-    }
-    return true;
-  } catch (e) {
-    console.warn("[Transcripts] Failed to send to thread:", e.message);
-    return false;
-  }
-}
-
-async function postTranscript(channel, text) {
-  return sendToTranscriptsThread(channel, text, true);
-}
-
-// ---------- Status/Bots ----------
-async function setBotPresence(client, activityText, status, activityType = 4) {
-  if (client?.user) {
-    await client.user.setPresence({
-      activities: [{ name: activityText, type: activityType }],
-      status,
-    });
-  }
-}
-
-// ---------- Kontext / Messages ----------
-async function setAddUserMessage(message, chatContext) {
-  // Befehle nie loggen
-  const txt = message.content || "";
-  if (txt.startsWith("!context") || txt.startsWith("!summarize")) return;
-
-  // Bot/Webhook -> als assistant loggen; sonst user
-  const isBotLike = !!message.author?.bot || !!message.webhookId;
-  const role = isBotLike ? "assistant" : "user";
-
-  let content = txt;
-  if (message.attachments?.size > 0) {
-    const links = message.attachments.map((a) => a.url).join("\n");
-    content = `${links}\n${content}`;
-  }
-  const senderName =
-    message.member?.displayName ||
-    message.author?.username ||
-    (isBotLike ? "bot" : "user");
-
-  await chatContext.add(role, senderName, content);
-}
-
-// ---------- Voice-TTS (optional) ----------
 function setEnqueueTTS(guildId, task) {
   if (!queueMap.has(guildId)) queueMap.set(guildId, []);
   const q = queueMap.get(guildId);
@@ -288,7 +227,7 @@ async function setProcessTTSQueue(guildId) {
   try {
     await task();
   } catch (e) {
-    console.error("[ERROR]:", e);
+    console.error("[TTS ERROR]:", e);
   } finally {
     q.shift();
     if (q.length > 0) setProcessTTSQueue(guildId);
@@ -315,6 +254,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
   setEnqueueTTS(guildId, async () => {
     let player = playerMap.get(guildId);
     if (!player) {
+      const { createAudioPlayer } = require("@discordjs/voice");
       player = createAudioPlayer();
       playerMap.set(guildId, player);
       connection.subscribe(player);
@@ -324,15 +264,12 @@ async function getSpeech(connection, guildId, text, client, voice) {
         const response = await getTTS(chunk, "tts-1", voice);
         const pass = new PassThrough();
         response.pipe(pass);
-        const decoder = new prism.FFmpeg({
-          args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"],
-        });
+        const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
         const pcmStream = pass.pipe(decoder);
-        const resource = createAudioResource(pcmStream, {
-          inputType: StreamType.Raw,
-        });
+        const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
         player.play(resource);
         await new Promise((resolve, reject) => {
+          const { AudioPlayerStatus } = require("@discordjs/voice");
           player.once(AudioPlayerStatus.Idle, resolve);
           player.once("error", reject);
         });
@@ -348,16 +285,11 @@ module.exports = {
   getUserTools,
   getDefaultPersona,
   getChannelConfig,
-  setBotPresence,
-  setAddUserMessage,
+  setMessageReaction,
+  setReplyAsWebhook,
   splitIntoChunks,
   sendChunked,
   postSummariesIndividually,
-  // Transcripts
-  findExistingTranscriptsThread,
   getOrCreateTranscriptsThread,
-  sendToTranscriptsThread,
-  postTranscript,
-  // TTS
   getSpeech,
 };
