@@ -10,6 +10,7 @@ const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const Context = require("./context.js");
 const {
   getChannelConfig,
+  setStartListening,
   setAddUserMessage,
   setBotPresence,
   sendChunked,
