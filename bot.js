@@ -279,7 +279,7 @@ const norm = (contentRaw || "").trim().toLowerCase();
 const isTrigger =
   norm.startsWith(triggerName) ||
   norm.startsWith(`!${triggerName}`) ||
-   // (!!parsedTranscript && norm.includes(triggerName)); // bei Voice reicht Erwähnung irgendwo
+  (!!parsedTranscript && norm.includes(triggerName)); // bei Voice reicht Erwähnung irgendwo
 
 if (!isTrigger) return;
 
