@@ -77,6 +77,7 @@ async function getHistory(toolFunction) {
     const pool = await getPool();
     const params = { ...bindings, channel_id: String(channelId) };
     const [rows] = await pool.execute(safeSql, params);
+    console.log(rows);
 
     const cleaned = Array.isArray(rows) ? rows.map(r => truncateRowValues(r)) : [];
     const payload = {
