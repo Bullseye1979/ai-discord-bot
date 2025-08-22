@@ -28,49 +28,50 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       return;
     }
 
-    const senderId = String(message.author?.id || "");
-    const senderName = message.member?.displayName || message.author?.username || "";
-    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    // ---- Block-Auswahl mit getrennter *-Behandlung & Priorität ----
+// Priorität: userExact(4) > speakerExact(3) > userWildcard(2) > speakerWildcard(1)
+const senderId = String(message.author?.id || "");
+const senderName = (message.member?.displayName || message.author?.username || "").toLowerCase();
+const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
-    // NEU – Wildcards + leere Arrays = „alle erlaubt“ + speaker case-insensitive
-// ersetzt den bisherigen matchingBlock-Teil
-const matchingBlock = blocks.reduce((best, b, idx) => {
+function scoreBlock(b) {
   const users = Array.isArray(b.user) ? b.user.map(String) : null;
   const speakers = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).toLowerCase()) : null;
 
-  const userScore = users
-    ? (users.includes(String(senderId)) ? 2 : (users.includes("*") || users.length === 0 ? 1 : 0))
-    : 1; // fehlendes Feld => „alle“ (Score 1)
+  const userExact      = users?.includes(senderId) ? 4 : 0;
+  const userWildcard   = users?.includes("*") ? 2 : 0;
+  const speakerExact   = speakers?.includes(senderName) ? 3 : 0;
+  const speakerWildcard= speakers?.includes("*") ? 1 : 0;
 
-  const speakerScore = speakers
-    ? (speakers.includes((senderName || "").toLowerCase()) ? 2 : (speakers.includes("*") || speakers.length === 0 ? 1 : 0))
-    : 1;
+  // Höchste Regel greift
+  return Math.max(userExact, speakerExact, userWildcard, speakerWildcard, 0);
+}
 
-  const score = Math.max(userScore, speakerScore); // OR-Logik mit Gewichtung
+const best = blocks.reduce((acc, b, idx) => {
+  const s = scoreBlock(b);
+  if (!acc || s > acc.score) return { block: b, score: s, idx };
+  return acc;
+}, null);
 
-  if (!best || score > best.score) return { block: b, score, idx };
-  // bei Gleichstand gewinnt der frühere (kleinere idx)
-  return best;
-}, null)?.block;
+const matchingBlock = (best && best.score > 0) ? best.block : null;
 
+if (!matchingBlock) {
+  await setMessageReaction(message, "❌");
+  return;
+}
 
+// Tools/Model/API-Key strikt aus dem Treffer-Block (kein globaler Fallback außer Funktions-Defaults)
+const effectiveModel  = matchingBlock.model  || model;
+const effectiveApiKey = matchingBlock.apikey || apiKey;
 
-    if (!matchingBlock) {
-      await setMessageReaction(message, "❌");
-      return;
-    }
-
-    const effectiveModel = matchingBlock.model || model;
-    const effectiveApiKey = matchingBlock.apikey || apiKey;
-
-    if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
-      chatContext.tools = blockTools;
-      chatContext.toolRegistry = blockRegistry;
-    } else {
-      chatContext.tools = channelMeta.tools;
-      chatContext.toolRegistry = channelMeta.toolRegistry;
-    }
+if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+  const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+  chatContext.tools = blockTools;
+  chatContext.toolRegistry = blockRegistry;
+} else {
+  chatContext.tools = channelMeta.tools;
+  chatContext.toolRegistry = channelMeta.toolRegistry;
+}
 
         // Guard: Wenn es noch keine Summary gibt, KI streng darauf hinweisen, nichts zu erfinden
     let _instrBackup = chatContext.instructions;
