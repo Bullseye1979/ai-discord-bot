@@ -15,6 +15,7 @@ const {
   setAddUserMessage,
   setBotPresence,
   sendChunked,
+  resetTTSPlayer,
   resetRecordingFlag,
   postSummariesIndividually,
 } = require("./discord-helper.js");
@@ -171,21 +172,22 @@ client.on("messageCreate", async (message) => {
  // !joinvc: Voice beitreten + Transcripts/TTS an DIESEN Textkanal binden
 if ((message.content || "").startsWith("!joinvc")) {
   try {
-    // Get the user's current voice channel
+    // User-VC holen
     let gm = null;
     try { gm = await message.guild.members.fetch(message.author.id); } catch {}
     const vc = gm?.voice?.channel || message.member?.voice?.channel;
     if (!vc) { await message.reply("Join a voice channel first."); return; }
 
-    // Kill old connection (if any) to force rebind
+    // Alte Voice-Verbindung (falls vorhanden) sauber schließen
     const old = getVoiceConnection(message.guild.id);
     if (old) {
       try { old.destroy(); } catch {}
     }
-    // Reset recorder flag for this guild
+    // Recorder- und TTS-Player-Status zurücksetzen
     resetRecordingFlag(message.guild.id);
+    resetTTSPlayer(message.guild.id);
 
-    // Join new connection
+    // Neue Verbindung herstellen
     const conn = joinVoiceChannel({
       channelId: vc.id,
       guildId: message.guild.id,
@@ -193,19 +195,20 @@ if ((message.content || "").startsWith("!joinvc")) {
       selfDeaf: false,
     });
 
-    // Bind transcripts/TTS to the **current** text channel (Channel 2)
+    // Diesen Textkanal als Ziel (Transkripte & TTS) setzen
     guildTextChannels.set(message.guild.id, message.channel.id);
 
-    // Start/refresh listening (now posts will follow the Map dynamically)
+    // (Re)Start Listening – Transkripte posten ab jetzt in den aktuellen Textkanal
     setStartListening(conn, message.guild.id, guildTextChannels, client);
 
-    await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts will be posted here.`);
+    await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`);
   } catch (e) {
     console.error("[!joinvc] failed:", e?.message || e);
     await message.channel.send("❌ Failed to join/move. Check my permissions (Connect/Speak) and try again.");
   }
   return;
 }
+
 
 
 

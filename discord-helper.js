@@ -51,6 +51,14 @@ function resetRecordingFlag(guildId) {
   activeRecordings.delete(guildId);
 }
 
+function resetTTSPlayer(guildId) {
+  const p = playerMap.get(guildId);
+  if (p) {
+    try { p.stop(); } catch {}
+    playerMap.delete(guildId);
+  }
+}
+
 
 // --- Avatar sicherstellen (nur Persona verwenden) ---
 async function ensureChannelAvatar(channelId, channelMeta) {
@@ -556,10 +564,11 @@ async function getSpeech(connection, guildId, text, client, voice) {
     if (!player) {
       const { createAudioPlayer } = require("@discordjs/voice");
       player = createAudioPlayer();
-      player.setMaxListeners(50);
       playerMap.set(guildId, player);
-      connection.subscribe(player);
     }
+    // WICHTIG: nach Channel-Wechsel IMMER (re)subscriben
+    try { connection.subscribe(player); } catch {}
+
     for (const chunk of chunks) {
       try {
         const response = await getTTS(chunk, "tts-1", voice);
@@ -568,6 +577,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
         const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
         const pcmStream = pass.pipe(decoder);
         const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
+
         player.play(resource);
         await new Promise((resolve, reject) => {
           const { AudioPlayerStatus } = require("@discordjs/voice");
@@ -581,6 +591,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
     }
   });
 }
+
 
 async function getOrCreateRelayWebhookFor(parentChannel) {
   try {
@@ -648,6 +659,7 @@ module.exports = {
   getOrCreateRelayWebhookFor,
   setStartListening,
   getSpeech,
+  resetTTSPlayer,
   resetRecordingFlag, 
   sendTranscriptViaWebhook,
 
