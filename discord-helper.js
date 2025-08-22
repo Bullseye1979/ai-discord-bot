@@ -349,8 +349,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     const textChannel = textChannelId ? await client.channels.fetch(textChannelId).catch(() => null) : null;
     if (!textChannel) return;
 
-    const thread = await getOrCreateTranscriptsThread(textChannel);
-    const target = thread || textChannel;
+    const target = textChannel; // ⬅️ direkt in den Kanal posten, kein Thread
 
     const receiver = connection.receiver;
     if (!receiver) return;
