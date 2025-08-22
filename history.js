@@ -46,14 +46,15 @@ function truncate(s, n=1200) {
 }
 
 // Tool-Entry
-async function getHistory(toolFunction) {
+async function getHistory(toolFunction, runtime = {}) {
   try {
     const args = JSON.parse(toolFunction.arguments || '{}');
-    const channelId = String(args.channel_id || '').trim();
     const sql = String(args.sql || '').trim();
     const extra = (args.bindings && typeof args.bindings === 'object') ? args.bindings : {};
 
-    if (!channelId) throw new Error("channel_id missing");
+    // ⬇️ Kanal NUR aus runtime (kommt aus aiCore.js)
+    const channelId = String(runtime.channel_id || '').trim();
+    if (!channelId) throw new Error("channel_id missing (runtime)");
     if (!sql) throw new Error("sql missing");
 
     // Sicherheitsgitter
@@ -66,14 +67,12 @@ async function getHistory(toolFunction) {
       throw new Error("Query must include :channel_id in WHERE");
     }
 
-    // channel_id IMMER bereitstellen
+    // :channel_id IMMER bereitstellen (zusätzlich zu evtl. extra Bindings)
     const bindings = { channel_id: channelId, ...extra };
 
-    console.log(sql);
     const { sql: compiled, values } = compileNamed(sql, bindings);
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);
-    console.log(rows);
 
     const safe = (rows || []).map(r => {
       const obj = {};
