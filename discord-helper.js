@@ -10,7 +10,7 @@ const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const axios = require("axios");
-const { getAIImage, getTranscription, getTTS } = require("./aiService.js");
+const { getAIImage, getTranscription, getTTS, getAI } = require("./aiService.js");
 require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
