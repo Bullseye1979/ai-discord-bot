@@ -28,52 +28,66 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       return;
     }
 
-    // ---- Block-Auswahl mit getrennter *-Behandlung & Priorität ----
-// Priorität: userExact(4) > speakerExact(3) > userWildcard(2) > speakerWildcard(1)
-const senderId = String(message.author?.id || "");
-const senderName = (message.member?.displayName || message.author?.username || "").toLowerCase();
-const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    // ---- Strikte Block-Auswahl: speaker-only (Webhook/Transkript) vs user-only (Text) ----
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
-function scoreBlock(b) {
-  const users = Array.isArray(b.user) ? b.user.map(String) : null;
-  const speakers = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).toLowerCase()) : null;
+    // Transkript/Webhook? -> NUR speaker prüfen
+    const isSpeakerMsg = !!message.webhookId;
 
-  const userExact      = users?.includes(senderId) ? 4 : 0;
-  const userWildcard   = users?.includes("*") ? 2 : 0;
-  const speakerExact   = speakers?.includes(senderName) ? 3 : 0;
-  const speakerWildcard= speakers?.includes("*") ? 1 : 0;
+    // Für Speaker (Transkript) nehmen wir den (Proxy-)Namen:
+    const speakerName = (message.member?.displayName || message.author?.username || "")
+      .trim()
+      .toLowerCase();
 
-  // Höchste Regel greift
-  return Math.max(userExact, speakerExact, userWildcard, speakerWildcard, 0);
-}
+    // Für Text nehmen wir die echte Discord-User-ID:
+    const userId = String(message.author?.id || "").trim();
 
-const best = blocks.reduce((acc, b, idx) => {
-  const s = scoreBlock(b);
-  if (!acc || s > acc.score) return { block: b, score: s, idx };
-  return acc;
-}, null);
+    function pickBlockForSpeaker() {
+      let exact = null;
+      let wildcard = null;
+      for (const b of blocks) {
+        const sp = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).trim().toLowerCase()) : [];
+        if (sp.length === 0) continue;
+        if (sp.includes("*") && !wildcard) wildcard = b;
+        if (speakerName && sp.includes(speakerName) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    }
 
-const matchingBlock = (best && best.score > 0) ? best.block : null;
+    function pickBlockForUser() {
+      let exact = null;
+      let wildcard = null;
+      for (const b of blocks) {
+        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
+        if (us.length === 0) continue;
+        if (us.includes("*") && !wildcard) wildcard = b;
+        if (userId && us.includes(userId) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    }
 
-if (!matchingBlock) {
-  await setMessageReaction(message, "❌");
-  return;
-}
+    const matchingBlock = isSpeakerMsg ? pickBlockForSpeaker() : pickBlockForUser();
 
-// Tools/Model/API-Key strikt aus dem Treffer-Block (kein globaler Fallback außer Funktions-Defaults)
-const effectiveModel  = matchingBlock.model  || model;
-const effectiveApiKey = matchingBlock.apikey || apiKey;
+    // Kein Block => Ablehnen
+    if (!matchingBlock) {
+      await setMessageReaction(message, "❌");
+      return;
+    }
 
-if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-  const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
-  chatContext.tools = blockTools;
-  chatContext.toolRegistry = blockRegistry;
-} else {
-  chatContext.tools = channelMeta.tools;
-  chatContext.toolRegistry = channelMeta.toolRegistry;
-}
+    // Tools/Model/API-Key strikt aus dem Treffer-Block (Fallback auf Channel-Defaults wie gehabt)
+    const effectiveModel  = matchingBlock.model  || model;
+    const effectiveApiKey = matchingBlock.apikey || apiKey;
 
-        // Guard: Wenn es noch keine Summary gibt, KI streng darauf hinweisen, nichts zu erfinden
+    if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
+    } else {
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+
+    // Guard: Wenn es noch keine Summary gibt, KI streng darauf hinweisen, nichts zu erfinden
     let _instrBackup = chatContext.instructions;
     try {
       const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
@@ -83,7 +97,6 @@ if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
           "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
       }
     } catch {}
-
 
     const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
 
