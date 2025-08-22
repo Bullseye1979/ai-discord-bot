@@ -9,7 +9,7 @@ const { getYoutube } = require('./youtube');
 const { getImageDescription } = require('./vision.js');
 const { getLocation } = require('./location');
 const { getPDF } = require('./pdf.js');
-const { history } = require('./history.js');
+const { getHistory } = require('./history.js');
 
 // Tool Definitions
 const tools = [
@@ -135,7 +135,7 @@ const tools = [
     {
       type: "function",
       function: {
-        name: "history",
+        name: "getHistory",
         description:
           "Run a flexible READ-ONLY MySQL SELECT over this channel’s history. The model should write the full SELECT itself. " +
           "ALLOWED tables: context_log(id, timestamp, channel_id, role, sender, content), summaries(id, timestamp, channel_id, summary, last_context_id). " +
@@ -205,7 +205,8 @@ const fullToolRegistry = {
     getYoutube,
     getImageDescription,
     getLocation,
-    getPDF
+    getPDF,
+    getHistory
 };
 
 function getToolRegistry(toolNames = []) {

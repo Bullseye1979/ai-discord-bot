@@ -55,7 +55,7 @@ function truncateRowValues(row, maxLen = 800) {
   return out;
 }
 
-async function history(toolFunction) {
+async function getHistory(toolFunction) {
   try {
     const args = JSON.parse(toolFunction.arguments || "{}");
     const sql = args.sql;
