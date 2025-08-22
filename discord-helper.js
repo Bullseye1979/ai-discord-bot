@@ -17,6 +17,8 @@ ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
 const activeRecordings = new Map();
 const _avatarInFlight = new Map(); // ⬅️ verhindert parallele Generierungen
+const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
+
 
 // --- Persona → Visual-Prompt (per GPT) ---
 // --- Persona → Visual-Prompt (per GPT) ---
@@ -572,8 +574,6 @@ async function getSpeech(connection, guildId, text, client, voice) {
     }
   });
 }
-
-const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
 
 async function getOrCreateRelayWebhookFor(parentChannel) {
   try {
