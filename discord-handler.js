@@ -33,19 +33,26 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
     // NEU – Wildcards + leere Arrays = „alle erlaubt“ + speaker case-insensitive
-const matchingBlock = blocks.find(b => {
+// ersetzt den bisherigen matchingBlock-Teil
+const matchingBlock = blocks.reduce((best, b, idx) => {
   const users = Array.isArray(b.user) ? b.user.map(String) : null;
   const speakers = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).toLowerCase()) : null;
 
-  const okUser =
-    !users || users.length === 0 || users.includes("*") || users.includes(senderId);
+  const userScore = users
+    ? (users.includes(String(senderId)) ? 2 : (users.includes("*") || users.length === 0 ? 1 : 0))
+    : 1; // fehlendes Feld => „alle“ (Score 1)
 
-  const okSpeaker =
-    !speakers || speakers.length === 0 || speakers.includes("*") ||
-    speakers.includes((senderName || "").toLowerCase());
+  const speakerScore = speakers
+    ? (speakers.includes((senderName || "").toLowerCase()) ? 2 : (speakers.includes("*") || speakers.length === 0 ? 1 : 0))
+    : 1;
 
-  return okUser || okSpeaker;
-});
+  const score = Math.max(userScore, speakerScore); // OR-Logik mit Gewichtung
+
+  if (!best || score > best.score) return { block: b, score, idx };
+  // bei Gleichstand gewinnt der frühere (kleinere idx)
+  return best;
+}, null)?.block;
+
 
 
     if (!matchingBlock) {
