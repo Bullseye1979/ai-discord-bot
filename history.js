@@ -1,98 +1,89 @@
-// tool.execContextSQL.js
-// Version 1.0
-// Führt einen READ-ONLY, flexiblen MySQL SELECT gegen context_log / summaries aus.
-// Rückgabe: kompaktes JSON als String (geeignet als Kontext für Folgefragen).
+// getHistory.js
+// Flexible READ-ONLY SQL-Select über die Channel-History
+// ALLOWED tables: context_log, summaries
 
-const mysql = require("mysql2/promise");
-require("dotenv").config();
+const mysql = require('mysql2/promise');
 
-let __pool = null;
+let pool = null;
 async function getPool() {
-  if (__pool) return __pool;
-  __pool = await mysql.createPool({
-    host: process.env.DB_HOST || "127.0.0.1",
-    port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER || "root",
-    password: process.env.DB_PASSWORD || "",
-    database: process.env.DB_NAME || "discord_context",
-    waitForConnections: true,
-    connectionLimit: Number(process.env.DB_CONN_LIMIT || 10),
-    timezone: "Z",
-    dateStrings: true,
-    namedPlaceholders: true,
-    multipleStatements: false,
-  });
-  return __pool;
-}
-
-function sanitizeSelect(sql) {
-  const s = String(sql || "").trim();
-  if (!/^select\b/i.test(s)) throw new Error("Only SELECT is allowed.");
-  if (/[;`]/.test(s)) throw new Error("No statement separators/backticks allowed.");
-  if (/\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|call)\b/i.test(s)) {
-    throw new Error("Write/DDL statements are not allowed.");
+  if (!pool) {
+    pool = mysql.createPool({
+      host: process.env.DB_HOST,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASS,
+      database: process.env.DB_NAME,
+      waitForConnections: true,
+      connectionLimit: 5,
+      charset: 'utf8mb4'
+    });
   }
-  if (!/\b(context_log|summaries)\b/i.test(s)) {
-    throw new Error("Query must reference context_log and/or summaries.");
-  }
-  return s;
+  return pool;
 }
 
-function ensureLimit(sql) {
-  return /\blimit\s+\d+/i.test(sql) ? sql : (sql + " LIMIT 200");
-}
+// :named → ?  (und values[] in richtiger Reihenfolge)
+function compileNamed(sql, bindings) {
+  const values = [];
+  const cleaned = String(sql || '').replace(/;+\s*$/,''); // trailing ; entfernen
 
-function truncateRowValues(row, maxLen = 800) {
-  const out = {};
-  for (const k of Object.keys(row)) {
-    const v = row[k];
-    if (typeof v === "string" && v.length > maxLen) {
-      out[k] = v.slice(0, maxLen) + "…";
-    } else {
-      out[k] = v;
+  const out = cleaned.replace(/:(\w+)/g, (_, name) => {
+    if (!(name in bindings)) {
+      throw new Error(`Missing binding for :${name}`);
     }
+    values.push(bindings[name]);
+    return '?';
+  });
+
+  // Falls kein LIMIT vorhanden: begrenzen
+  if (!/\blimit\s+\d+/i.test(out)) {
+    return { sql: `${out} LIMIT 200`, values };
   }
-  return out;
+  return { sql: out, values };
 }
 
+function truncate(s, n=1200) {
+  if (typeof s !== 'string') return s;
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+// Tool-Entry
 async function getHistory(toolFunction) {
   try {
-    const args = JSON.parse(toolFunction.arguments || "{}");
-    const sql = args.sql;
-    const bindings = args.bindings || {};
-    const channelId = args.channel_id || bindings.channel_id;
+    const args = JSON.parse(toolFunction.arguments || '{}');
+    const channelId = String(args.channel_id || '').trim();
+    const sql = String(args.sql || '').trim();
+    const extra = (args.bindings && typeof args.bindings === 'object') ? args.bindings : {};
 
-    if (!sql) return "[ERROR]: Missing 'sql' argument.";
-    if (!channelId) return "[ERROR]: Missing 'channel_id' argument.";
+    if (!channelId) throw new Error("channel_id missing");
+    if (!sql) throw new Error("sql missing");
 
-    console.log(sql);
-
-    let safeSql = sanitizeSelect(sql);
-
-    console.log(safeSql);
-
-    // Erzwinge, dass :channel_id tatsächlich im SQL verwendet wird
-    if (!/:channel_id\b/.test(safeSql)) {
-      return "[ERROR]: Your SELECT must include a channel filter using :channel_id (e.g. WHERE channel_id = :channel_id).";
+    // Sicherheitsgitter
+    const lowered = sql.toLowerCase();
+    if (!lowered.startsWith('select')) throw new Error("Only SELECT is allowed");
+    if (!/(from|join)\s+(context_log|summaries)\b/i.test(sql)) {
+      throw new Error("Only tables context_log or summaries are allowed");
+    }
+    if (!/:channel_id\b/.test(sql)) {
+      throw new Error("Query must include :channel_id in WHERE");
     }
 
-    safeSql = ensureLimit(safeSql);
+    // channel_id IMMER bereitstellen
+    const bindings = { channel_id: channelId, ...extra };
 
-    const pool = await getPool();
-    const params = { ...bindings, channel_id: String(channelId) };
-    const [rows] = await pool.execute(safeSql, params);
-    console.log(rows);
+    const { sql: compiled, values } = compileNamed(sql, bindings);
+    const db = await getPool();
+    const [rows] = await db.execute(compiled, values);
 
-    const cleaned = Array.isArray(rows) ? rows.map(r => truncateRowValues(r)) : [];
-    const payload = {
-      rowCount: cleaned.length,
-      rows: cleaned,
-      note: "Rows truncated to fit; increase specificity (e.g., date range, speaker, LIKE) if needed."
-    };
+    const safe = (rows || []).map(r => {
+      const obj = {};
+      for (const [k, v] of Object.entries(r)) {
+        obj[k] = typeof v === 'string' ? truncate(v) : v;
+      }
+      return obj;
+    });
 
-    return "```json\n" + JSON.stringify(payload, null, 2) + "\n```";
+    return JSON.stringify({ rowCount: safe.length, rows: safe });
   } catch (err) {
-    return "[ERROR]: " + (err?.message || String(err));
+    return JSON.stringify({ error: String(err && err.message || err) });
   }
 }
 
