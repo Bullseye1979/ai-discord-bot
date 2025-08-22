@@ -22,7 +22,7 @@ async function getImage(toolFunction) {
         const context = new Context();
         context.add("system", userId, IMAGEPROMPT);
         context.add("user", userId, `Original image description: \"${args.prompt}\"`);
-        const gptResponse = await getAI(context, 500, "gpt-3.5-turbo");
+        const gptResponse = await getAI(context, 500, "gpt-4o");
         const improvedPrompt = gptResponse.trim();
         if (!improvedPrompt) throw new Error("[ERROR]: Could not improve prompt");
         const imageUrl = await getAIImage(improvedPrompt, args.size);
