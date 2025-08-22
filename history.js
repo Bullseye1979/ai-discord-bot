@@ -65,7 +65,11 @@ async function getHistory(toolFunction) {
     if (!sql) return "[ERROR]: Missing 'sql' argument.";
     if (!channelId) return "[ERROR]: Missing 'channel_id' argument.";
 
+    console.log(sql);
+
     let safeSql = sanitizeSelect(sql);
+
+    console.log(safeSql);
 
     // Erzwinge, dass :channel_id tatsächlich im SQL verwendet wird
     if (!/:channel_id\b/.test(safeSql)) {
