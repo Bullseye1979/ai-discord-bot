@@ -638,7 +638,7 @@ module.exports = {
   sendChunked,
   setBotPresence,
   postSummariesIndividually,
-  getOrCreateTranscriptsThread,
+  ggetOrCreateRelayWebhookFor,
   setStartListening,
   getSpeech,
   sendTranscriptViaWebhook,
