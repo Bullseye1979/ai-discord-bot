@@ -9,6 +9,7 @@ const { getYoutube } = require('./youtube');
 const { getImageDescription } = require('./vision.js');
 const { getLocation } = require('./location');
 const { getPDF } = require('./pdf.js');
+const { history } = require('./history.js');
 
 // Tool Definitions
 const tools = [
@@ -131,6 +132,44 @@ const tools = [
             }
         }
     },
+    {
+      type: "function",
+      function: {
+        name: "history",
+        description:
+          "Run a flexible READ-ONLY MySQL SELECT over this channel’s history. The model should write the full SELECT itself. " +
+          "ALLOWED tables: context_log(id, timestamp, channel_id, role, sender, content), summaries(id, timestamp, channel_id, summary, last_context_id). " +
+          "ALWAYS include a WHERE with :channel_id (qualified if using aliases). Use WEEK(timestamp,3), DATE(timestamp), BETWEEN, LIKE, YEAR, etc. " +
+          "Return is JSON with rowCount and rows (truncated strings).",
+        parameters: {
+          type: "object",
+          properties: {
+            channel_id: {
+              type: "string",
+              description: "Discord channel ID to scope the query. REQUIRED."
+            },
+            sql: {
+              type: "string",
+              description:
+                "A single SELECT statement using MySQL + named placeholders (e.g. :channel_id, :day, :from, :to, :who, :kw, :year). " +
+                "Examples:\n" +
+                "1) Top topic in a week: SELECT timestamp, summary FROM summaries WHERE channel_id = :channel_id AND YEAR(timestamp)=:year AND WEEK(timestamp,3)=:kw ORDER BY timestamp ASC LIMIT 50;\n" +
+                "2) Exact utterances by a speaker on a day: SELECT id, timestamp, sender, content FROM context_log WHERE channel_id=:channel_id AND DATE(timestamp)=:day AND sender LIKE :who ORDER BY timestamp ASC LIMIT 200;\n" +
+                "3) Raw logs in a time window: SELECT id, timestamp, role, sender, content FROM context_log WHERE channel_id=:channel_id AND timestamp BETWEEN :from AND :to ORDER BY id ASC LIMIT 200;"
+            },
+            bindings: {
+              type: "object",
+              description:
+                "Named parameters for placeholders (except channel_id if passed at top-level). " +
+                "E.g. {\"year\":2025, \"kw\":2} or {\"day\":\"2025-07-20\", \"who\":\"Bullseye%\"} or {\"from\":\"2025-07-20 00:00:00\",\"to\":\"2025-07-20 23:59:59\"}.",
+              additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }] }
+            }
+          },
+          required: ["sql", "channel_id"]
+        }
+      }
+    },
+
     {
         type: "function",
         function: {
