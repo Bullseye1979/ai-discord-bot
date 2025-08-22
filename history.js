@@ -10,7 +10,7 @@ async function getPool() {
     pool = mysql.createPool({
       host: process.env.DB_HOST,
       user: process.env.DB_USER,
-      password: process.env.DB_PASS,
+      password: process.env.DB_PASSWORD,
       database: process.env.DB_NAME,
       waitForConnections: true,
       connectionLimit: 5,
@@ -76,10 +76,11 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     // :channel_id IMMER bereitstellen (zusätzlich zu evtl. extra Bindings)
     const bindings = { channel_id: channelId, ...extra };
-
-    const { sql: compiled, values } = compileNamed(sql, bindings);
+    console.log(sql);
+      const { sql: compiled, values } = compileNamed(sql, bindings);
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);
+    console.log(rows);
 
     const safe = (rows || []).map(r => {
       const obj = {};
