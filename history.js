@@ -70,6 +70,10 @@ async function getHistory(toolFunction, runtime = {}) {
     // :channel_id IMMER bereitstellen (zusätzlich zu evtl. extra Bindings)
     const bindings = { channel_id: channelId, ...extra };
 
+    console.log(channelId+"\n");
+
+    console.log(sql);
+
     const { sql: compiled, values } = compileNamed(sql, bindings);
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);
