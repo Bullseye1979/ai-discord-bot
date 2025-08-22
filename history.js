@@ -91,4 +91,4 @@ async function getHistory(toolFunction) {
   }
 }
 
-module.exports = { history };
+module.exports = { getHistory };
