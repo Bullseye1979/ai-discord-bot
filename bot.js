@@ -169,6 +169,11 @@ if ((message.content || "").startsWith("!joinvc")) {
 
   // !summarize: Statusmeldung (EN), Cutoff, Summary, Channel leeren, 5 Summaries, Cursor bump, Abschluss
   if ((message.content || "").startsWith("!summarize")) {
+      if (!channelMeta.summariesEnabled) {
+        await message.channel.send("⚠️ Summaries are disabled in this channel.");
+        return;
+    }
+
     let progress = null;
     try {
       progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
@@ -179,7 +184,20 @@ if ((message.content || "").startsWith("!joinvc")) {
 
     // 1) Zusammenfassen bis Cutoff
     try {
+      const before = await chatContext.getLastSummaries(1).catch(() => []);
       await chatContext.summarizeSince(cutoffMs, customPrompt);
+      const after = await chatContext.getLastSummaries(1).catch(() => []);
+      const createdNew =
+      (before.length === 0 && after.length > 0) ||
+      (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
+
+      if (!createdNew) {
+        // Keine neue Summary entstanden → nichts löschen, sauber beenden
+        try { if (progress?.deletable) await progress.delete(); } catch {}
+        await message.channel.send("ℹ️ No messages to summarize yet.");
+        return;
+      }
+
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
     }

@@ -97,6 +97,11 @@ function getChannelConfig(channelId) {
     ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
     : `https://ralfreschke.de/documents/avatars/default.png`;
 
+  // NEW: Flag, ob es eine echte Channel-Datei gab
+  const hasConfigFile = fs.existsSync(configPath);
+  // NEW: Summaries nur erlauben, wenn es eine Channel-Datei gibt UND ein Prompt gesetzt ist
+  const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
+
   return {
     name,
     botname,
@@ -107,8 +112,11 @@ function getChannelConfig(channelId) {
     tools: ctxTools,
     toolRegistry,
     blocks,
-    summaryPrompt
+    summaryPrompt,
+    hasConfig: hasConfigFile,        // NEW
+    summariesEnabled,                // NEW
   };
+
 }
 
 // ---------- Chunking & Senden ----------

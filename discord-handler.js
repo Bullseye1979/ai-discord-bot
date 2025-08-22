@@ -55,6 +55,18 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
+        // Guard: Wenn es noch keine Summary gibt, KI streng darauf hinweisen, nichts zu erfinden
+    let _instrBackup = chatContext.instructions;
+    try {
+      const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
+      if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
+        chatContext.instructions = (_instrBackup || "") +
+          "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
+          "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
+      }
+    } catch {}
+
+
     const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
 
     if (output && output.trim()) {
@@ -75,6 +87,10 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     console.error("[AI ERROR]:", err);
     try { await setMessageReaction(message, "❌"); } catch {}
   } finally {
+    // restore instructions if modified
+    if (typeof _instrBackup === "string") {
+      try { chatContext.instructions = _instrBackup; } catch {}
+    }
     state.isAIProcessing--;
   }
 }
