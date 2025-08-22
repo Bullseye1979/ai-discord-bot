@@ -69,9 +69,11 @@ async function getHistory(toolFunction) {
     // channel_id IMMER bereitstellen
     const bindings = { channel_id: channelId, ...extra };
 
+    console.log(sql);
     const { sql: compiled, values } = compileNamed(sql, bindings);
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);
+    console.log(rows);
 
     const safe = (rows || []).map(r => {
       const obj = {};
