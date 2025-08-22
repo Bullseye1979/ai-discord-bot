@@ -10,7 +10,7 @@ const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const axios = require("axios");
-const { getAIImage, getTranscription, getTTS, getAI } = require("./aiService.js");
+const { getAIImage, getTranscription, getTTS } = require("./aiService.js");
 require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
@@ -19,7 +19,11 @@ const activeRecordings = new Map();
 const _avatarInFlight = new Map(); // ⬅️ verhindert parallele Generierungen
 
 // --- Persona → Visual-Prompt (per GPT) ---
+// --- Persona → Visual-Prompt (per GPT) ---
 async function buildVisualPromptFromPersona(personaText) {
+  // local require avoids rare binding issues
+  const { getAI } = require("./aiService.js");
+
   const ctx = {
     messages: [
       {
@@ -32,8 +36,7 @@ async function buildVisualPromptFromPersona(personaText) {
       },
       {
         role: "user",
-        content:
-          "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
+        content: "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
       }
     ]
   };
@@ -41,6 +44,7 @@ async function buildVisualPromptFromPersona(personaText) {
   const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
   return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
 }
+
 
 // --- Avatar sicherstellen (nur Persona verwenden) ---
 async function ensureChannelAvatar(channelId, channelMeta) {
@@ -298,31 +302,27 @@ async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignori
 
 
 // ---------- Transcripts-Thread ----------
-async function getOrCreateTranscriptsThread(textChannel) {
+const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
+
+async function getOrCreateRelayWebhookFor(parentChannel) {
   try {
-    const active = await textChannel.threads.fetchActive();
-    let thread = active?.threads?.find(t => t.name === "Transcripts");
-    if (thread) return thread;
+    if (!parentChannel) return null;
+    const cacheKey = parentChannel.id; // ⬅️ renamed
+    if (transcriptWebhookCache.has(cacheKey)) return transcriptWebhookCache.get(cacheKey);
 
-    const archived = await textChannel.threads.fetchArchived();
-    thread = archived?.threads?.find(t => t.name === "Transcripts");
-    if (thread) {
-      try { await thread.setArchived(false); } catch {}
-      return thread;
+    const hooks = await parentChannel.fetchWebhooks();
+    let hook = hooks.find(w => w.name === "Transcripts Relay");
+    if (!hook) {
+      hook = await parentChannel.createWebhook({ name: "Transcripts Relay" });
     }
-
-    // neu anlegen
-    thread = await textChannel.threads.create({
-      name: "Transcripts",
-      autoArchiveDuration: 1440, // 24h
-      reason: "Collecting voice transcripts"
-    });
-    return thread;
+    transcriptWebhookCache.set(cacheKey, hook); // ⬅️ renamed
+    return hook;
   } catch (e) {
-    console.error("[Transcripts] create/fetch failed:", e.message);
+    console.error("[Transcripts Relay] webhook create/fetch failed:", e?.message || e);
     return null;
   }
 }
+
 
 // ---------- Voice: TTS ----------
 const queueMap = new Map();
@@ -547,6 +547,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
     if (!player) {
       const { createAudioPlayer } = require("@discordjs/voice");
       player = createAudioPlayer();
+      player.setMaxListeners(50);
       playerMap.set(guildId, player);
       connection.subscribe(player);
     }
