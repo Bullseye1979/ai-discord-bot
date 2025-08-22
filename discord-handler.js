@@ -32,11 +32,21 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     const senderName = message.member?.displayName || message.author?.username || "";
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
-    const matchingBlock = blocks.find(b => {
-      const okUser = Array.isArray(b.user) && b.user.map(String).includes(senderId);
-      const okSpeaker = Array.isArray(b.speaker) && b.speaker.includes(senderName);
-      return okUser || okSpeaker;
-    });
+    // NEU – Wildcards + leere Arrays = „alle erlaubt“ + speaker case-insensitive
+const matchingBlock = blocks.find(b => {
+  const users = Array.isArray(b.user) ? b.user.map(String) : null;
+  const speakers = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).toLowerCase()) : null;
+
+  const okUser =
+    !users || users.length === 0 || users.includes("*") || users.includes(senderId);
+
+  const okSpeaker =
+    !speakers || speakers.length === 0 || speakers.includes("*") ||
+    speakers.includes((senderName || "").toLowerCase());
+
+  return okUser || okSpeaker;
+});
+
 
     if (!matchingBlock) {
       await setMessageReaction(message, "❌");
