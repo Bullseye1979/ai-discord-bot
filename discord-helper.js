@@ -302,7 +302,7 @@ async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignori
 
 
 // ---------- Transcripts-Thread ----------
-const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
+
 
 async function getOrCreateRelayWebhookFor(parentChannel) {
   try {
