@@ -34,6 +34,19 @@ const contextStorage = new Map();
 const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS/Transcripts)
 const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
 
+const crypto = require("crypto");
+
+function metaSig(m) {
+  return crypto.createHash("sha1").update(JSON.stringify({
+    persona: m.persona || "",
+    instructions: m.instructions || "",
+    tools: (m.tools || []).map(t => t?.function?.name || t?.name || "").sort(),
+    botname: m.botname || "",
+    voice: m.voice || "",
+    summaryPrompt: m.summaryPrompt || ""
+  })).digest("hex");
+}
+
 function channelHasExplicitConfig(channelId) {
   return fs.existsSync(path.join(__dirname, "channel-config", `${channelId}.json`));
 }
@@ -82,9 +95,8 @@ client.on("messageCreate", async (message) => {
   if (!channelMeta) return;
 
   const key = `channel:${baseChannelId}`;
-
-
-
+  const key = `channel:${baseChannelId}`;
+  const signature = metaSig(channelMeta);
 
   if (!contextStorage.has(key)) {
     const ctx = new Context(
@@ -94,9 +106,23 @@ client.on("messageCreate", async (message) => {
       channelMeta.toolRegistry,
       baseChannelId
     );
-    contextStorage.set(key, ctx);
+    contextStorage.set(key, { ctx, sig: signature });
+  } else {
+    const entry = contextStorage.get(key);
+    if (entry.sig !== signature) {
+      // Konfig hat sich geändert → Context neu aufbauen
+      entry.ctx = new Context(
+        channelMeta.persona,
+        channelMeta.instructions,
+        channelMeta.tools,
+        channelMeta.toolRegistry,
+        baseChannelId
+      );
+      entry.sig = signature;
+    }
   }
-  const chatContext = contextStorage.get(key);
+  const chatContext = contextStorage.get(key).ctx;
+
 
   // ---- Zentrale Command-Gates ----
   const rawText = (message.content || "").trim();
