@@ -8,6 +8,7 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
+const { initCron, reloadCronForChannel } = require("./scheduler.js");
 const Context = require("./context.js");
 const {
   getChannelConfig,
@@ -37,6 +38,13 @@ const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS
 const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
 
 const crypto = require("crypto");
+
+client.once("ready", () => {
+  setBotPresence(client, "✅ Started", "online");
+  // ⬇️ Cron-Jobs für alle Channel-Configs mit crontab laden
+  initCron(contextStorage);
+});
+
 
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
@@ -88,13 +96,17 @@ async function deleteAllMessages(channel) {
 }
 
 client.on("messageCreate", async (message) => {
+
   if (!message.guild) return;
 
-  // -------- Parent-Channel-Logik für Threads --------
-  // -------- Channel-Config (ohne Threads/Transcripts) --------
+
+
+  // -------- Channel-Config laden (keine Threads / direkt Channel-ID) --------
   const baseChannelId = message.channelId;
   const channelMeta = getChannelConfig(baseChannelId);
   if (!channelMeta) return;
+
+  // Context pro Channel cachen; bei Config-Änderung neu aufbauen
   const key = `channel:${baseChannelId}`;
   const signature = metaSig(channelMeta);
 
@@ -110,7 +122,6 @@ client.on("messageCreate", async (message) => {
   } else {
     const entry = contextStorage.get(key);
     if (entry.sig !== signature) {
-      // Konfig hat sich geändert → Context neu aufbauen
       entry.ctx = new Context(
         channelMeta.persona,
         channelMeta.instructions,
@@ -123,14 +134,13 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key).ctx;
 
-
   // ---- Zentrale Command-Gates ----
   const rawText = (message.content || "").trim();
   const isCommand = rawText.startsWith("!");
 
   if (isCommand) {
-    // 1) Kein Channel-Config-File -> Commands gesperrt
-    if (!channelHasExplicitConfig(baseChannelId)) {
+    // 1) Commands nur, wenn es für diesen Channel eine explizite Config-Datei gibt
+    if (!channelMeta.hasConfig) {
       await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
       return;
     }
@@ -141,6 +151,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
   }
+
 
 
 

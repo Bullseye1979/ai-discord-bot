@@ -47,16 +47,19 @@ async function buildVisualPromptFromPersona(personaText) {
   return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
 }
 
-function resetRecordingFlag(guildId) {
-  activeRecordings.delete(guildId);
+function resetTTSPlayer(guildId) {
+  try {
+    const p = playerMap.get(guildId);
+    if (p) {
+      try { p.stop(true); } catch {}
+      playerMap.delete(guildId);
+    }
+  } catch {}
 }
 
-function resetTTSPlayer(guildId) {
-  const p = playerMap.get(guildId);
-  if (p) {
-    try { p.stop(); } catch {}
-    playerMap.delete(guildId);
-  }
+function resetRecordingFlag(guildId) {
+  // Aufnahme-Flag löschen, damit setStartListening beim nächsten Join neu scharf geschaltet wird
+  try { activeRecordings.delete(guildId); } catch {}
 }
 
 
@@ -155,6 +158,7 @@ function getDefaultPersona() {
 
 
 // ---------- Channel-Config ----------
+
 function getChannelConfig(channelId) {
   const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
   const def = getDefaultPersona();
@@ -169,6 +173,9 @@ function getChannelConfig(channelId) {
     blocks = def.blocks,
     summaryPrompt = def.summaryPrompt
   } = def;
+
+  // ⬇️ NEU
+  let crontab = null;
 
   if (fs.existsSync(configPath)) {
     try {
@@ -185,8 +192,10 @@ function getChannelConfig(channelId) {
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
-      // ↓↓↓ NEU
-      if (Array.isArray(cfg.admins)) def.admins = cfg.admins;
+      // ⬇️ NEU: Crontab (als String, z.B. "0 23 * * 1")
+      if (typeof cfg.crontab === "string" && cfg.crontab.trim()) {
+        crontab = cfg.crontab.trim();
+      }
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -199,10 +208,7 @@ function getChannelConfig(channelId) {
     ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
     : `https://ralfreschke.de/documents/avatars/default.png`;
 
-  // NEW: Flag, ob es eine echte Channel-Datei gab
   const hasConfigFile = fs.existsSync(configPath);
-  // NEW: Summaries nur erlauben, wenn es eine Channel-Datei gibt UND ein Prompt gesetzt ist
-  const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
 
   return {
     name,
@@ -216,12 +222,9 @@ function getChannelConfig(channelId) {
     blocks,
     summaryPrompt,
     hasConfig: hasConfigFile,
-    summariesEnabled,
-    admins: def.admins || []                
+    crontab,                     // ⬅️ NEU
   };
-
 }
-
 // ---------- Chunking & Senden ----------
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
