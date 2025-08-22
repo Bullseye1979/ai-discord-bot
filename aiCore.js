@@ -1,6 +1,7 @@
-// Version 1.4
+// Version 1.5
 // Provides the AI Functionality for the main process (tool_calls, length management, final answer)
-// - Kontext-Klone erhalten jetzt die channelId, damit DB-Logs/Tools konsistent sind.
+// - channelId wird wie früher in Context-Klone übernommen
+// - Tool-Calls: (fn, handoverContext, getAIResponse, runtime) => rückwärtskompatibel, runtime nur optional
 
 require('dotenv').config();
 const axios = require('axios');
@@ -16,7 +17,7 @@ async function getAIResponse(
 ) {
   if (tokenlimit == null) tokenlimit = 4096;
 
-  // ➕ channelId aus dem Original übernehmen (für Tools)
+  // channelId aus dem Original übernehmen (für Tools)
   const channelId = context_orig?.channelId || "global";
 
   // Arbeits-Kontexte (separat, um History/Tools sauber zu halten)
@@ -32,7 +33,9 @@ async function getAIResponse(
   const nowUtc = new Date().toISOString();
   context.messages.unshift({
     role: "system",
-    content: "Current UTC time: " + nowUtc + " <- Use this time, whenever you are asked for the current time. Translate it to the location for which the time is requested. If no location is specified use your current location."
+    content:
+      "Current UTC time: " + nowUtc +
+      " <- Use this time, whenever you are asked for the current time. Translate it to the location for which the time is requested. If no location is specified use your current location."
   });
 
   let responseMessage = "";
@@ -67,9 +70,7 @@ async function getAIResponse(
       });
     } catch (err) {
       console.error("[FATAL] Error from OpenAI:", err);
-      if (err.response) {
-        console.error(JSON.stringify(err.response.data, null, 2));
-      }
+      if (err.response) console.error(JSON.stringify(err.response.data, null, 2));
       throw err;
     }
 
@@ -79,14 +80,14 @@ async function getAIResponse(
 
     hasToolCalls = aiMessage.tool_calls && aiMessage.tool_calls.length > 0;
 
-    // Assistant antwortet mit Tool-Calls?
+    // Assistant mit Tool-Calls?
     if (aiMessage.tool_calls) {
       context.messages.push({
         role: "assistant",
         tool_calls: aiMessage.tool_calls || null
       });
     }
-    // Freitext-Antwort anhängen
+    // Freitext
     if (aiMessage.content) {
       responseMessage += aiMessage.content.trim();
     }
@@ -104,9 +105,10 @@ async function getAIResponse(
           continue;
         }
         try {
-          // ➕ channel_id als Laufzeit-Info an Tools übergeben
+          // ✅ RÜCKWÄRTSKOMPATIBEL: 2. Param ist weiterhin der handoverContext
+          //    channel_id wird NUR als optionales 4. Argument angehängt.
           const runtime = { channel_id: channelId };
-          const toolResult = await toolFunction(toolCall.function, runtime, getAIResponse);
+          const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
           lastmessage = toolResult;
           context.messages.push({
             role: "tool",
@@ -122,13 +124,12 @@ async function getAIResponse(
         }
       }
     } else {
-      // Falls das letzte Toolresult separat in den Original-Kontext geschrieben werden soll
+      // Optional: letztes Toolresult separat im Original-Kontext ablegen
       if (lastmessage) {
         await context_orig.add("assistant", "", lastmessage);
       }
     }
 
-    // Fortsetzungslogik
     continueResponse = !hasToolCalls && finishReason === "length";
     if (continueResponse) {
       context.messages.push({ role: "user", content: "continue" });

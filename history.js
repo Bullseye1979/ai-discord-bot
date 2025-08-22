@@ -45,17 +45,24 @@ function truncate(s, n=1200) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
-// Tool-Entry
-async function getHistory(toolFunction, runtime = {}) {
+// Tool-Entry (rückwärtskompatibel):
+// getHistory(toolFunction, handoverContext, _getAIResponse, runtime)
+async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   try {
     const args = JSON.parse(toolFunction.arguments || '{}');
     const sql = String(args.sql || '').trim();
     const extra = (args.bindings && typeof args.bindings === 'object') ? args.bindings : {};
 
-    // ⬇️ Kanal NUR aus runtime (kommt aus aiCore.js)
-    const channelId = String(runtime.channel_id || '').trim();
-    if (!channelId) throw new Error("channel_id missing (runtime)");
     if (!sql) throw new Error("sql missing");
+
+    // channelId: bevorzugt aus runtime, sonst aus handoverContext.channelId
+    let channelId = "";
+    if (runtime && runtime.channel_id) {
+      channelId = String(runtime.channel_id).trim();
+    } else if (ctxOrUndefined && ctxOrUndefined.channelId) {
+      channelId = String(ctxOrUndefined.channelId).trim();
+    }
+    if (!channelId) throw new Error("channel_id missing");
 
     // Sicherheitsgitter
     const lowered = sql.toLowerCase();
@@ -69,10 +76,6 @@ async function getHistory(toolFunction, runtime = {}) {
 
     // :channel_id IMMER bereitstellen (zusätzlich zu evtl. extra Bindings)
     const bindings = { channel_id: channelId, ...extra };
-
-    console.log(channelId+"\n");
-
-    console.log(sql);
 
     const { sql: compiled, values } = compileNamed(sql, bindings);
     const db = await getPool();
