@@ -229,23 +229,26 @@ if ((message.content || "").startsWith("!joinvc")) {
   }
 
 
-  // ---------------- Normaler Flow ----------------
+// ---------------- Normaler Flow ----------------
 
-// Hilfsfunktion: **Sprecher:** text
-function parseTranscriptLine(raw) {
-  const m = (raw || "").match(/^\s*\*\*([^*]+)\*\*:\s*(.+)$/s);
-  if (!m) return null;
-  return { speaker: m[1].trim(), text: m[2].trim() };
+// 1) Erkennen, ob dies ein Transkript-Webhook ist (Webhooks ≠ AI-Webhook)
+const isWebhook = !!message.webhookId;
+let isAIWebhook = false;
+if (isWebhook) {
+  try {
+    const ws = await message.channel.fetchWebhooks();
+    const w = ws.find(x => x.id === message.webhookId);
+    isAIWebhook = !!w && w.name === (channelMeta?.botname || "AI");
+  } catch {}
 }
-
-// 1) Erkennen, ob dies eine Transkriptzeile ist (vom Bot/Webhook gepostet, Form: **Sprecher:** Text)
-const parsedTranscript =
-  (message.author?.bot || message.webhookId) ? parseTranscriptLine(message.content || "") : null;
+const isTranscriptPost = isWebhook && !isAIWebhook; // alles andere als unser AI-Webhook
 
 // 2) In den Kontext schreiben
-if (parsedTranscript && parsedTranscript.text) {
-  // Transkript als User-Message (Sprechername)
-  await chatContext.add("user", parsedTranscript.speaker, parsedTranscript.text);
+if (isTranscriptPost) {
+  // Transkript als User-Message (Sprechername = Webhook-Username)
+  const speaker = message.author?.username || "Unknown";
+  const text = (message.content || "").trim();
+  if (text) await chatContext.add("user", speaker, text);
 } else if (!message.author?.bot && !message.webhookId) {
   // echte User-Texte loggen
   await setAddUserMessage(message, chatContext);
@@ -255,8 +258,9 @@ if (parsedTranscript && parsedTranscript.text) {
 
 // 3) TTS nur für AI-Antworten, aber NICHT für Summaries/Transkripte
 try {
-  const isTranscriptPost = !!parsedTranscript;
-  const looksLikeSummary = /\*\*Summary\b|\bSummary completed\b|\bSummary in progress\b/i.test(message.content || "");
+  const looksLikeSummary =
+    /\*\*Summary\b/i.test(message.content || "") ||
+    /\bSummary (in progress|completed)/i.test(message.content || "");
   if (!isTranscriptPost && !looksLikeSummary) {
     await setTTS(message, client, guildTextChannels);
   }
@@ -268,9 +272,9 @@ try {
 let contentRaw = message.content || "";
 let speakerForProxy = null;
 
-if (parsedTranscript && parsedTranscript.text) {
-  contentRaw = parsedTranscript.text;
-  speakerForProxy = parsedTranscript.speaker || null;
+if (isTranscriptPost) {
+  contentRaw = (message.content || "").trim();
+  speakerForProxy = message.author?.username || null;
 }
 
 const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
@@ -279,7 +283,7 @@ const norm = (contentRaw || "").trim().toLowerCase();
 const isTrigger =
   norm.startsWith(triggerName) ||
   norm.startsWith(`!${triggerName}`) ||
-  (!!parsedTranscript && norm.includes(triggerName)); // bei Voice reicht Erwähnung irgendwo
+  (isTranscriptPost && norm.includes(triggerName)); // bei Voice reicht Erwähnung irgendwo
 
 if (!isTrigger) return;
 
@@ -316,6 +320,7 @@ const proxyMsg = new Proxy(message, {
 });
 
 return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+;
 
 }); // ✅ FIX 1: Handler schließen!
 

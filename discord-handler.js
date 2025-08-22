@@ -6,7 +6,6 @@ const {
   setMessageReaction,
   getChannelConfig,
   setReplyAsWebhook,
-  getOrCreateTranscriptsThread,
   getSpeech,
 } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
@@ -64,13 +63,6 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         botname: channelMeta.botname,
         avatarUrl: channelMeta.avatarUrl
       });
-
-      // 2) Antwort zusätzlich in Transcripts-Thread spiegeln (falls existiert/erstellbar)
-      const thread = await getOrCreateTranscriptsThread(message.channel);
-      if (thread) {
-        const { sendChunked } = require("./discord-helper.js");
-        await sendChunked(thread, output);
-      }
 
       // 3) In den Kontext loggen als Bot
       await chatContext.add("assistant", channelMeta?.botname || "AI", output);
