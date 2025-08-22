@@ -9,12 +9,90 @@ const { EndBehaviorType, createAudioResource, StreamType } = require("@discordjs
 const { PassThrough } = require("stream");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
-const { getTranscription, getTTS } = require("./aiService.js");
+const axios = require("axios");
+const { getAIImage, getTranscription, getTTS } = require("./aiService.js");
 require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
 const activeRecordings = new Map();
+const _avatarInFlight = new Map(); // ⬅️ verhindert parallele Generierungen
+
+// --- Persona → Visual-Prompt (per GPT) ---
+async function buildVisualPromptFromPersona(personaText) {
+  const ctx = {
+    messages: [
+      {
+        role: "system",
+        content:
+          "You convert assistant persona descriptions into ONE concise visual prompt for a clean square avatar illustration. " +
+          "Only output the final prompt text. Be concrete: age vibe, outfit, color palette, expression, background. " +
+          "Avoid any mention of text, logos, UI, frames, watermarks, brands. " +
+          "End with: 'square portrait, centered, neutral background, soft lighting'. Max ~80 words."
+      },
+      {
+        role: "user",
+        content:
+          "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
+      }
+    ]
+  };
+
+  const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
+  return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
+}
+
+// --- Avatar sicherstellen (nur Persona verwenden) ---
+async function ensureChannelAvatar(channelId, channelMeta) {
+  try {
+    const dir = path.join(__dirname, "documents", "avatars");
+    const file = path.join(dir, `${channelId}.png`);
+
+    // Bereits vorhanden? -> URL zurück
+    if (fs.existsSync(file)) {
+      return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
+    }
+
+    // Ohne Persona -> Default
+    const persona = (channelMeta?.persona || "").trim();
+    if (!persona) {
+      return `https://ralfreschke.de/documents/avatars/default.png`;
+    }
+
+    // Parallel-Läufe verhindern
+    if (_avatarInFlight.has(channelId)) {
+      await _avatarInFlight.get(channelId);
+      return fs.existsSync(file)
+        ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
+        : `https://ralfreschke.de/documents/avatars/default.png`;
+    }
+
+    const p = (async () => {
+      await fs.promises.mkdir(dir, { recursive: true });
+
+      // 1) Persona → kompakten Bild-Prompt bauen
+      const visualPrompt = await buildVisualPromptFromPersona(persona);
+
+      // 2) Bild generieren
+      const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
+
+      // 3) Download & speichern
+      const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
+      await fs.promises.writeFile(file, Buffer.from(res.data));
+    })();
+
+    _avatarInFlight.set(channelId, p);
+    await p;
+    _avatarInFlight.delete(channelId);
+
+    return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
+  } catch (e) {
+    console.warn("[ensureChannelAvatar] failed:", e?.response?.data || e?.message || e);
+    _avatarInFlight.delete(channelId);
+    return `https://ralfreschke.de/documents/avatars/default.png`;
+  }
+}
+
 
 // ---------- Tools für User/Blocks ----------
 function getUserTools(nameOrDisplayName) {
@@ -178,18 +256,26 @@ async function postSummariesIndividually(channel, summaries, _leftover) {
 }
 
 // ---------- Webhook Reply ----------
-async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
+// ---------- Webhook Reply (Avatar = aus Persona generiert) ----------
+async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignorieren */ }) {
   try {
+    // Falls Thread: Webhook immer am Parent erstellen
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
     const hookChannel = isThread ? message.channel.parent : message.channel;
 
-    // Falls Parent nicht verfügbar (sollte in Threads nicht passieren), fallback
+    // ChannelMeta laden (Parent wenn Thread)
+    const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+    const meta = getChannelConfig(effectiveChannelId);
+
+    // Avatar sicherstellen (nur Persona)
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
+
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || "AI"));
     if (!hook) {
       hook = await hookChannel.createWebhook({
         name: botname || "AI",
-        avatar: avatarUrl || undefined
+        avatar: personaAvatarUrl || undefined,
       });
     }
 
@@ -198,7 +284,7 @@ async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
       await hook.send({
         content: p,
         username: botname || "AI",
-        avatarURL: avatarUrl || undefined,
+        avatarURL: personaAvatarUrl || undefined,
         allowedMentions: { parse: [] },
         threadId: isThread ? message.channel.id : undefined
       });
@@ -209,6 +295,7 @@ async function setReplyAsWebhook(message, content, { botname, avatarUrl }) {
     await sendChunked(message.channel, content);
   }
 }
+
 
 // ---------- Transcripts-Thread ----------
 async function getOrCreateTranscriptsThread(textChannel) {
