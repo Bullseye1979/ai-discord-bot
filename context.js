@@ -78,8 +78,7 @@ class Context {
     this.instructions = instructions || "";
     this.tools = tools || [];
     this.toolRegistry = toolRegistry || {};
-    this.channelId = channelId;
-    this.isSummarizing = false;
+    this.channelId = String(channelId);
 
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) this.messages.push({ role: "system", name: "system", content: sys });
@@ -142,105 +141,132 @@ class Context {
   }
 
   async summarizeSince(cutoffMs, customPrompt = null) {
-    if (this.isSummarizing) return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
-    this.isSummarizing = true;
-
-    try {
-      const db = await getPool();
-
-      const [lastSum] = await db.execute(
-        `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
-        [this.channelId]
-      );
-      const lastCursor = lastSum?.[0]?.last_context_id ?? null;
-      const cutoff = toMySQLDateTime(new Date(cutoffMs));
-
-      let rows = [];
-      if (lastCursor != null) {
-        const [r] = await db.execute(
-          `SELECT id, timestamp, role, sender, content
-             FROM context_log
-            WHERE channel_id=? AND id > ? AND timestamp <= ?
-            ORDER BY id ASC`,
-          [this.channelId, lastCursor, cutoff]
-        );
-        rows = r || [];
-      } else {
-        const [r] = await db.execute(
-          `SELECT id, timestamp, role, sender, content
-             FROM context_log
-            WHERE channel_id=? AND timestamp <= ?
-            ORDER BY id ASC`,
-          [this.channelId, cutoff]
-        );
-        rows = r || [];
-      }
-
-      let maxId = rows.length ? rows[rows.length - 1].id : lastCursor;
-      let insertedSummaryId = null;
-
-      if (rows.length) {
-        const prompt =
-          (customPrompt && customPrompt.trim()) ||
-          `You are a Dungeon Master writing a dramatic session recap. Summarize only the in-character D&D events. Strictly ignore all out-of-character chatter (food orders, jokes, tech talk, meta). Write in English, vivid high-fantasy style. Do not repeat previous summaries; include only NEW events from the provided logs.`;
-
-        console.debug(`[SUMMARY][DEBUG] Channel=${this.channelId} last_context_id=${lastCursor ?? "null"} cutoff=${cutoff} rows=${rows.length}`);
-        console.debug(`[SUMMARY][DEBUG] Selected rows to summarize:`);
-        rows.forEach((r) => {
-          console.debug(`[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`);
-        });
-
-        const text = rows
-          .map((r) => `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
-          .join("\n");
-
-        // Summarizer-Kontext OHNE automatische 5 DB-Summaries (skipInitialSummaries: true)
-        const sumCtx = new Context("You are a channel summary generator.", prompt, [], {}, this.channelId, { skipInitialSummaries: true });
-        await sumCtx.add("user", "system", text);
-
-        console.debug(`[SUMMARY][DEBUG] Prompt used:\n${prompt}`);
-        console.debug(`[SUMMARY][DEBUG] ===== BEGIN SUMMARIZER CONTEXT (messages) =====`);
-        console.debug(JSON.stringify(sumCtx.messages, null, 2));
-        console.debug(`[SUMMARY][DEBUG] ===== END SUMMARIZER CONTEXT (messages) =====`);
-
-        const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
-        if (summary) {
-          const [res] = await db.execute(
-            `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
-             VALUES (?, ?, ?, ?)`,
-            [toMySQLDateTime(new Date()), this.channelId, summary, maxId]
-          );
-          insertedSummaryId = res?.insertId ?? null;
-        }
-      } else {
-        console.debug("[SUMMARY] No new rows since last cursor/cutoff.");
-      }
-
-      // Kontext neu aufbauen: System + 5 Summaries (ASC) + alle >= Cutoff
-      const [desc] = await db.execute(
-        `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
-        [this.channelId]
-      );
-      const asc = (desc || []).slice().reverse();
-
-      const newMsgs = [];
-      const sys = `${this.persona}\n${this.instructions}`.trim();
-      if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
-
-      for (const r of asc) newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
-
-      const afterRows = await this.getMessagesAfter(cutoffMs);
-      for (const r of afterRows) newMsgs.push({ role: r.role, name: r.sender, content: r.content });
-
-      this.messages = newMsgs;
-      return { messages: this.messages, insertedSummaryId, usedMaxContextId: maxId };
-    } catch (e) {
-      console.error("[SUMMARIZE] failed:", e);
-      return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
-    } finally {
-      this.isSummarizing = false;
-    }
+  if (this.isSummarizing) {
+    return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
   }
+  this.isSummarizing = true;
+
+  try {
+    const db = await getPool();
+
+    // Letzte Summary (Cursor) für DIESEN Kanal holen
+    const [lastSum] = await db.execute(
+      `SELECT id, last_context_id
+         FROM summaries
+        WHERE channel_id = ?
+        ORDER BY id DESC
+        LIMIT 1`,
+      [this.channelId]
+    );
+    const lastCursor = lastSum?.[0]?.last_context_id ?? null;
+
+    const cutoff = toMySQLDateTime(new Date(cutoffMs));
+
+    // Alle neuen Kontextzeilen bis zum Cutoff für DIESEN Kanal laden
+    let rows = [];
+    if (lastCursor != null) {
+      const [r] = await db.execute(
+        `SELECT id, timestamp, role, sender, content
+           FROM context_log
+          WHERE channel_id = ?
+            AND id > ?
+            AND timestamp <= ?
+          ORDER BY id ASC`,
+        [this.channelId, lastCursor, cutoff]
+      );
+      rows = r || [];
+    } else {
+      const [r] = await db.execute(
+        `SELECT id, timestamp, role, sender, content
+           FROM context_log
+          WHERE channel_id = ?
+            AND timestamp <= ?
+          ORDER BY id ASC`,
+        [this.channelId, cutoff]
+      );
+      rows = r || [];
+    }
+
+    let maxId = rows.length ? rows[rows.length - 1].id : lastCursor;
+    let insertedSummaryId = null;
+
+    if (rows.length) {
+      // Promptreihenfolge: custom > channel-config (this.summaryPrompt) > neutraler Fallback
+      const prompt =
+        (customPrompt && customPrompt.trim()) ||
+        (this.summaryPrompt && this.summaryPrompt.trim()) ||
+        `Summarize the following channel logs concisely.
+Include only facts present in the logs, avoid meta-chatter and speculation.
+Do NOT invent events. Prefer clear bullet points when suitable.`;
+
+      // Logs als einfacher Textblock für den Summarizer
+      const text = rows
+        .map((r) => `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
+        .join("\n");
+
+      // Dedizierter Summarizer-Kontext, keine automatischen "letzten 5 Summaries" laden
+      const sumCtx = new Context(
+        "You are a channel summary generator.",
+        prompt,
+        [],
+        {},
+        this.channelId,
+        { skipInitialSummaries: true }
+      );
+      await sumCtx.add("user", "system", text);
+
+      const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
+
+      if (summary) {
+        const [res] = await db.execute(
+          `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
+           VALUES (?, ?, ?, ?)`,
+          [toMySQLDateTime(new Date()), this.channelId, summary, maxId]
+        );
+        insertedSummaryId = res?.insertId ?? null;
+      }
+    } else {
+      // Keine neuen Zeilen zwischen letztem Cursor und Cutoff – kein Summarize-Call
+      // (maxId bleibt lastCursor)
+    }
+
+    // Kontext neu aufbauen:
+    //   System (Persona+Instructions) +
+    //   letzte 5 Summaries (ASC) +
+    //   alle Nachrichten >= Cutoff
+    const [desc] = await db.execute(
+      `SELECT timestamp, summary
+         FROM summaries
+        WHERE channel_id = ?
+        ORDER BY id DESC
+        LIMIT 5`,
+      [this.channelId]
+    );
+    const asc = (desc || []).slice().reverse();
+
+    const newMsgs = [];
+    const sys = `${this.persona}\n${this.instructions}`.trim();
+    if (sys) newMsgs.push({ role: "system", name: "system", content: sys });
+
+    for (const r of asc) {
+      newMsgs.push({ role: "assistant", name: "summary", content: r.summary });
+    }
+
+    const afterRows = await this.getMessagesAfter(cutoffMs);
+    for (const r of afterRows) {
+      newMsgs.push({ role: r.role, name: r.sender, content: r.content });
+    }
+
+    this.messages = newMsgs;
+    return { messages: this.messages, insertedSummaryId, usedMaxContextId: maxId };
+  } catch (e) {
+    console.error("[SUMMARIZE] failed:", e);
+    return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
+  } finally {
+    this.isSummarizing = false;
+  }
+}
+
 
   async getLastSummaries(limit = 5) {
     const db = await getPool();
