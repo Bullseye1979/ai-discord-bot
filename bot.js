@@ -15,6 +15,7 @@ const {
   setAddUserMessage,
   setBotPresence,
   sendChunked,
+  resetRecordingFlag,
   postSummariesIndividually,
 } = require("./discord-helper.js");
 
@@ -170,12 +171,21 @@ client.on("messageCreate", async (message) => {
  // !joinvc: Voice beitreten + Transcripts/TTS an DIESEN Textkanal binden
 if ((message.content || "").startsWith("!joinvc")) {
   try {
-    // echten Member holen (robust), dann Voice-Channel
+    // Get the user's current voice channel
     let gm = null;
     try { gm = await message.guild.members.fetch(message.author.id); } catch {}
     const vc = gm?.voice?.channel || message.member?.voice?.channel;
     if (!vc) { await message.reply("Join a voice channel first."); return; }
 
+    // Kill old connection (if any) to force rebind
+    const old = getVoiceConnection(message.guild.id);
+    if (old) {
+      try { old.destroy(); } catch {}
+    }
+    // Reset recorder flag for this guild
+    resetRecordingFlag(message.guild.id);
+
+    // Join new connection
     const conn = joinVoiceChannel({
       channelId: vc.id,
       guildId: message.guild.id,
@@ -183,14 +193,16 @@ if ((message.content || "").startsWith("!joinvc")) {
       selfDeaf: false,
     });
 
-    // Transkripte in diesen Textkanal spiegeln
+    // Bind transcripts/TTS to the **current** text channel (Channel 2)
     guildTextChannels.set(message.guild.id, message.channel.id);
 
+    // Start/refresh listening (now posts will follow the Map dynamically)
     setStartListening(conn, message.guild.id, guildTextChannels, client);
+
     await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts will be posted here.`);
   } catch (e) {
     console.error("[!joinvc] failed:", e?.message || e);
-    await message.channel.send("❌ Failed to join voice. Check my permissions (Connect/Speak) and try again.");
+    await message.channel.send("❌ Failed to join/move. Check my permissions (Connect/Speak) and try again.");
   }
   return;
 }

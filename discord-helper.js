@@ -47,6 +47,10 @@ async function buildVisualPromptFromPersona(personaText) {
   return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
 }
 
+function resetRecordingFlag(guildId) {
+  activeRecordings.delete(guildId);
+}
+
 
 // --- Avatar sicherstellen (nur Persona verwenden) ---
 async function ensureChannelAvatar(channelId, channelMeta) {
@@ -447,56 +451,52 @@ async function resolveSpeakerName(client, guildId, userId) {
 async function setStartListening(connection, guildId, guildTextChannels, client) {
   try {
     if (!connection || !guildId) return;
-    if (activeRecordings.get(guildId)) return; // schon aktiv
 
-    const textChannelId = guildTextChannels.get(guildId);
-    const textChannel = textChannelId ? await client.channels.fetch(textChannelId).catch(() => null) : null;
-    if (!textChannel) return;
+    // If recorder already exists on a different connection, clear its listeners and rebind
+    const prev = activeRecordings.get(guildId);
+    if (prev && prev !== connection) {
+      try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
+    }
+    // Store the current connection as the active one
+    activeRecordings.set(guildId, connection);
 
-    const target = textChannel; // ⬅️ direkt in den Kanal posten, kein Thread
+    // Helper: always fetch the latest target text-channel from the shared Map
+    const getLatestTarget = async () => {
+      const latestId = guildTextChannels.get(guildId);
+      if (latestId) {
+        const ch = await client.channels.fetch(latestId).catch(() => null);
+        if (ch) return ch;
+      }
+      return null;
+    };
 
     const receiver = connection.receiver;
     if (!receiver) return;
 
-    activeRecordings.set(guildId, true);
-
+    receiver.speaking.removeAllListeners("start"); // avoid duplicate listeners
     receiver.speaking.on("start", (userId) => {
       try {
-        // 1) Opus abonnieren
         const opus = receiver.subscribe(userId, {
-          end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 } // 1s Stille = Ende
+          end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
         });
 
-        // 2) Opus → PCM
         const pcm = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
-
-        // 3) PCM in PassThrough schieben, ffmpeg gleichzeitig starten
         const pass = new PassThrough();
         const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
-        let bytes = 0;
-        pcm.on("data", (chunk) => {
-          bytes += chunk.length;
-          pass.write(chunk);
-        });
+        pcm.on("data", (chunk) => pass.write(chunk));
         pcm.on("end", async () => {
           pass.end();
           try {
             const { dir, file } = await wavPromise;
 
-            // sehr kurze Aufnahmen überspringen (z.B. < 0.5s bei 48kHz mono 16-bit ~ 48kB)
             const st = await fs.promises.stat(file).catch(() => null);
-            if (!st || st.size < 48000) {
+            if (!st || st.size < 48000) { // ~0.5s mono @ 48kHz
               try { await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
               return;
             }
 
-            // 4) Transkribieren —> WICHTIG: Dateipfad übergeben
-            // Wenn deine aiService.getTranscription einen Stream erwartet:
-            //   const text = await getTranscription(fs.createReadStream(file), "whisper-1", "auto");
-            // Wenn sie einen Dateipfad erwartet (häufiger Fall):
             const text = await getTranscription(file, "whisper-1", "auto");
-
             if (text && text.trim()) {
               const speaker = await resolveSpeakerName(client, guildId, userId);
               let avatarURL;
@@ -505,14 +505,18 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
                 const m = await g.members.fetch(userId).catch(() => null);
                 avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
               } catch {}
-              await sendTranscriptViaWebhook(target, text.trim(), speaker, avatarURL);
+
+              // 🔁 DYNAMIC TARGET: read the **current** posting channel each time
+              const latestTarget = await getLatestTarget();
+              if (latestTarget) {
+                await sendTranscriptViaWebhook(latestTarget, text.trim(), speaker, avatarURL);
+              }
             }
           } catch (err) {
             console.warn("[Transcription] failed:", err?.message || err);
           } finally {
-            // 5) Aufräumen
             try {
-              const { dir } = await wavPromise; // dir aus dem Promise ziehen
+              const { dir } = await wavPromise;
               await fs.promises.rm(dir, { recursive: true, force: true });
             } catch {}
           }
@@ -527,16 +531,19 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
       }
     });
 
-    // Aufräumen, wenn Verbindung endet
+    // Clean up only if the connection that dies is the current one
     connection.on("stateChange", (oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
-        activeRecordings.delete(guildId);
+        if (activeRecordings.get(guildId) === connection) {
+          activeRecordings.delete(guildId);
+        }
       }
     });
   } catch (e) {
     console.warn("[setStartListening] failed:", e?.message || e);
   }
 }
+
 
 
 
@@ -641,6 +648,7 @@ module.exports = {
   getOrCreateRelayWebhookFor,
   setStartListening,
   getSpeech,
+  resetRecordingFlag, 
   sendTranscriptViaWebhook,
 
 };
