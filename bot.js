@@ -6,6 +6,7 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
 const path = require("path");
+const fs = require("fs");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const Context = require("./context.js");
 const {
@@ -33,6 +34,14 @@ const contextStorage = new Map();
 const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS/Transcripts)
 const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
 
+function channelHasExplicitConfig(channelId) {
+  return fs.existsSync(path.join(__dirname, "channel-config", `${channelId}.json`));
+}
+
+function isChannelAdmin(channelMeta, userId) {
+  const ids = Array.isArray(channelMeta.admins) ? channelMeta.admins.map(String) : [];
+  return ids.includes(String(userId));
+}
 
 function parseTranscriptLine(raw) {
   // Matches: **Speaker Name:** message text
@@ -89,6 +98,25 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key);
 
+  // ---- Zentrale Command-Gates ----
+  const rawText = (message.content || "").trim();
+  const isCommand = rawText.startsWith("!");
+
+  if (isCommand) {
+    // 1) Kein Channel-Config-File -> Commands gesperrt
+    if (!channelHasExplicitConfig(baseChannelId)) {
+      await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
+      return;
+    }
+
+    // 2) Nur Admins aus der Channel-Config dürfen Commands
+    if (!isChannelAdmin(channelMeta, message.author.id)) {
+      await message.channel.send("⛔ You are not authorized to run commands in this channel.");
+      return;
+    }
+  }
+
+
 
 
   // ---------------- Commands (vor Logging!) ----------------
@@ -103,15 +131,6 @@ client.on("messageCreate", async (message) => {
   // !purge-db: Channel-Einträge in beiden Tabellen löschen (Admin / ManageGuild)
   if ((message.content || "").startsWith("!purge-db")) {
     const member = message.member;
-    const hasPerm =
-      member.permissions.has(PermissionsBitField.Flags.Administrator) ||
-      member.permissions.has(PermissionsBitField.Flags.ManageGuild);
-
-    if (!hasPerm) {
-      await message.channel.send("❌ You need **Manage Server** or **Administrator** to purge the database for this channel.");
-      return;
-    }
-
     try {
       const res = await chatContext.purgeChannelData();
       await message.channel.send(

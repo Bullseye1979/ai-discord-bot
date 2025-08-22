@@ -46,12 +46,17 @@ function getDefaultPersona() {
       botname: json.botname || "",
       selectedTools: json.tools || [],
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
-      summaryPrompt: json.summaryPrompt || json.summary_prompt || ""
+      summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
+      admins: Array.isArray(json.admins) ? json.admins : []      // ← NEU
     };
   } catch {
-    return { persona: "", instructions: "", voice: "", name: "", botname: "", selectedTools: [], blocks: [], summaryPrompt: "" };
+    return {
+      persona: "", instructions: "", voice: "", name: "", botname: "",
+      selectedTools: [], blocks: [], summaryPrompt: "", admins: [] // ← NEU
+    };
   }
 }
+
 
 // ---------- Channel-Config ----------
 function getChannelConfig(channelId) {
@@ -81,10 +86,11 @@ function getChannelConfig(channelId) {
       if (typeof cfg.instructions === "string") instructions = cfg.instructions;
       if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
       if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
-
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
+      // ↓↓↓ NEU
+      if (Array.isArray(cfg.admins)) def.admins = cfg.admins;
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -113,8 +119,9 @@ function getChannelConfig(channelId) {
     toolRegistry,
     blocks,
     summaryPrompt,
-    hasConfig: hasConfigFile,        // NEW
-    summariesEnabled,                // NEW
+    hasConfig: hasConfigFile,
+    summariesEnabled,
+    admins: def.admins || []                
   };
 
 }
@@ -284,12 +291,11 @@ async function setBotPresence(client, activityText = "✅ Ready", status = "onli
 }
 
 
-// ---------- Kontext / Messages ----------
 async function setAddUserMessage(message, chatContext) {
   try {
-    // Nichts loggen, wenn es die Kontext-Abfrage ist – die soll NICHT im Kontext/DB landen
-    const raw = message?.content || "";
-    if (raw.startsWith("!context")) return;
+    const raw = (message?.content || "").trim();
+    // Keine Commands ins Log schreiben
+    if (raw.startsWith("!")) return;
 
     // Anhänge sammeln
     let content = raw;
@@ -308,6 +314,7 @@ async function setAddUserMessage(message, chatContext) {
     console.warn("[setAddUserMessage] failed:", e?.message || e);
   }
 }
+
 
 
 // temp-Datei anlegen

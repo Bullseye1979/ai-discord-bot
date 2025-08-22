@@ -140,37 +140,46 @@ class Context {
     return rows || [];
   }
 
-  async summarizeSince(cutoffMs, customPrompt = null) {
+  // context.js
+async summarizeSince(cutoffMs, customPrompt = null) {
   if (this.isSummarizing) {
     return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
   }
   this.isSummarizing = true;
 
+  // sehr nüchterner Fallback-Prompt (keine Halluzinationen)
+  const DEFAULT_EXTRACTIVE_PROMPT = `
+You are an EXTRACTIVE summarizer for chat logs.
+
+Hard rules:
+- Include only facts explicitly present in the SOURCE LINES.
+- Do not invent names, places, or events. If unsure, omit.
+- Each bullet MUST end with the source line IDs in square brackets, e.g. [#123,#128].
+- If there are no in-character or otherwise valid events, output exactly: "No in-character events in this period."
+
+Output:
+- A short title.
+- 3–10 bullet points, plain past tense, neutral tone (no purple prose).
+`.trim();
+
   try {
     const db = await getPool();
 
-    // Letzte Summary (Cursor) für DIESEN Kanal holen
+    // Letzte Summary/Cursor laden
     const [lastSum] = await db.execute(
-      `SELECT id, last_context_id
-         FROM summaries
-        WHERE channel_id = ?
-        ORDER BY id DESC
-        LIMIT 1`,
+      `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
       [this.channelId]
     );
     const lastCursor = lastSum?.[0]?.last_context_id ?? null;
-
     const cutoff = toMySQLDateTime(new Date(cutoffMs));
 
-    // Alle neuen Kontextzeilen bis zum Cutoff für DIESEN Kanal laden
+    // Kandidatenzeilen holen (nur eigener Channel!)
     let rows = [];
     if (lastCursor != null) {
       const [r] = await db.execute(
         `SELECT id, timestamp, role, sender, content
            FROM context_log
-          WHERE channel_id = ?
-            AND id > ?
-            AND timestamp <= ?
+          WHERE channel_id=? AND id > ? AND timestamp <= ?
           ORDER BY id ASC`,
         [this.channelId, lastCursor, cutoff]
       );
@@ -179,8 +188,7 @@ class Context {
       const [r] = await db.execute(
         `SELECT id, timestamp, role, sender, content
            FROM context_log
-          WHERE channel_id = ?
-            AND timestamp <= ?
+          WHERE channel_id=? AND timestamp <= ?
           ORDER BY id ASC`,
         [this.channelId, cutoff]
       );
@@ -191,31 +199,31 @@ class Context {
     let insertedSummaryId = null;
 
     if (rows.length) {
-      // Promptreihenfolge: custom > channel-config (this.summaryPrompt) > neutraler Fallback
+      // Quelle kompakt + mit IDs aufbereiten (für Zitierpflicht)
+      const text = rows
+        .map(r => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
+        .join("\n");
+
+      // Prompt-Priorität: customPrompt > this.summaryPrompt (aus Channel-Config) > Default
       const prompt =
         (customPrompt && customPrompt.trim()) ||
         (this.summaryPrompt && this.summaryPrompt.trim()) ||
-        `Summarize the following channel logs concisely.
-Include only facts present in the logs, avoid meta-chatter and speculation.
-Do NOT invent events. Prefer clear bullet points when suitable.`;
+        DEFAULT_EXTRACTIVE_PROMPT;
 
-      // Logs als einfacher Textblock für den Summarizer
-      const text = rows
-        .map((r) => `[${new Date(r.timestamp).toISOString()}] #${r.id} ${r.role.toUpperCase()}(${r.sender}): ${r.content}`)
-        .join("\n");
-
-      // Dedizierter Summarizer-Kontext, keine automatischen "letzten 5 Summaries" laden
+      // isolierter Mini-Context nur für die Zusammenfassung
       const sumCtx = new Context(
         "You are a channel summary generator.",
         prompt,
-        [],
-        {},
+        [], // keine Tools
+        {}, // kein Tool-Registry
         this.channelId,
-        { skipInitialSummaries: true }
+        { skipInitialSummaries: true } // wichtig: keine automatischen DB-Summaries reinziehen
       );
+
       await sumCtx.add("user", "system", text);
 
-      const summary = (await getAI(sumCtx, 900, "gpt-4-turbo"))?.trim() || "";
+      // Temperatur niedrig halten (falls deine getAI-Impl das 4. Argument als Options nimmt)
+      const summary = (await getAI(sumCtx, 900, "gpt-4-turbo", { temperature: 0.1 }))?.trim() || "";
 
       if (summary) {
         const [res] = await db.execute(
@@ -226,20 +234,12 @@ Do NOT invent events. Prefer clear bullet points when suitable.`;
         insertedSummaryId = res?.insertId ?? null;
       }
     } else {
-      // Keine neuen Zeilen zwischen letztem Cursor und Cutoff – kein Summarize-Call
-      // (maxId bleibt lastCursor)
+      console.debug("[SUMMARY] No new rows since last cursor/cutoff.");
     }
 
-    // Kontext neu aufbauen:
-    //   System (Persona+Instructions) +
-    //   letzte 5 Summaries (ASC) +
-    //   alle Nachrichten >= Cutoff
+    // Neuen Chat-Kontext aufbauen: System + letzte 5 Summaries (ASC) + alle Messages >= Cutoff
     const [desc] = await db.execute(
-      `SELECT timestamp, summary
-         FROM summaries
-        WHERE channel_id = ?
-        ORDER BY id DESC
-        LIMIT 5`,
+      `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
       [this.channelId]
     );
     const asc = (desc || []).slice().reverse();
@@ -266,6 +266,7 @@ Do NOT invent events. Prefer clear bullet points when suitable.`;
     this.isSummarizing = false;
   }
 }
+
 
 
   async getLastSummaries(limit = 5) {
