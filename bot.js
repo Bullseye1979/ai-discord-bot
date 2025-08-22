@@ -93,8 +93,6 @@ client.on("messageCreate", async (message) => {
   const baseChannelId = message.channelId;
   const channelMeta = getChannelConfig(baseChannelId);
   if (!channelMeta) return;
-
-  const key = `channel:${baseChannelId}`;
   const key = `channel:${baseChannelId}`;
   const signature = metaSig(channelMeta);
 
