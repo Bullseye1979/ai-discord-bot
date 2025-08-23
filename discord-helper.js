@@ -269,12 +269,31 @@ async function setMessageReaction(message, emoji) {
   }
 }
 
-async function postSummariesIndividually(channel, summaries, _leftover) {
-  for (let i = 0; i < summaries.length; i++) {
-    const header = `**Summary ${i + 1}/${summaries.length}**`;
-    await sendChunked(channel, `${header}\n\n${summaries[i]}`);
+// discord-helper.js
+async function setMessageReaction(message, emoji) {
+  const STATUS = ["⏳", "✅", "❌"];
+  try {
+    const me = message.client?.user;
+    if (!me) return;
+
+    // Alle bisherigen Status-Reaktionen des BOTS entfernen
+    const toRemove = message.reactions?.cache?.filter(r => STATUS.includes(r.emoji?.name)) || [];
+    for (const r of toRemove.values()) {
+      try {
+        // Nur unsere eigene Reaktion entfernen – dafür braucht der Bot keine ManageMessages
+        await r.users.remove(me.id);
+      } catch {}
+    }
+
+    // Neue gewünschte Reaktion setzen (falls angegeben)
+    if (emoji && STATUS.includes(emoji)) {
+      await message.react(emoji).catch(() => {});
+    }
+  } catch (e) {
+    console.warn("[setMessageReaction] failed:", e?.message || e);
   }
 }
+
 
 // ---------- Webhook Reply ----------
 // ---------- Webhook Reply (Avatar = aus Persona generiert) ----------

@@ -36,7 +36,8 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
   state.isAIProcessing++;
   try {
-    await message.react("⏳");
+    await setMessageReaction(message, "⏳");
+
 
     const channelMeta = getChannelConfig(message.channelId);
     if (!channelMeta) {
