@@ -39,13 +39,6 @@ const activeRecordings = new Map();        // Platzhalter falls Recording reakti
 
 const crypto = require("crypto");
 
-client.once("ready", () => {
-  setBotPresence(client, "✅ Started", "online");
-  // ⬇️ Cron-Jobs für alle Channel-Configs mit crontab laden
-  initCron(contextStorage);
-});
-
-
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
     persona: m.persona || "",
@@ -140,10 +133,11 @@ client.on("messageCreate", async (message) => {
 
   if (isCommand) {
     // 1) Commands nur, wenn es für diesen Channel eine explizite Config-Datei gibt
-    if (!channelMeta.hasConfig) {
-      await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
-      return;
-    }
+    // NEU
+if (!channelHasExplicitConfig(baseChannelId)) {
+  await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
+  return;
+}
 
     // 2) Nur Admins aus der Channel-Config dürfen Commands
     if (!isChannelAdmin(channelMeta, message.author.id)) {
