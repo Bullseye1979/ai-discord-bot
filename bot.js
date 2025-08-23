@@ -37,6 +37,8 @@ const client = new Client({
 const contextStorage = new Map();
 const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS/Transcripts)
 const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
+const ttsGate = new Map(); // channelId -> boolean
+
 
 const crypto = require("crypto");
 
@@ -153,8 +155,7 @@ if (isCommand) {
 {
   const authorId = String(message.author?.id || "");
   const lower = rawText.toLowerCase();
-  const baseChannelId = message.channelId; // <- wichtig
-
+  
   if (lower.startsWith("+consent_chat")) {
     await setChatConsent(authorId, baseChannelId, true);
     await message.channel.send("✅ Chat consent saved for this channel.");
@@ -203,7 +204,6 @@ if ((message.content || "").startsWith("!reload-cron")) {
 
   // !purge-db: Channel-Einträge in beiden Tabellen löschen (Admin / ManageGuild)
   if ((message.content || "").startsWith("!purge-db")) {
-    const member = message.member;
     try {
       const res = await chatContext.purgeChannelData();
       await message.channel.send(
@@ -387,22 +387,31 @@ if (isTranscriptPost) {
 
 
 // 3) TTS nur für AI-Antworten, aber NICHT für Summaries/Transkripte
+// 3) TTS nur für AI-Antworten – UND nur dann, wenn die auslösende Anfrage via Voice kam
 try {
   const looksLikeSummary =
     /\*\*Summary\b/i.test(message.content || "") ||
     /\bSummary (in progress|completed)/i.test(message.content || "");
+
   if (!isTranscriptPost && !looksLikeSummary) {
-    await setTTS(message, client, guildTextChannels);
+    // Wurde für diesen Channel TTS explizit durch Voice-Request erlaubt?
+    const okToSpeak = ttsGate.get(message.channel.id) === true;
+
+    if (okToSpeak) {
+      await setTTS(message, client, guildTextChannels);
+      // Nach einer (erfolgreichen) Antwort wieder zurücksetzen
+      ttsGate.set(message.channel.id, false);
+    }
   }
 } catch (e) {
   console.warn("[TTS] call failed:", e?.message || e);
 }
 
+
 // 4) Trigger-Check
 let contentRaw = message.content || "";
 let speakerForProxy = null;
 const authorId = String(message.author?.id || "");
-const baseChannelId = message.channelId; // gleiche channelId wie oben verwenden
 
 if (isTranscriptPost) {
   contentRaw = (message.content || "").trim();
@@ -423,6 +432,8 @@ const isTrigger =
 
 if (!isTrigger) return;
 
+// Nur sprechen, wenn die Anfrage per Voice/Transkript kam
+ttsGate.set(message.channel.id, isTranscriptPost === true);
 
 // 5) An KI weitergeben – Proxy macht aus Transkriptpost eine "echte" User-Nachricht
 const state = { isAIProcessing: 0 };
