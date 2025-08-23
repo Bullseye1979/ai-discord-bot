@@ -182,6 +182,22 @@ if (isCommand) {
 
   // ---------------- Commands (vor Logging!) ----------------
 
+
+// !clear-channel / !purge-channel: löscht alle NICHT gepinnten Nachrichten im aktuellen Channel
+if (rawText.startsWith("!clear-channel") || rawText.startsWith("!purge-channel")) {
+  try {
+    await deleteAllMessages(message.channel);
+    // Bestätigung NACH dem Leeren posten (bleibt als einzige Nachricht stehen)
+    await message.channel.send("🧹 Channel cleared.");
+  } catch (e) {
+    console.error("[!clear-channel] deleteAllMessages error:", e?.message || e);
+    await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
+  }
+  return;
+}
+
+
+
   // !context: nur anzeigen, NICHT loggen
   if ((message.content || "").startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();

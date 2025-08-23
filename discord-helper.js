@@ -261,6 +261,18 @@ async function sendChunked(channel, content) {
   }
 }
 
+// Nach sendChunked(...)
+async function postSummariesIndividually(channel, summaries, headerPrefix = null) {
+  for (let i = 0; i < summaries.length; i++) {
+    const header =
+      headerPrefix
+        ? `${headerPrefix} ${i + 1}/${summaries.length}`
+        : `**Summary ${i + 1}/${summaries.length}**`;
+    await sendChunked(channel, `${header}\n\n${summaries[i]}`);
+  }
+}
+
+
 async function setMessageReaction(message, emoji) {
   try { 
     await message.react(emoji);
@@ -700,6 +712,7 @@ module.exports = {
   getSpeech,
   resetTTSPlayer,
   resetRecordingFlag, 
+  postSummariesIndividually,
   sendTranscriptViaWebhook,
 
 };

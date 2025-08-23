@@ -1,4 +1,4 @@
-// scheduler.js — v2.0
+// scheduler.js — v2.1
 // Der Scheduler postet nur "!summarize" in Kanäle mit gültiger crontab.
 
 const fs = require("fs");
@@ -11,6 +11,22 @@ const jobs = new Map();
 function isValidCrontab(expr) {
   try { return typeof expr === "string" && cron.validate(expr); }
   catch { return false; }
+}
+
+function scheduleSummarize(client, channelId, expr, timezone) {
+  // node-cron akzeptiert timezone als IANA-TZ, z.B. "Europe/Berlin"
+  const opts = {};
+  if (timezone && typeof timezone === "string") opts.timezone = timezone;
+
+  return cron.schedule(expr, async () => {
+    try {
+      const chan = await client.channels.fetch(channelId).catch(() => null);
+      if (!chan?.isTextBased?.()) return;
+      await chan.send("!summarize");
+    } catch (e) {
+      console.error(`[scheduler] failed to trigger !summarize for ${channelId}:`, e?.message || e);
+    }
+  }, opts);
 }
 
 function initCron(client, _contextStorage) {
@@ -30,6 +46,8 @@ function initCron(client, _contextStorage) {
 
     for (const file of files) {
       const channelId = path.basename(file, ".json");
+      if (channelId === "default") continue; // <— default.json nie schedulen
+
       let cfg = null;
       try {
         cfg = JSON.parse(fs.readFileSync(path.join(cfgDir, file), "utf8"));
@@ -46,15 +64,9 @@ function initCron(client, _contextStorage) {
       const expr = cfg?.crontab;
       if (!isValidCrontab(expr)) continue;
 
-      const task = cron.schedule(expr, async () => {
-        try {
-          const chan = await client.channels.fetch(channelId).catch(() => null);
-          if (!chan?.isTextBased?.()) return;
-          await chan.send("!summarize");
-        } catch (e) {
-          console.error(`[scheduler] failed to trigger !summarize for ${channelId}:`, e?.message || e);
-        }
-      });
+      const timezone = cfg?.timezone || meta?.timezone; // <— TZ aus Config erlauben
+      const task = scheduleSummarize(client, channelId, expr, timezone);
+
       jobs.set(channelId, task);
       scheduled++;
     }
@@ -70,7 +82,7 @@ async function reloadCronForChannel(client, _contextStorage, channelId) {
   if (old) { try { old.stop(); } catch {} jobs.delete(channelId); }
 
   const file = path.join(__dirname, "channel-config", `${channelId}.json`);
-  if (!fs.existsSync(file)) return false;
+  if (!fs.existsSync(file) || channelId === "default") return false;
 
   let cfg = null;
   try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); }
@@ -82,15 +94,9 @@ async function reloadCronForChannel(client, _contextStorage, channelId) {
   const expr = cfg?.crontab;
   if (!isValidCrontab(expr)) return false;
 
-  const task = cron.schedule(expr, async () => {
-    try {
-      const chan = await client.channels.fetch(channelId).catch(() => null);
-      if (!chan?.isTextBased?.()) return;
-      await chan.send("!summarize");
-    } catch (e) {
-      console.error(`[scheduler] failed to trigger !summarize for ${channelId}:`, e?.message || e);
-    }
-  });
+  const timezone = cfg?.timezone || meta?.timezone; // <— TZ auch hier
+  const task = scheduleSummarize(client, channelId, expr, timezone);
+
   jobs.set(channelId, task);
   return true;
 }
