@@ -1,103 +1,152 @@
-// scheduler.js — Auto-Summary per Channel via crontab
+// scheduler.js — v1.0
+// Lädt crontab aus channel-config/<channelId>.json und führt auto-summarize aus.
+// Nach erfolgreicher Summary: Kanal leeren, 5 neueste Summaries posten, Cursor bump.
+
 const fs = require("fs");
 const path = require("path");
 const cron = require("node-cron");
-const Context = require("./context.js");
-const { getChannelConfig } = require("./discord-helper.js");
+const {
+  getChannelConfig,
+  postSummariesIndividually,
+} = require("./discord-helper.js");
 
-const jobs = new Map(); // channelId -> cron task
-
-function listChannelConfigIds() {
-  const dir = path.join(__dirname, "channel-config");
-  if (!fs.existsSync(dir)) return [];
-  const files = fs.readdirSync(dir).filter(f => f.endsWith(".json") && f !== "default.json");
-  return files.map(f => path.basename(f, ".json"));
-}
-
-function ensureContextForChannel(channelId, contextStorage, channelMeta) {
-  const key = `channel:${channelId}`;
-  if (!contextStorage.has(key)) {
-    const ctx = new Context(
-      channelMeta.persona,
-      channelMeta.instructions,
-      channelMeta.tools,
-      channelMeta.toolRegistry,
-      channelId
-    );
-    contextStorage.set(key, ctx);
-  }
-  return contextStorage.get(key);
-}
-
-async function runSummaryOnce(channelId, contextStorage) {
+// Wir benutzen deleteAllMessages und bumpCursor über chatContext + helper-Funktion in bot.js.
+// deleteAllMessages ist dort implementiert; wir re-implementieren eine sichere Variante hier:
+async function deleteAllMessagesSafe(channel) {
   try {
-    const meta = getChannelConfig(channelId);
-    // Nur wenn es eine echte Config und eine crontab gab – (Aufruf ist trotzdem idempotent)
-    if (!meta?.hasConfig || !meta?.crontab) return;
-
-    const chatContext = ensureContextForChannel(channelId, contextStorage, meta);
-    const cutoffMs = Date.now();
-
-    // Nur zusammenfassen – keine Channel-Löschungen/Posts (still).
-    await chatContext.summarizeSince(cutoffMs, meta.summaryPrompt || null);
-
-    // Optional: Cursor bumpen (summarizeSince setzt sowieso, aber schadet nicht)
-    await chatContext.bumpCursorToCurrentMax();
-
-    console.log(`[CRON] Summarized channel ${channelId} at ${new Date().toISOString()}`);
+    const me = channel.guild.members.me;
+    const perms = channel.permissionsFor(me);
+    if (!perms?.has("ManageMessages") || !perms?.has("ReadMessageHistory")) {
+      throw new Error("Missing ManageMessages/ReadMessageHistory");
+    }
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    let beforeId = null;
+    while (true) {
+      const fetched = await channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
+      if (!fetched || fetched.size === 0) break;
+      for (const msg of fetched.values()) {
+        if (msg.pinned) continue;
+        try { await msg.delete(); } catch {}
+        await sleep(120);
+      }
+      const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
+      if (!oldest) break;
+      beforeId = oldest.id;
+    }
+    return true;
   } catch (e) {
-    console.error("[CRON] runSummaryOnce failed:", e?.message || e);
-  }
-}
-
-function scheduleForChannel(channelId, contextStorage) {
-  unscheduleForChannel(channelId); // erst alte stoppen
-
-  const meta = getChannelConfig(channelId);
-  if (!meta?.hasConfig || !meta?.crontab) {
-    return false; // nichts zu tun
-  }
-
-  // Validierung durch node-cron (throws bei invalid)
-  const task = cron.schedule(meta.crontab, () => runSummaryOnce(channelId, contextStorage), {
-    timezone: "UTC" // optional: stell das auf deine gewünschte TZ
-  });
-
-  jobs.set(channelId, task);
-  console.log(`[CRON] Scheduled channel ${channelId} -> ${meta.crontab}`);
-  return true;
-}
-
-function unscheduleForChannel(channelId) {
-  const t = jobs.get(channelId);
-  if (t) {
-    try { t.stop(); } catch {}
-    jobs.delete(channelId);
-    console.log(`[CRON] Unscheduled channel ${channelId}`);
-  }
-}
-
-function initCron(contextStorage) {
-  const ids = listChannelConfigIds();
-  for (const id of ids) {
-    try { scheduleForChannel(id, contextStorage); }
-    catch (e) { console.error(`[CRON] Failed scheduling ${id}:`, e?.message || e); }
-  }
-}
-
-function reloadCronForChannel(channelId, contextStorage) {
-  try {
-    const ok = scheduleForChannel(channelId, contextStorage);
-    if (!ok) console.log(`[CRON] No crontab for ${channelId} (or no config).`);
-    return ok;
-  } catch (e) {
-    console.error(`[CRON] reload failed for ${channelId}:`, e?.message || e);
+    console.warn("[scheduler] deleteAllMessagesSafe:", e?.message || e);
     return false;
   }
 }
 
-module.exports = {
-  initCron,
-  reloadCronForChannel,
-  runSummaryOnce,
-};
+const JOBS = new Map(); // channelId -> cron task
+
+function readAllChannelConfigs() {
+  const dir = path.join(__dirname, "channel-config");
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter(f => f.endsWith(".json"))
+    .map(f => f.replace(/\.json$/,""));
+}
+
+function scheduleOne(client, contextStorage, channelId) {
+  const meta = getChannelConfig(channelId);
+  // Nur wenn: echte Config-Datei + summariesEnabled + crontab vorhanden
+  if (!meta?.hasConfig || !meta?.summariesEnabled) return false;
+
+  const crontab = String(meta.crontab || "").trim();
+  if (!crontab) return false;
+
+  const tz = meta.crontab_tz || undefined;
+
+  // Bereits existierenden Job stoppen
+  if (JOBS.has(channelId)) {
+    try { JOBS.get(channelId).stop(); } catch {}
+    JOBS.delete(channelId);
+  }
+
+  const task = cron.schedule(crontab, async () => {
+    try {
+      // Channel abrufen
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased?.()) return;
+
+      // Context beschaffen/erzeugen wie in bot.js
+      const key = `channel:${channelId}`;
+      if (!contextStorage.has(key)) {
+        const Context = require("./context.js");
+        const ctx = new Context(meta.persona, meta.instructions, meta.tools, meta.toolRegistry, channelId);
+        contextStorage.set(key, { ctx, sig: "cron" });
+      }
+      const chatContext = contextStorage.get(key).ctx;
+
+      // Vorher/Nachher zum Erkennen, ob neue Summary entstanden ist
+      const before = await chatContext.getLastSummaries(1).catch(() => []);
+      await chatContext.summarizeSince(Date.now(), meta.summaryPrompt || meta.summary_prompt || null);
+      const after = await chatContext.getLastSummaries(1).catch(() => []);
+
+      const createdNew =
+        (before.length === 0 && after.length > 0) ||
+        (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
+
+      if (!createdNew) {
+        // Nichts Neues -> nur Loggen, keine UI-Aktionen
+        console.log(`[scheduler] No new messages to summarize for channel ${channelId}`);
+        return;
+      }
+
+      // Kanal leeren
+      const cleared = await deleteAllMessagesSafe(channel);
+      if (!cleared) {
+        await channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
+      }
+
+      // 5 Summaries posten
+      const last5Desc = await chatContext.getLastSummaries(5);
+      const summariesAsc =
+        (last5Desc || [])
+          .slice()
+          .reverse()
+          .map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
+
+      if (summariesAsc.length === 0) {
+        await channel.send("No summaries available yet.");
+      } else {
+        await postSummariesIndividually(channel, summariesAsc, null);
+      }
+
+      // Cursor bumpen
+      await chatContext.bumpCursorToCurrentMax().catch(() => {});
+      console.log(`[scheduler] Summarized channel ${channelId}`);
+
+    } catch (e) {
+      console.error("[scheduler] job error:", e?.message || e);
+    }
+  }, { timezone: tz });
+
+  JOBS.set(channelId, task);
+  task.start();
+  return true;
+}
+
+// Public API
+function initCron(client, contextStorage) {
+  // alle existierenden Jobs stoppen
+  for (const t of JOBS.values()) { try { t.stop(); } catch {} }
+  JOBS.clear();
+
+  const ids = readAllChannelConfigs();
+  let count = 0;
+  for (const id of ids) {
+    if (scheduleOne(client, contextStorage, id)) count++;
+  }
+  console.log(`[scheduler] Scheduled ${count} channels with crontab`);
+}
+
+async function reloadCronForChannel(client, contextStorage, channelId) {
+  const ok = scheduleOne(client, contextStorage, channelId);
+  return !!ok;
+}
+
+module.exports = { initCron, reloadCronForChannel };

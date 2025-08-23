@@ -165,6 +165,19 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  // !reload-cron: Crontab dieses Channels neu laden
+if ((message.content || "").startsWith("!reload-cron")) {
+  try {
+    const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
+    await message.channel.send(ok ? "🔁 Cron reloaded for this channel." : "⚠️ No crontab defined for this channel.");
+  } catch (e) {
+    console.error("[!reload-cron] failed:", e?.message || e);
+    await message.channel.send("❌ Failed to reload cron for this channel.");
+  }
+  return;
+}
+
+
   // !purge-db: Channel-Einträge in beiden Tabellen löschen (Admin / ManageGuild)
   if ((message.content || "").startsWith("!purge-db")) {
     const member = message.member;
@@ -415,7 +428,11 @@ return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.mod
 (async () => {
   client.login(process.env.DISCORD_TOKEN);
 })();
-client.once("ready", () => setBotPresence(client, "✅ Started", "online"));
+client.once("ready", () => {
+  setBotPresence(client, "✅ Started", "online");
+  // Client mitgeben!
+  initCron(client, contextStorage);
+});
 
 // HTTP /documents (optional)
 const expressApp = express();
