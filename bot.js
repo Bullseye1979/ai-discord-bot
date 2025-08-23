@@ -39,15 +39,6 @@ const activeRecordings = new Map();        // Platzhalter falls Recording reakti
 
 const crypto = require("crypto");
 
-// Gibt true zurück, wenn es eine channel-config/<CHANNEL_ID>.json gibt
-function channelHasExplicitConfig(channelId) {
-  try {
-    return fs.existsSync(path.join(__dirname, "channel-config", `${channelId}.json`));
-  } catch {
-    return false;
-  }
-}
-
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
     persona: m.persona || "",
@@ -59,9 +50,6 @@ function metaSig(m) {
   })).digest("hex");
 }
 
-function channelHasExplicitConfig(channelId) {
-  return fs.existsSync(path.join(__dirname, "channel-config", `${channelId}.json`));
-}
 
 function isChannelAdmin(channelMeta, userId) {
   const ids = Array.isArray(channelMeta.admins) ? channelMeta.admins.map(String) : [];

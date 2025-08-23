@@ -163,21 +163,20 @@ function getChannelConfig(channelId) {
   const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
   const def = getDefaultPersona();
 
-  let {
-    persona = def.persona,
-    instructions = def.instructions,
-    voice = def.voice,
-    name = def.name,
-    botname = def.botname,
-    selectedTools = def.selectedTools,
-    blocks = def.blocks,
-    summaryPrompt = def.summaryPrompt
-  } = def;
+  // Defaults
+  let persona       = def.persona;
+  let instructions  = def.instructions;
+  let voice         = def.voice;
+  let name          = def.name;
+  let botname       = def.botname;
+  let selectedTools = def.selectedTools;
+  let blocks        = def.blocks;
+  let summaryPrompt = def.summaryPrompt;
+  let admins        = Array.isArray(def.admins) ? def.admins : [];
 
-  // ⬇️ NEU
-  let crontab = null;
+  const hasConfigFile = fs.existsSync(configPath);
 
-  if (fs.existsSync(configPath)) {
+  if (hasConfigFile) {
     try {
       const raw = fs.readFileSync(configPath, "utf8");
       const cfg = JSON.parse(raw);
@@ -192,10 +191,8 @@ function getChannelConfig(channelId) {
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
-      // ⬇️ NEU: Crontab (als String, z.B. "0 23 * * 1")
-      if (typeof cfg.crontab === "string" && cfg.crontab.trim()) {
-        crontab = cfg.crontab.trim();
-      }
+      // WICHTIG: Admins sauber übernehmen (nicht def.admins mutieren)
+      if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -208,7 +205,7 @@ function getChannelConfig(channelId) {
     ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
     : `https://ralfreschke.de/documents/avatars/default.png`;
 
-  const hasConfigFile = fs.existsSync(configPath);
+  const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
 
   return {
     name,
@@ -221,10 +218,12 @@ function getChannelConfig(channelId) {
     toolRegistry,
     blocks,
     summaryPrompt,
-    hasConfig: hasConfigFile,
-    crontab,                     // ⬅️ NEU
+    hasConfig: hasConfigFile,       // <- DARAUF prüft dein bot.js
+    summariesEnabled,               // <- nutzt Scheduler
+    admins                          // <- von oben, nicht aus def
   };
 }
+
 // ---------- Chunking & Senden ----------
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
