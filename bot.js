@@ -8,6 +8,7 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
+const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
 const { initCron, reloadCronForChannel } = require("./scheduler.js");
 const Context = require("./context.js");
 const {
@@ -148,6 +149,32 @@ if (isCommand) {
 }
 
 
+// ---------------- Consent Short-Commands (+consent_…) ----------------
+{
+  const authorId = String(message.author?.id || "");
+  const lower = rawText.toLowerCase();
+
+  if (lower.startsWith("+consent_chat")) {
+    await setChatConsent(authorId, true);
+    await message.channel.send("✅ Chat consent saved. Your typed messages can now be logged and processed.");
+    return;
+  }
+  if (lower.startsWith("+withdrawl_chat")) {
+    await setChatConsent(authorId, false);
+    await message.channel.send("✅ Chat consent withdrawn. Your typed messages will not be logged or processed.");
+    return;
+  }
+  if (lower.startsWith("+consent_voice")) {
+    await setVoiceConsent(authorId, true);
+    await message.channel.send("✅ Voice consent saved. Your speech can be transcribed and may trigger actions.");
+    return;
+  }
+  if (lower.startsWith("+withdrawl_voice")) {
+    await setVoiceConsent(authorId, false);
+    await message.channel.send("✅ Voice consent withdrawn. Your speech will not be recorded or transcribed.");
+    return;
+  }
+}
 
 
 
@@ -339,17 +366,24 @@ if (isWebhook) {
 const isTranscriptPost = isWebhook && !isAIWebhook; // alles andere als unser AI-Webhook
 
 // 2) In den Kontext schreiben
+// 2) In den Kontext schreiben
 if (isTranscriptPost) {
   // Transkript als User-Message (Sprechername = Webhook-Username)
   const speaker = message.author?.username || "Unknown";
   const text = (message.content || "").trim();
   if (text) await chatContext.add("user", speaker, text);
 } else if (!message.author?.bot && !message.webhookId) {
-  // echte User-Texte loggen
-  await setAddUserMessage(message, chatContext);
+  // getippte User-Texte NUR mit Chat-Consent loggen
+  const authorId = String(message.author?.id || "");
+  if (await hasChatConsent(authorId)) {
+    await setAddUserMessage(message, chatContext);
+  } else {
+    // ohne Chat-Consent: nicht loggen
+  }
 } else {
   // sonst ignorieren (z.B. AI-Summaries, Systemposts)
 }
+
 
 // 3) TTS nur für AI-Antworten, aber NICHT für Summaries/Transkripte
 try {
@@ -366,10 +400,14 @@ try {
 // 4) Trigger-Check
 let contentRaw = message.content || "";
 let speakerForProxy = null;
+const authorId = String(message.author?.id || "");
 
 if (isTranscriptPost) {
   contentRaw = (message.content || "").trim();
   speakerForProxy = message.author?.username || null;
+} else {
+  // Getippte Nachrichten dürfen nur mit Chat-Consent triggern
+  if (!(await hasChatConsent(authorId))) return;
 }
 
 const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
@@ -381,6 +419,7 @@ const isTrigger =
   (isTranscriptPost && norm.includes(triggerName)); // bei Voice reicht Erwähnung irgendwo
 
 if (!isTrigger) return;
+
 
 // 5) An KI weitergeben – Proxy macht aus Transkriptpost eine "echte" User-Nachricht
 const state = { isAIProcessing: 0 };

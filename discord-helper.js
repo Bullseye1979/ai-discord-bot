@@ -7,6 +7,7 @@ const path = require("path");
 const { tools, getToolRegistry } = require("./tools.js");
 const { EndBehaviorType, createAudioResource, StreamType } = require("@discordjs/voice");
 const { PassThrough } = require("stream");
+const { hasVoiceConsent } = require("./consent.js");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const axios = require("axios");
@@ -462,15 +463,12 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
   try {
     if (!connection || !guildId) return;
 
-    // If recorder already exists on a different connection, clear its listeners and rebind
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
     }
-    // Store the current connection as the active one
     activeRecordings.set(guildId, connection);
 
-    // Helper: always fetch the latest target text-channel from the shared Map
     const getLatestTarget = async () => {
       const latestId = guildTextChannels.get(guildId);
       if (latestId) {
@@ -483,9 +481,12 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     const receiver = connection.receiver;
     if (!receiver) return;
 
-    receiver.speaking.removeAllListeners("start"); // avoid duplicate listeners
-    receiver.speaking.on("start", (userId) => {
+    receiver.speaking.removeAllListeners("start");
+    receiver.speaking.on("start", async (userId) => {
       try {
+        // 🔐 Ohne Voice-Consent keine Aufnahme/Transkription
+        if (!(await hasVoiceConsent(String(userId)))) return;
+
         const opus = receiver.subscribe(userId, {
           end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
         });
@@ -497,8 +498,10 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
         pcm.on("data", (chunk) => pass.write(chunk));
         pcm.on("end", async () => {
           pass.end();
+          let dir;
           try {
-            const { dir, file } = await wavPromise;
+            const { dir: _dir, file } = await wavPromise;
+            dir = _dir;
 
             const st = await fs.promises.stat(file).catch(() => null);
             if (!st || st.size < 48000) { // ~0.5s mono @ 48kHz
@@ -516,7 +519,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
                 avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
               } catch {}
 
-              // 🔁 DYNAMIC TARGET: read the **current** posting channel each time
               const latestTarget = await getLatestTarget();
               if (latestTarget) {
                 await sendTranscriptViaWebhook(latestTarget, text.trim(), speaker, avatarURL);
@@ -525,10 +527,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
           } catch (err) {
             console.warn("[Transcription] failed:", err?.message || err);
           } finally {
-            try {
-              const { dir } = await wavPromise;
-              await fs.promises.rm(dir, { recursive: true, force: true });
-            } catch {}
+            try { if (dir) await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
           }
         });
 
@@ -541,7 +540,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
       }
     });
 
-    // Clean up only if the connection that dies is the current one
     connection.on("stateChange", (oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
         if (activeRecordings.get(guildId) === connection) {
