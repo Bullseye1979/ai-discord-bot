@@ -124,6 +124,39 @@ if (isSpeakerMsg) {
       }
     } catch {}
 
+
+
+    // --- [PATCH] Bild-Uploads automatisch in den Prompt aufnehmen ---
+const imageUrls = [];
+try {
+  // Nur bei normalen User-Posts (nicht bei Webhooks/Transkripten)
+  if (!message.webhookId && message.attachments?.size > 0) {
+    for (const att of message.attachments.values()) {
+      const ct = (att.contentType || att.content_type || "").toLowerCase();
+      const isImageCT  = ct.startsWith("image/");
+      const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
+      if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
+    }
+  }
+} catch {}
+
+if (imageUrls.length) {
+  const hasGetImageTool =
+    Array.isArray(chatContext.tools) &&
+    chatContext.tools.some(t => (t.function?.name || t.name) === "getImage");
+
+  const hint =
+    "\n\n[IMAGE UPLOAD]\n" +
+    imageUrls.map(u => `- ${u}`).join("\n") +
+    "\nAufgabe: Was ist auf diesem Bild zu sehen?" +
+    (hasGetImageTool ? " Nutze dafür das Tool `getImage`." : "");
+
+  // _instrBackup ist in deinem Code bereits vorher gesetzt
+  chatContext.instructions = (chatContext.instructions || "") + hint;
+}
+
+
+
     const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
 
     if (output && output.trim()) {
@@ -209,7 +242,7 @@ if (!gate || gate < Date.now()) {
   return; // keine Freigabe → still bleiben
 }
 
-  
+
 
   // Muss im selben Guild-Textkanal sein, in dem der Bot gerade "hängt"
   const guildId = message.guild.id;
