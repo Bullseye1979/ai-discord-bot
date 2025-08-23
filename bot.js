@@ -402,13 +402,15 @@ try {
 let contentRaw = message.content || "";
 let speakerForProxy = null;
 const authorId = String(message.author?.id || "");
+const baseChannelId = message.channelId; // gleiche channelId wie oben verwenden
 
 if (isTranscriptPost) {
   contentRaw = (message.content || "").trim();
   speakerForProxy = message.author?.username || null;
 } else {
   // Getippte Nachrichten dürfen nur mit Chat-Consent triggern
-  if (!(await hasChatConsent(authorId))) return;
+  const ok = await hasChatConsent(authorId, baseChannelId);
+  if (!ok) return;
 }
 
 const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
