@@ -33,7 +33,7 @@ async function getImage(toolFunction /*, handoverContext, getAIResponse, runtime
       ctx.add("user", userId, `Original image description: "${rawPrompt}"`);
 
       // 3.5 ist oft abgeschaltet → nimm was stabiles/schnelles
-      const gptResponse = await getAI(ctx, 400, "gpt-4o-mini");
+      const gptResponse = await getAI(ctx, 400, "gpt-3.5-turbo");
       const candidate = (gptResponse || "").trim();
       if (candidate) improvedPrompt = candidate;
     } catch {

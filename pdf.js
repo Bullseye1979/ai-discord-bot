@@ -201,7 +201,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
         });
 
         await browser.close();
-        return getPlainFromHTML(htmlWithImages,2000) + `\n\nPDF path: https://ralfreschke.de/documents/${fileName}.pdf` + "\n\n###Images:### \n"+imagelist;
+        return getPlainFromHTML(htmlWithImages,2000) + `\n\nPDF path: https://xbullseyegaming.de/documents/${fileName}.pdf` + "\n\n###Images:### \n"+imagelist;
 
     } catch (err) {
         console.error("[ERROR]: ", err);
