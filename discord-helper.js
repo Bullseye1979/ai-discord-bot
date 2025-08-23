@@ -695,7 +695,6 @@ module.exports = {
   setAddUserMessage,
   sendChunked,
   setBotPresence,
-  postSummariesIndividually,
   getOrCreateRelayWebhookFor,
   setStartListening,
   getSpeech,
