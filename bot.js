@@ -153,25 +153,26 @@ if (isCommand) {
 {
   const authorId = String(message.author?.id || "");
   const lower = rawText.toLowerCase();
+  const baseChannelId = message.channelId; // <- wichtig
 
   if (lower.startsWith("+consent_chat")) {
-    await setChatConsent(authorId, true);
-    await message.channel.send("✅ Chat consent saved. Your typed messages can now be logged and processed.");
+    await setChatConsent(authorId, baseChannelId, true);
+    await message.channel.send("✅ Chat consent saved for this channel.");
     return;
   }
   if (lower.startsWith("+withdrawl_chat")) {
-    await setChatConsent(authorId, false);
-    await message.channel.send("✅ Chat consent withdrawn. Your typed messages will not be logged or processed.");
+    await setChatConsent(authorId, baseChannelId, false);
+    await message.channel.send("✅ Chat consent withdrawn for this channel.");
     return;
   }
   if (lower.startsWith("+consent_voice")) {
-    await setVoiceConsent(authorId, true);
-    await message.channel.send("✅ Voice consent saved. Your speech can be transcribed and may trigger actions.");
+    await setVoiceConsent(authorId, baseChannelId, true);
+    await message.channel.send("✅ Voice consent saved for this channel.");
     return;
   }
   if (lower.startsWith("+withdrawl_voice")) {
-    await setVoiceConsent(authorId, false);
-    await message.channel.send("✅ Voice consent withdrawn. Your speech will not be recorded or transcribed.");
+    await setVoiceConsent(authorId, baseChannelId, false);
+    await message.channel.send("✅ Voice consent withdrawn for this channel.");
     return;
   }
 }
@@ -366,23 +367,23 @@ if (isWebhook) {
 const isTranscriptPost = isWebhook && !isAIWebhook; // alles andere als unser AI-Webhook
 
 // 2) In den Kontext schreiben
-// 2) In den Kontext schreiben
 if (isTranscriptPost) {
-  // Transkript als User-Message (Sprechername = Webhook-Username)
+  // (Webhooks = Voice; Logging steuert discord-helper via Voice-Consent)
   const speaker = message.author?.username || "Unknown";
   const text = (message.content || "").trim();
   if (text) await chatContext.add("user", speaker, text);
 } else if (!message.author?.bot && !message.webhookId) {
-  // getippte User-Texte NUR mit Chat-Consent loggen
-  const authorId = String(message.author?.id || "");
-  if (await hasChatConsent(authorId)) {
+  // echte User-Texte nur mit Chat-Consent loggen
+  const ok = await hasChatConsent(message.author.id, baseChannelId);
+  if (ok) {
     await setAddUserMessage(message, chatContext);
   } else {
-    // ohne Chat-Consent: nicht loggen
+    // keine Speicherung, kein Reply-Trigger
   }
 } else {
-  // sonst ignorieren (z.B. AI-Summaries, Systemposts)
+  // sonst ignorieren
 }
+
 
 
 // 3) TTS nur für AI-Antworten, aber NICHT für Summaries/Transkripte

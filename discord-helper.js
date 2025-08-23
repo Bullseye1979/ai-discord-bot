@@ -463,12 +463,15 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
   try {
     if (!connection || !guildId) return;
 
+    // Alte Aufnahme-Listener lösen, wenn andere Verbindung aktiv war
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
     }
+    // Diese Verbindung als aktiv merken
     activeRecordings.set(guildId, connection);
 
+    // Helper: immer den aktuell konfigurierten Ziel-Textkanal aus der Map holen
     const getLatestTarget = async () => {
       const latestId = guildTextChannels.get(guildId);
       if (latestId) {
@@ -481,65 +484,83 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     const receiver = connection.receiver;
     if (!receiver) return;
 
+    // Duplikate vermeiden
     receiver.speaking.removeAllListeners("start");
-    receiver.speaking.on("start", async (userId) => {
-      try {
-        // 🔐 Ohne Voice-Consent keine Aufnahme/Transkription
-        if (!(await hasVoiceConsent(String(userId)))) return;
 
-        const opus = receiver.subscribe(userId, {
-          end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
-        });
+    receiver.speaking.on("start", (userId) => {
+      (async () => {
+        try {
+          // Aktuellen Ziel-Textkanal holen
+          const latestTarget = await getLatestTarget();
+          if (!latestTarget) return;
+          const targetChannelId = latestTarget.id;
 
-        const pcm = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
-        const pass = new PassThrough();
-        const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
+          // 🔐 Channel-basierter VOICE-Consent: ohne Consent gar nicht erst abonnieren/aufzeichnen
+          const allowed = await hasVoiceConsent(userId, targetChannelId);
+          if (!allowed) return;
 
-        pcm.on("data", (chunk) => pass.write(chunk));
-        pcm.on("end", async () => {
-          pass.end();
-          let dir;
-          try {
-            const { dir: _dir, file } = await wavPromise;
-            dir = _dir;
+          // Ab hier: Abo + Decode
+          const opus = receiver.subscribe(userId, {
+            end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
+          });
 
-            const st = await fs.promises.stat(file).catch(() => null);
-            if (!st || st.size < 48000) { // ~0.5s mono @ 48kHz
-              try { await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
-              return;
-            }
+          const pcm = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
+          const pass = new PassThrough();
+          const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
-            const text = await getTranscription(file, "whisper-1", "auto");
-            if (text && text.trim()) {
-              const speaker = await resolveSpeakerName(client, guildId, userId);
-              let avatarURL;
-              try {
-                const g = await client.guilds.fetch(guildId);
-                const m = await g.members.fetch(userId).catch(() => null);
-                avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
-              } catch {}
+          pcm.on("data", (chunk) => pass.write(chunk));
+          pcm.on("end", async () => {
+            pass.end();
+            let tmpDir = null;
+            try {
+              const { dir, file } = await wavPromise;
+              tmpDir = dir;
 
-              const latestTarget = await getLatestTarget();
-              if (latestTarget) {
+              // sehr kurze Schnipsel ignorieren
+              const st = await fs.promises.stat(file).catch(() => null);
+              if (!st || st.size < 48000) { // ~0.5s mono @ 48kHz
+                return;
+              }
+
+              // Transkribieren
+              const text = await getTranscription(file, "whisper-1", "auto");
+              if (text && text.trim()) {
+                const speaker = await resolveSpeakerName(client, guildId, userId);
+                let avatarURL;
+                try {
+                  const g = await client.guilds.fetch(guildId);
+                  const m = await g.members.fetch(userId).catch(() => null);
+                  avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
+                } catch {}
+
+                // In Zielkanal/Thread spiegeln (Webhook)
                 await sendTranscriptViaWebhook(latestTarget, text.trim(), speaker, avatarURL);
               }
+            } catch (err) {
+              console.warn("[Transcription] failed:", err?.message || err);
+            } finally {
+              // Temp-Datei/Ordner wegräumen
+              try {
+                const { dir } = await wavPromise;
+                tmpDir = tmpDir || dir;
+              } catch {}
+              if (tmpDir) {
+                try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch {}
+              }
             }
-          } catch (err) {
-            console.warn("[Transcription] failed:", err?.message || err);
-          } finally {
-            try { if (dir) await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
-          }
-        });
+          });
 
-        pcm.on("error", (e) => {
-          console.warn("[PCM stream error]:", e?.message || e);
-          try { pass.destroy(); } catch {}
-        });
-      } catch (e) {
-        console.warn("[Voice subscribe] failed:", e?.message || e);
-      }
+          pcm.on("error", (e) => {
+            console.warn("[PCM stream error]:", e?.message || e);
+            try { pass.destroy(); } catch {}
+          });
+        } catch (e) {
+          console.warn("[Voice subscribe] failed:", e?.message || e);
+        }
+      })();
     });
 
+    // Clean-up nur, wenn genau diese Verbindung endet
     connection.on("stateChange", (oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
         if (activeRecordings.get(guildId) === connection) {
