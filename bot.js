@@ -39,6 +39,15 @@ const activeRecordings = new Map();        // Platzhalter falls Recording reakti
 
 const crypto = require("crypto");
 
+// Gibt true zurück, wenn es eine channel-config/<CHANNEL_ID>.json gibt
+function channelHasExplicitConfig(channelId) {
+  try {
+    return fs.existsSync(path.join(__dirname, "channel-config", `${channelId}.json`));
+  } catch {
+    return false;
+  }
+}
+
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
     persona: m.persona || "",
@@ -88,6 +97,8 @@ async function deleteAllMessages(channel) {
   }
 }
 
+
+
 client.on("messageCreate", async (message) => {
 
   if (!message.guild) return;
@@ -128,23 +139,25 @@ client.on("messageCreate", async (message) => {
   const chatContext = contextStorage.get(key).ctx;
 
   // ---- Zentrale Command-Gates ----
-  const rawText = (message.content || "").trim();
-  const isCommand = rawText.startsWith("!");
+ // ---- Zentrale Command-Gates ----
+const rawText = (message.content || "").trim();
+const isCommand = rawText.startsWith("!");
 
-  if (isCommand) {
-    // 1) Commands nur, wenn es für diesen Channel eine explizite Config-Datei gibt
-    // NEU
-if (!channelHasExplicitConfig(baseChannelId)) {
-  await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
-  return;
-}
+// Bot selbst soll Cron-Kommandos immer ausführen dürfen:
+const selfIssued = message.author?.id === client.user?.id;
 
-    // 2) Nur Admins aus der Channel-Config dürfen Commands
-    if (!isChannelAdmin(channelMeta, message.author.id)) {
-      await message.channel.send("⛔ You are not authorized to run commands in this channel.");
-      return;
-    }
+if (isCommand) {
+  // 1) Commands nur, wenn es für diesen Channel eine explizite Config-Datei gibt
+  if (!channelMeta.hasConfig) {
+    await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
+    return;
   }
+  // 2) Admin-Check: Bot selbst darf immer; alle anderen nur wenn in admins
+  if (!selfIssued && !isChannelAdmin(channelMeta, message.author.id)) {
+    await message.channel.send("⛔ You are not authorized to run commands in this channel.");
+    return;
+  }
+}
 
 
 
