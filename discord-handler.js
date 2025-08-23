@@ -11,6 +11,22 @@ const {
 const { getAIResponse } = require("./aiCore.js");
 const { getToolRegistry } = require("./tools.js");
 
+
+    // ---- TTS Gate: nur sprechen, wenn Voice der Auslöser war ----
+const ttsGate = new Map(); // channelId -> expiresAt (ms since epoch)
+const TTS_TTL_MS = 15000;  // 15s reichen i.d.R. für alle Reply-Chunks
+
+function markTTSAllowedForChannel(channelId, ttlMs = TTS_TTL_MS) {
+  if (!channelId) return;
+  const expires = Date.now() + ttlMs;
+  ttsGate.set(String(channelId), expires);
+  // Auto-Cleanup
+  setTimeout(() => {
+    const cur = ttsGate.get(String(channelId));
+    if (cur && cur <= Date.now()) ttsGate.delete(String(channelId));
+  }, ttlMs + 1000);
+}
+
 // Run an AI request
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
   if (state.isAIProcessing >= 3) {
@@ -33,6 +49,16 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     // Transkript/Webhook? -> NUR speaker prüfen
     const isSpeakerMsg = !!message.webhookId;
+
+    // Effektive Channel-ID wie in setTTS (Threads → Parent)
+const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+
+// Nur wenn Voice/Transkript der Auslöser war → TTS erlauben (zeitlich begrenzt)
+if (isSpeakerMsg) {
+  markTTSAllowedForChannel(effectiveChannelId);
+}
+
 
     // Für Speaker (Transkript) nehmen wir den (Proxy-)Namen:
     const speakerName = (message.member?.displayName || message.author?.username || "")
@@ -176,6 +202,14 @@ async function setTTS(message, client, guildTextChannels) {
     }).catch(() => false));
 
   if (!isAIWebhook) return; // Nur echte AI-Ausgaben vorlesen (keine Userposts usw.)
+
+// Nur sprechen, wenn der Kanal innerhalb der TTL freigeschaltet wurde (Voice-Auslöser)
+const gate = ttsGate.get(String(effectiveChannelId));
+if (!gate || gate < Date.now()) {
+  return; // keine Freigabe → still bleiben
+}
+
+  
 
   // Muss im selben Guild-Textkanal sein, in dem der Bot gerade "hängt"
   const guildId = message.guild.id;
