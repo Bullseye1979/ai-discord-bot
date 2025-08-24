@@ -403,14 +403,6 @@ async function postSummariesIndividually(channel, summaries, headerPrefix = null
 }
 
 
-async function setMessageReaction(message, emoji) {
-  try { 
-    await message.react(emoji);
-  } catch (e) {
-    console.warn("[setMessageReaction] failed:", e?.message || e);
-  }
-}
-
 // discord-helper.js
 async function setMessageReaction(message, emoji) {
   const STATUS = ["⏳", "✅", "❌"];
@@ -480,26 +472,6 @@ async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignori
 
 
 // ---------- Transcripts-Thread ----------
-
-
-async function getOrCreateRelayWebhookFor(parentChannel) {
-  try {
-    if (!parentChannel) return null;
-    const cacheKey = parentChannel.id; // ⬅️ renamed
-    if (transcriptWebhookCache.has(cacheKey)) return transcriptWebhookCache.get(cacheKey);
-
-    const hooks = await parentChannel.fetchWebhooks();
-    let hook = hooks.find(w => w.name === "Transcripts Relay");
-    if (!hook) {
-      hook = await parentChannel.createWebhook({ name: "Transcripts Relay" });
-    }
-    transcriptWebhookCache.set(cacheKey, hook); // ⬅️ renamed
-    return hook;
-  } catch (e) {
-    console.error("[Transcripts Relay] webhook create/fetch failed:", e?.message || e);
-    return null;
-  }
-}
 
 
 // ---------- Voice: TTS ----------
