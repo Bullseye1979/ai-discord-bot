@@ -491,19 +491,18 @@ if (isTranscriptPost) {
 */
 
 // 3) TTS nur für AI-Antworten – UND nur dann, wenn die auslösende Anfrage via Voice kam
+// 3) TTS nur für Bot-Antworten – UND nur dann, wenn Voice das Gate gesetzt hat
 try {
   const looksLikeSummary =
     /\*\*Summary\b/i.test(message.content || "") ||
     /\bSummary (in progress|completed)/i.test(message.content || "");
 
-  if (!isTranscriptPost && !looksLikeSummary) {
-    // Wurde für diesen Channel TTS explizit durch Voice-Request erlaubt?
+  const isFromBot = message.author?.id === client.user?.id; // nur Antworten des Bots
+  if (isFromBot && !looksLikeSummary) {
     const okToSpeak = ttsGate.get(message.channel.id) === true;
-
     if (okToSpeak) {
       await setTTS(message, client, guildTextChannels);
-      // Nach einer (erfolgreichen) Antwort wieder zurücksetzen
-      ttsGate.set(message.channel.id, false);
+      ttsGate.set(message.channel.id, false); // Gate schließen
     }
   }
 } catch (e) {
@@ -511,67 +510,38 @@ try {
 }
 
 
-// 4) Trigger-Check
-let contentRaw = message.content || "";
-let speakerForProxy = null;
-const authorId = String(message.author?.id || "");
 
-if (isTranscriptPost) {
-  contentRaw = (message.content || "").trim();
-  speakerForProxy = message.author?.username || null;
-} else {
-  // Getippte Nachrichten dürfen nur mit Chat-Consent triggern
-  const ok = await hasChatConsent(authorId, baseChannelId);
-  if (!ok) return;
-}
+// 4) Trigger-Check (nur getippte User-Messages; Voice triggert via Callback in !joinvc)
+if (message.author?.bot || message.webhookId) return; // keine Bots/Webhooks
+
+const authorId = String(message.author?.id || "");
+const hasConsent = await hasChatConsent(authorId, baseChannelId);
+if (!hasConsent) return;
+
+const contentRaw = (message.content || "").trim();
+const norm = contentRaw.toLowerCase();
 
 const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
-const norm = (contentRaw || "").trim().toLowerCase();
-
 const isTrigger =
   norm.startsWith(triggerName) ||
-  norm.startsWith(`!${triggerName}`) ||
-  (isTranscriptPost && norm.includes(triggerName)); // bei Voice reicht Erwähnung irgendwo
+  norm.startsWith(`!${triggerName}`);
 
 if (!isTrigger) return;
 
-// Nur sprechen, wenn die Anfrage per Voice/Transkript kam
-ttsGate.set(message.channel.id, isTranscriptPost === true);
+// getippte Nachricht ins Log (mit Anhängen etc.)
+await setAddUserMessage(message, chatContext);
 
-// 5) An KI weitergeben – Proxy macht aus Transkriptpost eine "echte" User-Nachricht
+// KI aufrufen (Typed Flow; kein Proxy nötig)
 const state = { isAIProcessing: 0 };
-const proxyMsg = new Proxy(message, {
-  get(target, prop) {
-    if (prop === "content") return contentRaw;
+return getProcessAIRequest(
+  message,
+  chatContext,
+  client,
+  state,
+  channelMeta.model,
+  channelMeta.apikey
+);
 
-    if (prop === "author") {
-      const base = Reflect.get(target, "author");
-      return {
-        ...base,
-        bot: false,
-        username: speakerForProxy || base?.username || "user",
-      };
-    }
-
-    if (prop === "member") {
-      const base = Reflect.get(target, "member");
-      if (!base) return base;
-      return new Proxy(base, {
-        get(tb, pb) {
-          if (pb === "displayName") {
-            return speakerForProxy || tb.displayName || tb?.user?.username || "user";
-          }
-          return Reflect.get(tb, pb);
-        }
-      });
-    }
-
-    return Reflect.get(target, prop);
-  }
-});
-
-return getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
-;
 
 }); // ✅ FIX 1: Handler schließen!
 
