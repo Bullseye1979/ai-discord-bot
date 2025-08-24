@@ -1,37 +1,54 @@
-// Version 1.0
+// Version 1.1 (mit DEBUG-Logs)
 // Provides basic AI services to use for the tools
-
-
-// Requirements
 
 require('dotenv').config();
 const axios = require('axios');
 const { OPENAI_API_URL } = require('./config.js');
 const fs = require("fs");
 const path = require("path");
-const FormData = require("form-data")
+const FormData = require("form-data");
 
-
-// Functions
-
-// Send a request to GPT
-
-async function getAI(context, tokenlimit = 4096, model = "gpt-4-turbo",) {
+// Send a request to GPT (einfacher Helper)
+async function getAI(context, tokenlimit = 4096, model = "gpt-4-turbo") {
     const payload = {
         model: model,
         messages: [...context.messages],
         max_tokens: tokenlimit
     };
+
+    // 🔎 DEBUG: Minimalvorschau
+    try {
+        console.log("──────────────── DEBUG:getAI → OpenAI Payload ───────────────────────");
+        console.log(JSON.stringify({
+            model,
+            max_tokens: tokenlimit,
+            messages_preview: payload.messages.map(m => ({
+                role: m.role,
+                name: m.name,
+                content: (m.content || "").slice(0, 400)
+            }))
+        }, null, 2));
+        console.log("──────────────────────────────────────────────────────────────────────");
+    } catch { /* ignore */ }
+
     const aiResponse = await axios.post(OPENAI_API_URL, payload, {
         headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
     });
+
+    try {
+        const meta = {
+            created: aiResponse.data?.created,
+            model: aiResponse.data?.model,
+            finish_reason: aiResponse.data?.choices?.[0]?.finish_reason
+        };
+        console.log("DEBUG:getAI ← OpenAI Meta:", meta);
+    } catch { /* ignore */ }
+
     const aiMessage = aiResponse.data.choices[0].message;
     return aiMessage.content || "";
 }
 
-
 // Send a request to DALL-E
-
 async function getAIImage(prompt, size = "1024x1024", model="dall-e-3") {
     const dallEResponse = await axios.post(
         "https://api.openai.com/v1/images/generations",
@@ -55,16 +72,13 @@ async function getAIImage(prompt, size = "1024x1024", model="dall-e-3") {
     return imageUrl;
 }
 
-
-
 // Send a soundfile to Whisper
-
 async function getTranscription(audioPath, model="whisper-1") {
     try {
         const fileStream = fs.createReadStream(audioPath);
         const filename = path.basename(audioPath);
         const formData = new FormData();
-        formData.append("file", fileStream, { filename, contentType: "audio/wav" }); // 🛠️ Explizit mit Name & Typ
+        formData.append("file", fileStream, { filename, contentType: "audio/wav" });
         formData.append("model", model);
         const response = await axios.post("https://api.openai.com/v1/audio/transcriptions", formData, {
             headers: {
@@ -79,9 +93,7 @@ async function getTranscription(audioPath, model="whisper-1") {
     }
 }
 
-
 // Generate an TTS audio stream
-
 async function getTTS(text,model="tts-1",voice) {
     const response = await axios.post(
         'https://api.openai.com/v1/audio/speech',
@@ -99,12 +111,10 @@ async function getTTS(text,model="tts-1",voice) {
             responseType: 'stream'
         }
     );
-    return response.data; // Das ist der Stream
+    return response.data;
 }
 
-
 // Get an image description
-
 async function getDescription(imageUrl, prompt = "Describe the image in as much detail as possible. Extract text, if there is any.", model="gpt-4o") {
     try {
         const response = await axios.post(
@@ -138,8 +148,5 @@ async function getDescription(imageUrl, prompt = "Describe the image in as much 
         return "[ERROR]: Error analyzing the image.";
     }
 }
-
-
-// Exports
 
 module.exports = { getAI, getAIImage, getTranscription, getTTS, getDescription };
