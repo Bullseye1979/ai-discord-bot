@@ -1,4 +1,6 @@
-// aiService.js — Version 1.3 (Guard gegen leere messages + sichere name-Sanitization + Debug)
+// aiService.js — v1.2 (robust + debug)
+// Provides basic AI services to use for the tools
+
 require('dotenv').config();
 const axios = require('axios');
 const { OPENAI_API_URL } = require('./config.js');
@@ -6,128 +8,92 @@ const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
 
-// ---------- shared utils ----------
-
-// Sichere Fehlerausgabe (Authorization-Header maskiert)
-function logAxiosErrorSafe(prefix, err) {
-  const msg = err?.message || String(err);
-  console.error(prefix, msg);
-  if (err.response) {
-    try {
-      const safeHeaders = { ...err.response.headers };
-      if (safeHeaders.authorization) safeHeaders.authorization = "Bearer ***";
-      const safeConfig = { ...err.response.config };
-      if (safeConfig?.headers?.Authorization) {
-        safeConfig.headers = { ...safeConfig.headers, Authorization: "Bearer ***" };
-      }
-      console.error(`${prefix} Response:`, {
-        status: err.response.status,
-        statusText: err.response.statusText,
-        headers: safeHeaders,
-        data: err.response.data,
-        config: {
-          method: safeConfig.method,
-          url: safeConfig.url
-        }
-      });
-    } catch (e) {
-      console.error(`${prefix} (while masking)`, e);
-    }
+// Small helper for safe previews in logs
+function previewMessages(messages, limit = 3, maxLen = 140) {
+  try {
+    const sliced = (messages || []).slice(0, limit).map((m) => ({
+      role: m.role,
+      // name nur zeigen, wenn vorhanden
+      ...(m.name ? { name: m.name } : {}),
+      // content kürzen für Log
+      content: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, maxLen)
+    }));
+    return JSON.stringify(sliced, null, 2);
+  } catch {
+    return "[[unavailable]]";
   }
 }
 
-// OpenAI-konforme, verlustfreie Name-Sanitization (löscht keine Messages)
-function cleanOpenAIName(role, name) {
-  if (!name) return undefined;
-  if (role === "system" || role === "tool") return undefined;
-  let s = String(name)
-    .trim()
-    .replace(/[\s<|\\/>\u0000-\u001F]/g, "_")
-    .replace(/[^A-Za-z0-9._-]/g, "_")
-    .replace(/_{2,}/g, "_")
-    .replace(/^_+|_+$/g, "");
-  s = s.slice(0, 64);
-  if (!s) return undefined;
-  const reserved = new Set(["assistant", "user", "system", "tool"]);
-  if (reserved.has(s.toLowerCase())) return undefined;
-  return s;
-}
-
-// ---------- core helpers ----------
-
-// Einfacher GPT-Call (ohne Tools)
+// --- Chat Completion (generic) ---
 async function getAI(context, tokenlimit = 4096, model = "gpt-4o") {
-  // 1) defensiv klonen + prüfen
-  const msgs = Array.isArray(context?.messages) ? [...context.messages] : [];
+  // ✅ Fallback: niemals leeres messages-Array senden
+  const safeMessages = Array.isArray(context?.messages) ? [...context.messages] : [];
 
-  if (!msgs.length) {
-    // Nichts senden – stattdessen klarer Debug + Stacktrace
-    const stack = new Error("getAI called with empty context.messages").stack;
-    console.error("[GUARD] getAI(): context.messages is empty. Caller must provide at least one message.");
-    console.error(stack);
-    // Optional: einen Mini-Preview des context-Objekts
-    try {
-      const preview = Object.fromEntries(Object.entries(context || {}).slice(0, 8));
-      console.error("[GUARD] context preview (first keys):", preview);
-    } catch (_) {}
-    // gezielt abbrechen, damit kein 400 entsteht
-    throw new Error("getAI(): empty messages – caller bug. See logs for details.");
+  if (safeMessages.length === 0) {
+    safeMessages.push({
+      role: "system",
+      content: "You are a helpful assistant. Answer briefly and clearly."
+    });
   }
-
-  // 2) Name-Sanitizing (verlustfrei)
-  const messagesToSend = msgs.map(m => {
-    const out = { role: m.role, content: m.content };
-    const safeName = cleanOpenAIName(m.role, m.name);
-    if (safeName) out.name = safeName;
-    // getAI() hat keine tool_calls – bewusst nicht übernehmen
-    return out;
-  });
 
   const payload = {
-    model: model,
-    messages: messagesToSend,
+    model,
+    messages: safeMessages,
     max_tokens: tokenlimit
   };
 
-  // DEBUG: kompakte Payload-Vorschau
+  // 🔎 Debug-Ausgabe
   try {
-    console.log("──────────────── DEBUG:getAI → OpenAI Payload ───────────────────────");
+    console.log("──────── DEBUG:getAI → OpenAI Payload ────────");
     console.log(JSON.stringify({
       model,
       max_tokens: tokenlimit,
-      messages_preview: messagesToSend.map(m => ({
-        role: m.role,
-        name: m.name,
-        content: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 400)
-      }))
+      messages_preview: JSON.parse(previewMessages(safeMessages))
     }, null, 2));
-    console.log("──────────────────────────────────────────────────────────────────────");
-  } catch { /* ignore */ }
+    console.log("──────────────────────────────────────────────");
+  } catch {
+    // ignore logging errors
+  }
 
   try {
     const aiResponse = await axios.post(OPENAI_API_URL, payload, {
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" }
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
     });
 
-    try {
-      const meta = {
-        created: aiResponse.data?.created,
-        model: aiResponse.data?.model,
-        finish_reason: aiResponse.data?.choices?.[0]?.finish_reason
-      };
-      console.log("DEBUG:getAI ← OpenAI Meta:", meta);
-    } catch { /* ignore */ }
+    const choice = aiResponse?.data?.choices?.[0];
+    const content = choice?.message?.content || "";
 
-    const aiMessage = aiResponse.data.choices[0].message;
-    return aiMessage.content || "";
+    // 🔎 Meta-Log
+    console.log("DEBUG:getAI ← OpenAI Meta:", {
+      created: aiResponse?.data?.created,
+      model: aiResponse?.data?.model,
+      finish_reason: choice?.finish_reason
+    });
+
+    return content;
   } catch (err) {
-    logAxiosErrorSafe("[ERROR]: getAI failed:", err);
+    // Ausführliche Fehlerdiagnose
+    console.error("[AI ERROR]:", err?.message || err);
+    if (err?.response) {
+      console.error("[AI ERROR] Response:", {
+        status: err.response.status,
+        statusText: err.response.statusText,
+        headers: err.response.headers,
+        data: err.response.data
+      });
+    }
+    // Wir werfen weiter, damit der Caller (z.B. aiCore / Tool) korrekt reagieren kann
     throw err;
   }
 }
 
-// DALL·E (Generationen)
-async function getAIImage(prompt, size = "1024x1024", model="dall-e-3") {
+// --- Image Generation (DALL·E 3 endpoint) ---
+async function getAIImage(prompt, size = "1024x1024", model = "dall-e-3") {
+  // 🔎 Debug
+  console.log("──────── DEBUG:getAIImage → Request ──────────");
+  console.log(JSON.stringify({ model, size, prompt_preview: String(prompt || "").slice(0, 200) }, null, 2));
+  console.log("──────────────────────────────────────────────");
+
   try {
     const dallEResponse = await axios.post(
       "https://api.openai.com/v1/images/generations",
@@ -139,23 +105,43 @@ async function getAIImage(prompt, size = "1024x1024", model="dall-e-3") {
         }
       }
     );
+
     const imageUrl = dallEResponse?.data?.data?.[0]?.url;
-    if (!imageUrl) throw new Error("Kein Bild erhalten.");
+    if (!imageUrl) {
+      throw new Error("Kein Bild erhalten.");
+    }
+
+    // 🔎 Meta-Log
+    console.log("DEBUG:getAIImage ← OpenAI Meta:", {
+      created: dallEResponse?.data?.created,
+      model: dallEResponse?.data?.model || model
+    });
+
     return imageUrl;
-  } catch (err) {
-    logAxiosErrorSafe("[ERROR]: getAIImage failed:", err);
-    throw err;
+  } catch (error) {
+    console.error("[ERROR:getAIImage]:", error?.message || error);
+    if (error?.response) {
+      console.error("[ERROR:getAIImage] Response:", {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data
+      });
+    }
+    throw error;
   }
 }
 
-// Whisper (Transkription)
-async function getTranscription(audioPath, model="whisper-1") {
+// --- Whisper Transcription ---
+async function getTranscription(audioPath, model = "whisper-1") {
   try {
     const fileStream = fs.createReadStream(audioPath);
     const filename = path.basename(audioPath);
     const formData = new FormData();
     formData.append("file", fileStream, { filename, contentType: "audio/wav" });
     formData.append("model", model);
+
+    console.log("DEBUG:getTranscription →", { model, filename });
+
     const response = await axios.post("https://api.openai.com/v1/audio/transcriptions", formData, {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -164,13 +150,15 @@ async function getTranscription(audioPath, model="whisper-1") {
     });
     return response.data.text;
   } catch (error) {
-    logAxiosErrorSafe("[ERROR]: transcription failed:", error);
+    console.error("[ERROR:getTranscription]: ", error.response?.data || error.message);
     return "[ERROR]: Error during transcription.";
   }
 }
 
-// TTS
-async function getTTS(text, model="tts-1", voice) {
+// --- TTS (text → speech) ---
+async function getTTS(text, model = "tts-1", voice) {
+  console.log("DEBUG:getTTS →", { model, voice, text_preview: String(text || "").slice(0, 120) });
+
   const response = await axios.post(
     'https://api.openai.com/v1/audio/speech',
     { model, voice, input: text, response_format: 'mp3' },
@@ -182,12 +170,14 @@ async function getTTS(text, model="tts-1", voice) {
       responseType: 'stream'
     }
   );
-  return response.data;
+  return response.data; // Stream
 }
 
-// Bildbeschreibung (Vision)
-async function getDescription(imageUrl, prompt = "Describe the image in as much detail as possible. Extract text, if there is any.", model="gpt-4o") {
+// --- Vision: describe image ---
+async function getDescription(imageUrl, prompt = "Describe the image in as much detail as possible. Extract text, if there is any.", model = "gpt-4o") {
   try {
+    console.log("DEBUG:getDescription →", { model, imageUrl_preview: String(imageUrl || "").slice(0, 160) });
+
     const response = await axios.post(
       OPENAI_API_URL,
       {
@@ -204,13 +194,26 @@ async function getDescription(imageUrl, prompt = "Describe the image in as much 
         ],
         max_tokens: 500
       },
-      { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
+      {
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+      }
     );
-    return response.data.choices[0]?.message?.content?.trim() || "No description available.";
+    const out = response.data.choices[0]?.message?.content?.trim() || "No description available.";
+    console.log("DEBUG:getDescription ← OpenAI Meta:", {
+      created: response?.data?.created,
+      model: response?.data?.model
+    });
+    return out;
   } catch (error) {
-    logAxiosErrorSafe("[ERROR]: vision description failed:", error);
+    console.error("[ERROR:getDescription]:", error.response?.data || error.message);
     return "[ERROR]: Error analyzing the image.";
   }
 }
 
-module.exports = { getAI, getAIImage, getTranscription, getTTS, getDescription };
+module.exports = {
+  getAI,
+  getAIImage,
+  getTranscription,
+  getTTS,
+  getDescription
+};
