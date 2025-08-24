@@ -199,27 +199,6 @@ function parseTranscriptLine(raw) {
   return { speaker: m[1].trim(), text: m[2].trim() };
 }
 
-async function deleteAllMessages(channel) {
-  const me = channel.guild.members.me;
-  const perms = channel.permissionsFor(me);
-  if (!perms?.has(PermissionsBitField.Flags.ManageMessages) || !perms?.has(PermissionsBitField.Flags.ReadMessageHistory)) {
-    throw new Error("Missing permissions: ManageMessages and/or ReadMessageHistory");
-  }
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  let beforeId = null;
-  while (true) {
-    const fetched = await channel.messages.fetch({ limit: 100, before: beforeId || undefined }).catch(() => null);
-    if (!fetched || fetched.size === 0) break;
-    for (const msg of fetched.values()) {
-      if (msg.pinned) continue;
-      try { await msg.delete(); } catch {}
-      await sleep(120);
-    }
-    const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
-    if (!oldest) break;
-    beforeId = oldest.id;
-  }
-}
 
 // bot.js
 function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
@@ -542,12 +521,7 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
     }
 
     // 2) Alle Messages im Channel löschen
-    try {
-      await deleteAllMessages(message.channel);
-    } catch (e) {
-      console.error("[!summarize] deleteAllMessages error:", e?.message || e);
-      await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
-    }
+    
 
     // 3) 5 Summaries (älteste -> neueste) als einzelne Nachrichten posten (gechunked)
     try {
