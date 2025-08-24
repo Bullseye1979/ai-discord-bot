@@ -126,6 +126,125 @@ async function ensureChannelAvatar(channelId, channelMeta) {
   }
 }
 
+// WAV auf max. Bytes kürzen (48 kHz, 16-bit, mono ≈ 96,000 B/s)
+async function trimWavToMaxBytes(file, { rate = 48000, channels = 1, maxBytes = 23 * 1024 * 1024 } = {}) {
+  try {
+    const st = await fs.promises.stat(file).catch(() => null);
+    if (!st || st.size <= maxBytes) return file;
+
+    const BYTES_PER_SEC = rate * channels * 2; // 16-bit PCM
+    let maxSec = Math.floor((maxBytes - 44) / BYTES_PER_SEC) - 1; // Header abziehen + Puffer
+    if (maxSec < 1) return null;
+
+    const out = path.join(path.dirname(file), `trim_${Date.now()}.wav`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(file)
+        .audioCodec("pcm_s16le")
+        .format("wav")
+        .outputOptions([`-t ${maxSec}`])
+        .save(out)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+    return out;
+  } catch {
+    return file;
+  }
+}
+
+// WAV auf eine feste Dauer (Sekunden) trimmen
+async function trimWavToSeconds(file, seconds) {
+  try {
+    if (!Number.isFinite(seconds) || seconds <= 0) return file;
+    const out = path.join(path.dirname(file), `crop_${Date.now()}.wav`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(file)
+        .audioCodec("pcm_s16le")
+        .format("wav")
+        .outputOptions([`-t ${seconds}`])
+        .save(out)
+        .on("end", resolve)
+        .on("error", reject);
+    });
+    return out;
+  } catch {
+    return file;
+  }
+}
+
+// Bestimme, wie viele Sekunden vom Anfang wir behalten, um höchstens maxVoiceSeconds "voiced" zu enthalten
+// (Frame-basiert, 20 ms Frames @ 48 kHz; wir summieren voiced-Frames und stoppen, wenn Limit erreicht)
+async function computeVoiceCropSeconds(file, {
+  rate = 48000,
+  frameSamples = 960,         // 20 ms
+  maxVoiceSeconds = 12,       // z.B. 12s verwertbare Sprache
+  padLeadSec = 0.20,          // kleiner Vorlauf
+  padTailSec = 0.35           // kleiner Nachlauf
+} = {}) {
+  try {
+    const buf = await fs.promises.readFile(file);
+    if (!buf || buf.length <= 44) return null;
+
+    const pcm = buf.subarray(44);
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+    const totalFrames = Math.floor(samples.length / frameSamples);
+    if (totalFrames <= 0) return null;
+
+    // einfache voiced-Heuristik wie unten in analyzeWav
+    const rmsList = new Array(totalFrames);
+    const zcrList = new Array(totalFrames);
+
+    for (let f = 0; f < totalFrames; f++) {
+      const start = f * frameSamples;
+      let sumSq = 0, zc = 0, prev = samples[start];
+      for (let i = 1; i < frameSamples; i++) {
+        const s = samples[start + i];
+        sumSq += s * s;
+        if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) zc++;
+        prev = s;
+      }
+      const rms = Math.sqrt(sumSq / frameSamples) / 32768;
+      const zcr = zc / (frameSamples - 1);
+      rmsList[f] = rms;
+      zcrList[f] = zcr;
+    }
+
+    // Noise-Floor grob
+    const sortedRms = rmsList.slice().sort((a, b) => a - b);
+    const p = (arr, q) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor((arr.length - 1) * q)))];
+    const noise = Math.max(1e-6, p(sortedRms, 0.2));
+
+    const voicedMask = rmsList.map((r, i) => (r > noise * 2 && zcrList[i] < 0.25) ? 1 : 0);
+
+    const frameDur = frameSamples / rate; // sek/Frame = 0.02 s
+    const maxVoiceFrames = Math.floor(maxVoiceSeconds / frameDur);
+
+    // kumulativ "voiced"-Frames zählen bis Limit erreicht ist → dort abschneiden (+ kleinen Puffer)
+    let cumVoiced = 0;
+    let cutFrame = totalFrames - 1;
+    for (let f = 0; f < totalFrames; f++) {
+      if (voicedMask[f]) cumVoiced++;
+      if (cumVoiced >= maxVoiceFrames) { cutFrame = f; break; }
+    }
+
+    // Wenn sowieso unterhalb des Limits → nichts croppen
+    if (cumVoiced < maxVoiceFrames) return null;
+
+    // Sekunden berechnen + Pads
+    const leadFrames = Math.floor(padLeadSec / frameDur);
+    const tailFrames = Math.floor(padTailSec / frameDur);
+    const endFrameIncl = Math.min(totalFrames - 1, cutFrame + tailFrames);
+    // Start lassen wir bei 0 (wir wollen nicht mitten im Satz beginnen); wer will, könnte hier zum
+    // letzten Unvoiced vor der ersten Voice springen und dann padLeadSec addieren.
+
+    const seconds = (endFrameIncl + 1) * frameDur + 0; // ab 0 bis inkl. endFrame
+    return Math.max(0.5, seconds); // nie < 0.5s
+  } catch {
+    return null;
+  }
+}
+
+
 
 // ---------- Tools für User/Blocks ----------
 function getUserTools(nameOrDisplayName) {
@@ -577,6 +696,7 @@ async function quickSNR(wavPath) {
 
 // In discord-helper.js
 // In discord-helper.js
+// In discord-helper.js
 async function setStartListening(connection, guildId, guildTextChannels, client) {
   try {
     if (!connection || !guildId) return;
@@ -591,12 +711,16 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     const DUP_WINDOW_MS      = 5000;   // gleiche Aussage innerhalb 5s unterdrücken
     const SILENCE_MS         = 2100;   // "AfterSilence" für natürlichere Utterances (~2.1s)
     const MAX_UTTERANCE_MS   = 30000;  // harter Cut nach 30s
-    const MIN_WAV_BYTES      = 48000;  // ~0.5s @ mono 48kHz → Schnipsel wegwerfen
+    const MIN_WAV_BYTES      = 96000;  // ~1.0s @ mono 48kHz/16-bit (44B Header ignorieren wir hier bewusst)
 
     // SNR/Voicing-Gate (Noise-Filter)
     const MIN_SNR_DB         = 8;      // ≈ brauchbare Sprachqualität
-    const MIN_VOICED_RATIO   = 0.40;   // ≥ 40% frames mit "voiced speech"
+    const MIN_VOICED_RATIO   = 0.40;   // ≥ 40% Frames mit "voiced speech"
     const MIN_VOICED_FRAMES  = 15;     // mindestens ~300ms voiced (bei 20ms Frames)
+
+    // (optional) harter Deckel auf "verwertbarem" Material (nach SNR/Voicing),
+    // hier lassen wir es bei 15s — brauchst du kürzer/länger, anpassen:
+    const MAX_USEFUL_MS      = 15000;
 
     const normText = (s) =>
       String(s || "")
@@ -625,18 +749,17 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
       try {
         const buf = await fs.promises.readFile(filePath);
         if (!buf || buf.length <= 44) {
-          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0 };
+          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
         }
         // 16-bit PCM WAV Header skippen (44 Bytes)
         const pcm = buf.subarray(44);
         const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
 
-        const sr = 48000;            // wie im Decoder
-        const frame = 960;            // 20ms @ 48kHz
+        const sr = 48000;     // wie im Decoder
+        const frame = 960;    // 20ms @ 48kHz
         const totalFrames = Math.floor(samples.length / frame);
-
         if (totalFrames <= 0) {
-          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0 };
+          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
         }
 
         const rmsList = new Array(totalFrames);
@@ -656,32 +779,31 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
           }
           const rms = Math.sqrt(sumSq / frame) / 32768; // normiert 0..1
           const zcr = zc / (frame - 1);
-
           rmsList[f] = rms;
           zcrList[f] = zcr;
         }
 
+        // Noise-/Speech-Schätzung über Perzentile
         const sortedRms = rmsList.slice().sort((a, b) => a - b);
         const p = (arr, q) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor((arr.length - 1) * q)))];
+        const noise   = Math.max(1e-6, p(sortedRms, 0.2));   // 20. Perzentil → Noise-Floor
+        const speech  = Math.max(noise + 1e-6, p(sortedRms, 0.8)); // 80. Perzentil → Speech-Level
+        const snrDb   = 20 * Math.log10(speech / noise);
 
-        const noise = Math.max(1e-6, p(sortedRms, 0.2));  // 20. Perzentil als Noise-Floor
-        const speech = Math.max(noise + 1e-6, p(sortedRms, 0.8)); // 80. Perzentil als Speech-Level
-        const snrDb = 20 * Math.log10(speech / noise);
-
+        // einfache „voiced“-Heuristik pro Frame
         let voiced = 0;
         for (let f = 0; f < totalFrames; f++) {
           const voicedLike = rmsList[f] > noise * 2 && zcrList[f] < 0.25;
           if (voicedLike) voiced++;
         }
 
-        return {
-          snrDb,
-          voicedRatio: voiced / totalFrames,
-          voicedFrames: voiced,
-          totalFrames
-        };
+        const voicedRatio = voiced / totalFrames;
+        const voicedFrames = voiced;
+        const usefulMs = Math.min(voicedFrames * 20, MAX_USEFUL_MS); // Deckel auf „nützliche“ Dauer
+
+        return { snrDb, voicedRatio, voicedFrames, totalFrames, usefulMs };
       } catch {
-        return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0 };
+        return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
       }
     }
 
@@ -722,7 +844,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
           try {
             const { dir, file } = await wavPromise;
 
-            // sehr kurze Schnipsel verwerfen
+            // sehr kurze Schnipsel verwerfen (~1s)
             const st = await fs.promises.stat(file).catch(() => null);
             if (!st || st.size < MIN_WAV_BYTES) return;
 
@@ -737,13 +859,13 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
             } catch { /* falls Modul nicht geladen, default true */ }
             if (!consentOk) return;
 
-            // SNR/Voicing-Gate auswerten
-            const { snrDb, voicedRatio, voicedFrames } = await analyzeWav(file);
+            // SNR/Voicing-Gate
+            const { snrDb, voicedRatio, voicedFrames, usefulMs } = await analyzeWav(file);
             if (snrDb < MIN_SNR_DB || voicedRatio < MIN_VOICED_RATIO || voicedFrames < MIN_VOICED_FRAMES) {
               return; // zu viel Rauschen/Knister/Atmen → nicht transkribieren
             }
 
-            // Transkribieren
+            // Transkribieren (Whisper bekommt 1 Aufnahme; unsere Gates laufen vorher)
             const text  = await getTranscription(file, "whisper-1", "auto");
             const clean = (text || "").trim();
             if (!clean) return;
