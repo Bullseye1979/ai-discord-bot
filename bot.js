@@ -53,6 +53,19 @@ function metaSig(m) {
   })).digest("hex");
 }
 
+// erkennt, ob diese Nachricht von DEM AI-Webhook (botname) stammt
+async function isAIWebhookMessage(message, channelMeta) {
+  if (!message?.webhookId) return false;
+  try {
+    const hooks = await message.channel.fetchWebhooks();
+    const w = hooks.find(x => x.id === message.webhookId);
+    const expected = (channelMeta?.botname || "AI");
+    return !!w && w.name === expected;
+  } catch {
+    return false;
+  }
+}
+
 
 function isChannelAdmin(channelMeta, userId) {
   const ids = Array.isArray(channelMeta.admins) ? channelMeta.admins.map(String) : [];
@@ -490,24 +503,26 @@ if (isTranscriptPost) {
 
 */
 
-// 3) TTS nur für AI-Antworten – UND nur dann, wenn die auslösende Anfrage via Voice kam
-// 3) TTS nur für Bot-Antworten – UND nur dann, wenn Voice das Gate gesetzt hat
+// 3) TTS für Bot-ODER-AI-Webhook-Antworten – nur wenn Voice das Gate gesetzt hat
 try {
   const looksLikeSummary =
     /\*\*Summary\b/i.test(message.content || "") ||
     /\bSummary (in progress|completed)/i.test(message.content || "");
 
-  const isFromBot = message.author?.id === client.user?.id; // nur Antworten des Bots
-  if (isFromBot && !looksLikeSummary) {
-    const okToSpeak = ttsGate.get(message.channel.id) === true;
-    if (okToSpeak) {
+  const isFromBot = message.author?.id === client.user?.id;
+  const isFromAIWebhook = await isAIWebhookMessage(message, channelMeta);
+
+  if ((isFromBot || isFromAIWebhook) && !looksLikeSummary) {
+    if (ttsGate.get(message.channel.id) === true) {
       await setTTS(message, client, guildTextChannels);
-      ttsGate.set(message.channel.id, false); // Gate schließen
+      ttsGate.set(message.channel.id, false); // nach erster Antwort schließen
     }
   }
 } catch (e) {
   console.warn("[TTS] call failed:", e?.message || e);
 }
+
+
 
 
 
