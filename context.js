@@ -111,22 +111,19 @@ class Context {
     this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
   }
 
-  async add(role, sender, content) {
-    const entry = { role, name: sanitize(sender), content: String(content ?? "") };
-    try { await this._initLoaded; } catch {}
-    this.messages.push(entry);
+  // context.js
+async add(role, author, content, timestampMs = null) {
+  const createdAt = timestampMs ? new Date(timestampMs) : new Date();
 
-    try {
-      const db = await getPool();
-      await db.execute(
-        `INSERT INTO context_log (timestamp, channel_id, role, sender, content) VALUES (?, ?, ?, ?, ?)`,
-        [toMySQLDateTime(new Date()), this.channelId, role, entry.name, entry.content]
-      );
-    } catch (e) {
-      console.error("[DB] insert context_log failed:", e.message);
-    }
-    return entry;
-  }
+  // Beispiel-SQL – passe Spaltennamen an DEIN Schema an:
+  // Angenommen: context_log(channel_id, role, author, content, created_at)
+  await this.db.execute(
+    `INSERT INTO context_log (channel_id, role, author, content, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [this.channelId, role, author, content, createdAt]
+  );
+}
+
 
   async getMessagesAfter(cutoffMs) {
     const db = await getPool();

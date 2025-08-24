@@ -88,6 +88,48 @@ async function deleteAllMessages(channel) {
   }
 }
 
+// bot.js
+function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
+  const key = `channel:${channelId}`;
+  const signature = metaSig(channelMeta);
+  if (!contextStorage.has(key)) {
+    const ctx = new Context(
+      channelMeta.persona,
+      channelMeta.instructions,
+      channelMeta.tools,
+      channelMeta.toolRegistry,
+      channelId
+    );
+    contextStorage.set(key, { ctx, sig: signature });
+  } else {
+    const entry = contextStorage.get(key);
+    if (entry.sig !== signature) {
+      entry.ctx = new Context(
+        channelMeta.persona,
+        channelMeta.instructions,
+        channelMeta.tools,
+        channelMeta.toolRegistry,
+        channelId
+      );
+      entry.sig = signature;
+    }
+  }
+  return contextStorage.get(key).ctx;
+}
+
+
+// bot.js
+function buildProxyMessageForVoice(channel, text, userId, username) {
+  // Minimales Fake-Message-Objekt, genug für discord-handler.js
+  return {
+    channel,
+    guild: channel.guild,
+    content: text,
+    webhookId: null,
+    author: { id: String(userId), bot: false, username: username || "user" },
+    member: channel.guild?.members?.cache?.get(String(userId)) || null
+  };
+}
 
 
 client.on("messageCreate", async (message) => {
@@ -262,7 +304,51 @@ if ((message.content || "").startsWith("!joinvc")) {
     guildTextChannels.set(message.guild.id, message.channel.id);
 
     // (Re)Start Listening – Transkripte posten ab jetzt in den aktuellen Textkanal
-    setStartListening(conn, message.guild.id, guildTextChannels, client);
+   // bot.js — im !joinvc-Handler:
+setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
+  // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
+
+  // 1) Channel-Meta + ChatContext besorgen (Parent-Textkanal!)
+  const channelMeta = getChannelConfig(evt.channelId);
+  const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
+
+  // 2) Voice-Transkript in DB ablegen – MIT Start-Timestamp
+  try {
+    await chatContext.add("user", evt.speaker, evt.text, evt.startedAtMs);
+  } catch (e) {
+    console.warn("[voice->DB] failed:", e?.message || e);
+  }
+
+  // 3) Trigger checken (wie früher bei Transkript-Webhook – nur intern)
+  const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
+  const norm = (evt.text || "").trim().toLowerCase();
+  const isTrigger =
+    norm.startsWith(triggerName) ||
+    norm.startsWith(`!${triggerName}`) ||
+    norm.includes(triggerName);
+
+  if (!isTrigger) return;
+
+  // 4) TTS nur bei Voice-Trigger erlauben
+  ttsGate.set(evt.channelId, true);
+
+  // 5) KI aufrufen – Antwort wird normal in den Channel gepostet (nicht das Transkript)
+  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+  if (!ch) return;
+
+  const proxyMsg = buildProxyMessageForVoice(ch, evt.text, evt.userId, evt.speaker);
+  const state = { isAIProcessing: 0 };
+  try {
+    await getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+  } catch (e) {
+    console.error("[voice->AI] failed:", e?.message || e);
+  } finally {
+    // Optional: TTS-Gate nach erster Antwort wieder schließen (falls du das so willst)
+    // → falls du das reset in setTTS schon machst, kannst du das hier weglassen
+    // ttsGate.set(evt.channelId, false);
+  }
+});
+
 
     await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`);
   } catch (e) {
@@ -371,6 +457,8 @@ if ((message.content || "").startsWith("!joinvc")) {
 // ---------------- Normaler Flow ----------------
 
 // 1) Erkennen, ob dies ein Transkript-Webhook ist (Webhooks ≠ AI-Webhook)
+
+/*
 const isWebhook = !!message.webhookId;
 let isAIWebhook = false;
 if (isWebhook) {
@@ -400,9 +488,8 @@ if (isTranscriptPost) {
   // sonst ignorieren
 }
 
+*/
 
-
-// 3) TTS nur für AI-Antworten, aber NICHT für Summaries/Transkripte
 // 3) TTS nur für AI-Antworten – UND nur dann, wenn die auslösende Anfrage via Voice kam
 try {
   const looksLikeSummary =

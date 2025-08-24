@@ -667,32 +667,24 @@ async function quickSNR(wavPath) {
 
 
 // In discord-helper.js
-// In discord-helper.js
-// In discord-helper.js
-async function setStartListening(connection, guildId, guildTextChannels, client) {
+// discord-helper.js
+async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript /* <= NEU */) {
   try {
     if (!connection || !guildId) return;
 
-    // ---- persistente Funktions-States (pro Prozess) ----
     if (!setStartListening.__capturingUsers) setStartListening.__capturingUsers = new Set();
     if (!setStartListening.__lastUtteranceMap) setStartListening.__lastUtteranceMap = new Map();
     const capturingUsers   = setStartListening.__capturingUsers;   // Set<`${guildId}:${userId}`>
     const lastUtteranceMap = setStartListening.__lastUtteranceMap; // Map<key, {norm, ts}>
 
-    // ---- Tuning-Parameter ----
-    const DUP_WINDOW_MS      = 5000;   // gleiche Aussage innerhalb 5s unterdrücken
-    const SILENCE_MS         = 2100;   // "AfterSilence" für natürlichere Utterances (~2.1s)
-    const MAX_UTTERANCE_MS   = 30000;  // harter Cut nach 30s
-    const MIN_WAV_BYTES      = 96000;  // ~1.0s @ mono 48kHz/16-bit (44B Header ignorieren wir hier bewusst)
+    const DUP_WINDOW_MS      = 5000;
+    const SILENCE_MS         = 2100;
+    const MAX_UTTERANCE_MS   = 30000;
+    const MIN_WAV_BYTES      = 96000; // ~1s @ 48k/16bit/mono
 
-    // SNR/Voicing-Gate (Noise-Filter)
-    const MIN_SNR_DB         = 8;      // ≈ brauchbare Sprachqualität
-    const MIN_VOICED_RATIO   = 0.40;   // ≥ 40% Frames mit "voiced speech"
-    const MIN_VOICED_FRAMES  = 15;     // mindestens ~300ms voiced (bei 20ms Frames)
-
-    // (optional) harter Deckel auf "verwertbarem" Material (nach SNR/Voicing),
-    // hier lassen wir es bei 15s — brauchst du kürzer/länger, anpassen:
-    const MAX_USEFUL_MS      = 15000;
+    const MIN_SNR_DB         = 8;
+    const MIN_VOICED_RATIO   = 0.40;
+    const MIN_VOICED_FRAMES  = 15;
 
     const normText = (s) =>
       String(s || "")
@@ -701,14 +693,12 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
         .replace(/\s+/g, " ")
         .trim();
 
-    // ggf. alten Receiver-Listener sauber entfernen & Verbindung merken
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
     }
     activeRecordings.set(guildId, connection);
 
-    // Ziel-Textkanal dynamisch aus Map nachschlagen (kann via !joinvc wechseln)
     const getLatestTarget = async () => {
       const latestId = guildTextChannels.get(guildId);
       if (!latestId) return null;
@@ -716,62 +706,51 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
       return ch || null;
     };
 
-    // --- WAV-Analyse: grobe SNR + Voicing (20ms Frames) ---
     async function analyzeWav(filePath) {
       try {
         const buf = await fs.promises.readFile(filePath);
         if (!buf || buf.length <= 44) {
           return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
         }
-        // 16-bit PCM WAV Header skippen (44 Bytes)
         const pcm = buf.subarray(44);
         const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
 
-        const sr = 48000;     // wie im Decoder
-        const frame = 960;    // 20ms @ 48kHz
+        const sr = 48000, frame = 960;
         const totalFrames = Math.floor(samples.length / frame);
-        if (totalFrames <= 0) {
-          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
-        }
+        if (totalFrames <= 0) return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
 
         const rmsList = new Array(totalFrames);
         const zcrList = new Array(totalFrames);
 
         for (let f = 0; f < totalFrames; f++) {
           const start = f * frame;
-          let sumSq = 0;
-          let zc = 0;
-          let prev = samples[start];
-
+          let sumSq = 0, zc = 0, prev = samples[start];
           for (let i = 1; i < frame; i++) {
             const s = samples[start + i];
             sumSq += s * s;
             if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) zc++;
             prev = s;
           }
-          const rms = Math.sqrt(sumSq / frame) / 32768; // normiert 0..1
+          const rms = Math.sqrt(sumSq / frame) / 32768;
           const zcr = zc / (frame - 1);
-          rmsList[f] = rms;
-          zcrList[f] = zcr;
+          rmsList[f] = rms; zcrList[f] = zcr;
         }
 
-        // Noise-/Speech-Schätzung über Perzentile
-        const sortedRms = rmsList.slice().sort((a, b) => a - b);
+        const sortedRms = rmsList.slice().sort((a,b)=>a-b);
         const p = (arr, q) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor((arr.length - 1) * q)))];
-        const noise   = Math.max(1e-6, p(sortedRms, 0.2));   // 20. Perzentil → Noise-Floor
-        const speech  = Math.max(noise + 1e-6, p(sortedRms, 0.8)); // 80. Perzentil → Speech-Level
-        const snrDb   = 20 * Math.log10(speech / noise);
+        const noise  = Math.max(1e-6, p(sortedRms, 0.2));
+        const speech = Math.max(noise + 1e-6, p(sortedRms, 0.8));
+        const snrDb  = 20 * Math.log10(speech / noise);
 
-        // einfache „voiced“-Heuristik pro Frame
         let voiced = 0;
         for (let f = 0; f < totalFrames; f++) {
           const voicedLike = rmsList[f] > noise * 2 && zcrList[f] < 0.25;
           if (voicedLike) voiced++;
         }
 
-        const voicedRatio = voiced / totalFrames;
+        const voicedRatio  = voiced / totalFrames;
         const voicedFrames = voiced;
-        const usefulMs = Math.min(voicedFrames * 20, MAX_USEFUL_MS); // Deckel auf „nützliche“ Dauer
+        const usefulMs     = voicedFrames * 20;
 
         return { snrDb, voicedRatio, voicedFrames, totalFrames, usefulMs };
       } catch {
@@ -782,16 +761,15 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     const receiver = connection.receiver;
     if (!receiver) return;
 
-    receiver.speaking.removeAllListeners("start"); // doppelte Listener vermeiden
+    receiver.speaking.removeAllListeners("start");
     receiver.speaking.on("start", (userId) => {
       const key = `${guildId}:${userId}`;
-
-      // Re-entrancy-Lock: solange eine Aufnahme für diesen User läuft, ignorieren
       if (capturingUsers.has(key)) return;
       capturingUsers.add(key);
 
-      let killTimer = null;
+      const startedAtMs = Date.now(); // <<<<< WICHTIG: Start-Timestamp
 
+      let killTimer = null;
       try {
         const opus = receiver.subscribe(userId, {
           end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS },
@@ -801,13 +779,9 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
         const pass = new PassThrough();
         const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
-        // Streamen
         pcm.on("data", (chunk) => pass.write(chunk));
 
-        // Harter Cut nach MAX_UTTERANCE_MS (z.B. Monologe)
-        killTimer = setTimeout(() => {
-          try { opus.destroy(); } catch {}
-        }, MAX_UTTERANCE_MS);
+        killTimer = setTimeout(() => { try { opus.destroy(); } catch {} }, MAX_UTTERANCE_MS);
 
         const finish = async () => {
           if (killTimer) { clearTimeout(killTimer); killTimer = null; }
@@ -816,54 +790,47 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
           try {
             const { dir, file } = await wavPromise;
 
-            // sehr kurze Schnipsel verwerfen (~1s)
             const st = await fs.promises.stat(file).catch(() => null);
             if (!st || st.size < MIN_WAV_BYTES) return;
 
-            // Zielkanal bestimmen (und parallel Voice-Consent prüfen)
             const latestTarget = await getLatestTarget();
             if (!latestTarget) return;
 
             let consentOk = true;
-            try {
-              // channel-scoped consent
-              consentOk = await hasVoiceConsent(userId, latestTarget.id);
-            } catch { /* falls Modul nicht geladen, default true */ }
+            try { consentOk = await hasVoiceConsent(userId, latestTarget.id); } catch {}
             if (!consentOk) return;
 
-            // SNR/Voicing-Gate
-            const { snrDb, voicedRatio, voicedFrames, usefulMs } = await analyzeWav(file);
+            const { snrDb, voicedRatio, voicedFrames } = await analyzeWav(file);
             if (snrDb < MIN_SNR_DB || voicedRatio < MIN_VOICED_RATIO || voicedFrames < MIN_VOICED_FRAMES) {
-              return; // zu viel Rauschen/Knister/Atmen → nicht transkribieren
+              return;
             }
 
-            // Transkribieren (Whisper bekommt 1 Aufnahme; unsere Gates laufen vorher)
             const text  = await getTranscription(file, "whisper-1", "auto");
             const clean = (text || "").trim();
             if (!clean) return;
 
-            // Dubletten binnen 5s unterdrücken (normierter Textvergleich)
             const norm = normText(clean);
             const now  = Date.now();
             const last = lastUtteranceMap.get(key);
             if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) return;
             lastUtteranceMap.set(key, { norm, ts: now });
 
-            // Metadaten (Name/Avatar)
             const speaker = await resolveSpeakerName(client, guildId, userId);
-            let avatarURL;
-            try {
-              const g = await client.guilds.fetch(guildId);
-              const m = await g.members.fetch(userId).catch(() => null);
-              avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
-            } catch {}
 
-            // Post via Relay-Webhook in den (ggf. Thread-)Zielkanal
-            await sendTranscriptViaWebhook(latestTarget, clean, speaker, avatarURL);
+            // <<<<< NEU: NICHT posten – per Callback an bot.js liefern
+            if (typeof onTranscript === "function") {
+              await onTranscript({
+                guildId,
+                channelId: latestTarget.id,
+                userId,
+                speaker,
+                text: clean,
+                startedAtMs: startedAtMs
+              });
+            }
           } catch (err) {
             console.warn("[Transcription] failed:", err?.message || err);
           } finally {
-            // Temp-Datei entsorgen & Lock lösen
             try {
               const { dir } = await wavPromise;
               await fs.promises.rm(dir, { recursive: true, force: true });
@@ -887,7 +854,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
       }
     });
 
-    // Aufräumen, wenn diese Verbindung beendet wird
     connection.on("stateChange", (oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
         if (activeRecordings.get(guildId) === connection) {
@@ -895,7 +861,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
         }
       }
     });
-
   } catch (e) {
     console.warn("[setStartListening] failed:", e?.message || e);
   }
