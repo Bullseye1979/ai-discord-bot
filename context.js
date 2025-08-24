@@ -112,17 +112,18 @@ class Context {
   }
 
   // context.js
-async add(role, author, content, timestampMs = null) {
-  const createdAt = timestampMs ? new Date(timestampMs) : new Date();
+  // context.js
+async add(role, sender, content, timestampMs = null) {
+  const db = await getPool(); // Pool holen (this.db NICHT verwenden)
+  const ts = toMySQLDateTime(timestampMs ? new Date(timestampMs) : new Date());
 
-  // Beispiel-SQL – passe Spaltennamen an DEIN Schema an:
-  // Angenommen: context_log(channel_id, role, author, content, created_at)
-  await this.db.execute(
-    `INSERT INTO context_log (channel_id, role, author, content, created_at)
+  await db.execute(
+    `INSERT INTO context_log (timestamp, channel_id, role, sender, content)
      VALUES (?, ?, ?, ?, ?)`,
-    [this.channelId, role, author, content, createdAt]
+    [ts, this.channelId, String(role), String(sender || ""), String(content || "")]
   );
 }
+
 
 
   async getMessagesAfter(cutoffMs) {
@@ -217,7 +218,8 @@ Output:
         { skipInitialSummaries: true } // wichtig: keine automatischen DB-Summaries reinziehen
       );
 
-      await sumCtx.add("user", "system", text);
+      sumCtx.messages.push({ role: "user", name: "system", content: text }); // nur in-memory
+
 
       // Temperatur niedrig halten (falls deine getAI-Impl das 4. Argument als Options nimmt)
       const summary = (await getAI(sumCtx, 900, "gpt-4-turbo", { temperature: 0.1 }))?.trim() || "";
