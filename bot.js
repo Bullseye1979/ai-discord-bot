@@ -327,6 +327,16 @@ if (isCommand) {
 
 
 
+// irgendwo in deiner messageCreate
+const raw = (message?.content || "").trim();
+
+// nur überspringen wenn ! oder +
+if (!(raw.startsWith("!") || raw.startsWith("+"))) {
+  await setAddUserMessage(message, chatContext);
+}
+
+// ab hier läuft die Funktion ganz normal weiter
+
 
 // ---------------- Consent Short-Commands (+consent_…) ----------------
 {
@@ -659,13 +669,6 @@ const isTrigger =
 
 if (!isTrigger) return;
 
-// getippte Nachricht ins Log (mit Anhängen etc.)
-const raw = (message?.content || "").trim();
-
-// nur überspringen wenn ! oder +
-if (!(raw.startsWith("!") || raw.startsWith("+"))) {
-  await setAddUserMessage(message, chatContext);
-}
 
 
 
