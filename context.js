@@ -111,19 +111,23 @@ class Context {
     this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
   }
 
-  // context.js
-  // context.js
-async add(role, sender, content, timestampMs = null) {
-  const db = await getPool(); // Pool holen (this.db NICHT verwenden)
+async add(role, sender, content, timestampMs = null, { alsoMemory = true } = {}) {
+  const db = await getPool();
   const ts = toMySQLDateTime(timestampMs ? new Date(timestampMs) : new Date());
 
+  // Schema aus ensureTables(): timestamp, channel_id, role, sender, content
   await db.execute(
     `INSERT INTO context_log (timestamp, channel_id, role, sender, content)
      VALUES (?, ?, ?, ?, ?)`,
-    [ts, this.channelId, String(role), String(sender || ""), String(content || "")]
+    [ts, this.channelId, String(role || "user"), String(sender || "user"), String(content || "")]
   );
-}
 
+  // Wichtig: sofort auch dem In-Memory-Kontext hinzufügen,
+  // damit die Nachricht im selben Turn vom Modell gesehen wird.
+  if (alsoMemory) {
+    this.messages.push({ role: String(role || "user"), name: String(sender || "user"), content: String(content || "") });
+  }
+}
 
 
   async getMessagesAfter(cutoffMs) {
