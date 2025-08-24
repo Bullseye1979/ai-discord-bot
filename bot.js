@@ -132,17 +132,18 @@ function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
 
 
 // bot.js
-function buildProxyMessageForVoice(channel, text, userId, username) {
-  // Minimales Fake-Message-Objekt, genug für discord-handler.js
-  return {
-    channel,
-    guild: channel.guild,
-    content: text,
-    webhookId: null,
-    author: { id: String(userId), bot: false, username: username || "user" },
-    member: channel.guild?.members?.cache?.get(String(userId)) || null
-  };
-}
+ function buildProxyMessageForVoice(channel, text, userId, username) {
+   return {
+     channel,
+     guild: channel.guild,
+     content: text,
+-    webhookId: null,
++    webhookId: "voice-proxy",    // ← wichtig: als „Transkript/Webhook“ markieren
+     author: { id: String(userId), bot: false, username: username || "user" },
+     member: channel.guild?.members?.cache?.get(String(userId)) || null
+   };
+ }
+
 
 
 client.on("messageCreate", async (message) => {

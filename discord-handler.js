@@ -48,8 +48,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     // ---- Strikte Block-Auswahl: speaker-only (Webhook/Transkript) vs user-only (Text) ----
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
 
-    // Transkript/Webhook? -> NUR speaker prüfen
-    const isSpeakerMsg = !!message.webhookId;
+
 
     // Effektive Channel-ID wie in setTTS (Threads → Parent)
 const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
@@ -93,8 +92,10 @@ if (isSpeakerMsg) {
       return exact || wildcard || null;
     }
 
-    const matchingBlock = isSpeakerMsg ? pickBlockForSpeaker() : pickBlockForUser();
 
+const bySpeaker = pickBlockForSpeaker();
+const byUser    = pickBlockForUser();
+const matchingBlock = bySpeaker || byUser;
     // Kein Block => Ablehnen
     if (!matchingBlock) {
       await setMessageReaction(message, "❌");
