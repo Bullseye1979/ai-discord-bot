@@ -137,8 +137,8 @@ function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
      channel,
      guild: channel.guild,
      content: text,
--    webhookId: null,
-+    webhookId: "voice-proxy",    // ← wichtig: als „Transkript/Webhook“ markieren
+     webhookId: null,
+     webhookId: "voice-proxy",    // ← wichtig: als „Transkript/Webhook“ markieren
      author: { id: String(userId), bot: false, username: username || "user" },
      member: channel.guild?.members?.cache?.get(String(userId)) || null
    };

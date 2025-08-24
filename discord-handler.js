@@ -96,6 +96,7 @@ if (isSpeakerMsg) {
 const bySpeaker = pickBlockForSpeaker();
 const byUser    = pickBlockForUser();
 const matchingBlock = bySpeaker || byUser;
+
     // Kein Block => Ablehnen
     if (!matchingBlock) {
       await setMessageReaction(message, "❌");
