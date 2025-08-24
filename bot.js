@@ -8,13 +8,14 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const { getAIResponse } = require("./aiCore.js");
-const { getSpeech, setReplyAsWebhook, getChannelConfig } = require("./discord-helper.js");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
 const { initCron, reloadCronForChannel } = require("./scheduler.js");
 const Context = require("./context.js");
 const {
+  getSpeech,
   getChannelConfig,
+  setReplyAsWebhook,
   setStartListening,
   setAddUserMessage,
   setBotPresence,
