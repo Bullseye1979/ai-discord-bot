@@ -326,7 +326,7 @@ if (isCommand) {
 }
 
 
-await setAddUserMessage(message, chatContext);
+
 
 // ---------------- Consent Short-Commands (+consent_…) ----------------
 {
@@ -660,7 +660,16 @@ const isTrigger =
 if (!isTrigger) return;
 
 // getippte Nachricht ins Log (mit Anhängen etc.)
-await setAddUserMessage(message, chatContext);
+
+if (raw.startsWith("!") || raw.startsWith("+")) 
+{
+  return;
+} else {
+
+   await setAddUserMessage(message, chatContext);
+
+}
+
 
 // KI aufrufen (Typed Flow; kein Proxy nötig)
 const state = { isAIProcessing: 0 };
