@@ -501,24 +501,189 @@ async function resolveSpeakerName(client, guildId, userId) {
 }
 
 
+
+// --- Quick SNR + Voicing Gate für 48kHz/mono WAV ---
+async function quickSNR(wavPath) {
+  const buf = await fs.promises.readFile(wavPath);
+
+  // sehr einfache RIFF/WAV-Parsing-Logik: "data"-Chunk finden
+  function findDataChunk(b) {
+    // RIFF Header: 12 bytes, dann Chunks
+    let p = 12;
+    while (p + 8 <= b.length) {
+      const id = b.toString('ascii', p, p + 4);
+      const size = b.readUInt32LE(p + 4);
+      if (id === 'data') return { offset: p + 8, size };
+      p += 8 + size;
+    }
+    return null;
+  }
+
+  const data = findDataChunk(buf);
+  if (!data || data.size < 960 * 2) { // < 20ms
+    return { snrDb: 0, voicedRatio: 0, frames: 0 };
+  }
+
+  // PCM16 mono
+  const pcm = new Int16Array(
+    buf.buffer,
+    buf.byteOffset + data.offset,
+    data.size / 2
+  );
+
+  const frameSize = 960; // 20ms @ 48kHz
+  const energies = [];
+  const zcrs = [];
+
+  for (let i = 0; i + frameSize <= pcm.length; i += frameSize) {
+    let e = 0;
+    let z = 0;
+    let prev = pcm[i];
+    for (let j = i; j < i + frameSize; j++) {
+      const s = pcm[j] / 32768; // normiert [-1..1]
+      e += s * s;
+      const cur = pcm[j];
+      if ((cur >= 0 && prev < 0) || (cur < 0 && prev >= 0)) z++;
+      prev = cur;
+    }
+    e /= frameSize;                         // mittlere Energie
+    const zcr = z / frameSize;              // Zero-Crossing-Rate
+    energies.push(e);
+    zcrs.push(zcr);
+  }
+
+  if (energies.length < 3) {
+    return { snrDb: 0, voicedRatio: 0, frames: energies.length };
+  }
+
+  const sorted = [...energies].sort((a, b) => a - b);
+  const idx20 = Math.max(0, Math.floor(sorted.length * 0.20) - 1);
+  const idx80 = Math.max(0, Math.floor(sorted.length * 0.80) - 1);
+  const noise = Math.max(sorted[idx20], 1e-9);
+  const signal = Math.max(sorted[idx80], noise + 1e-9);
+  const snrDb = 10 * Math.log10(signal / noise);
+
+  // voiced-Frames: Energie deutlich über Noise + ZCR im Sprachbereich (nicht zu flach)
+  const energyThresh = noise * 3.0;
+  let voiced = 0;
+  for (let k = 0; k < energies.length; k++) {
+    if (energies[k] > energyThresh && zcrs[k] < 0.25) voiced++;
+  }
+  const voicedRatio = voiced / energies.length;
+
+  return { snrDb, voicedRatio, frames: energies.length };
+}
+
+
+// In discord-helper.js
+// In discord-helper.js
 async function setStartListening(connection, guildId, guildTextChannels, client) {
   try {
     if (!connection || !guildId) return;
 
-    // Vorherige Verbindung/Listener sauber ersetzen
+    // ---- persistente Funktions-States (pro Prozess) ----
+    if (!setStartListening.__capturingUsers) setStartListening.__capturingUsers = new Set();
+    if (!setStartListening.__lastUtteranceMap) setStartListening.__lastUtteranceMap = new Map();
+    const capturingUsers   = setStartListening.__capturingUsers;   // Set<`${guildId}:${userId}`>
+    const lastUtteranceMap = setStartListening.__lastUtteranceMap; // Map<key, {norm, ts}>
+
+    // ---- Tuning-Parameter ----
+    const DUP_WINDOW_MS      = 5000;   // gleiche Aussage innerhalb 5s unterdrücken
+    const SILENCE_MS         = 2100;   // "AfterSilence" für natürlichere Utterances (~2.1s)
+    const MAX_UTTERANCE_MS   = 30000;  // harter Cut nach 30s
+    const MIN_WAV_BYTES      = 48000;  // ~0.5s @ mono 48kHz → Schnipsel wegwerfen
+
+    // SNR/Voicing-Gate (Noise-Filter)
+    const MIN_SNR_DB         = 8;      // ≈ brauchbare Sprachqualität
+    const MIN_VOICED_RATIO   = 0.40;   // ≥ 40% frames mit "voiced speech"
+    const MIN_VOICED_FRAMES  = 15;     // mindestens ~300ms voiced (bei 20ms Frames)
+
+    const normText = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    // ggf. alten Receiver-Listener sauber entfernen & Verbindung merken
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
     }
     activeRecordings.set(guildId, connection);
 
-    // Immer den aktuell gesetzten Ziel-Textkanal (für Transcripts) holen
+    // Ziel-Textkanal dynamisch aus Map nachschlagen (kann via !joinvc wechseln)
     const getLatestTarget = async () => {
       const latestId = guildTextChannels.get(guildId);
       if (!latestId) return null;
       const ch = await client.channels.fetch(latestId).catch(() => null);
       return ch || null;
     };
+
+    // --- WAV-Analyse: grobe SNR + Voicing (20ms Frames) ---
+    async function analyzeWav(filePath) {
+      try {
+        const buf = await fs.promises.readFile(filePath);
+        if (!buf || buf.length <= 44) {
+          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0 };
+        }
+        // 16-bit PCM WAV Header skippen (44 Bytes)
+        const pcm = buf.subarray(44);
+        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+
+        const sr = 48000;            // wie im Decoder
+        const frame = 960;            // 20ms @ 48kHz
+        const totalFrames = Math.floor(samples.length / frame);
+
+        if (totalFrames <= 0) {
+          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0 };
+        }
+
+        const rmsList = new Array(totalFrames);
+        const zcrList = new Array(totalFrames);
+
+        for (let f = 0; f < totalFrames; f++) {
+          const start = f * frame;
+          let sumSq = 0;
+          let zc = 0;
+          let prev = samples[start];
+
+          for (let i = 1; i < frame; i++) {
+            const s = samples[start + i];
+            sumSq += s * s;
+            if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) zc++;
+            prev = s;
+          }
+          const rms = Math.sqrt(sumSq / frame) / 32768; // normiert 0..1
+          const zcr = zc / (frame - 1);
+
+          rmsList[f] = rms;
+          zcrList[f] = zcr;
+        }
+
+        const sortedRms = rmsList.slice().sort((a, b) => a - b);
+        const p = (arr, q) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor((arr.length - 1) * q)))];
+
+        const noise = Math.max(1e-6, p(sortedRms, 0.2));  // 20. Perzentil als Noise-Floor
+        const speech = Math.max(noise + 1e-6, p(sortedRms, 0.8)); // 80. Perzentil als Speech-Level
+        const snrDb = 20 * Math.log10(speech / noise);
+
+        let voiced = 0;
+        for (let f = 0; f < totalFrames; f++) {
+          const voicedLike = rmsList[f] > noise * 2 && zcrList[f] < 0.25;
+          if (voicedLike) voiced++;
+        }
+
+        return {
+          snrDb,
+          voicedRatio: voiced / totalFrames,
+          voicedFrames: voiced,
+          totalFrames
+        };
+      } catch {
+        return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0 };
+      }
+    }
 
     const receiver = connection.receiver;
     if (!receiver) return;
@@ -527,45 +692,70 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
     receiver.speaking.on("start", (userId) => {
       const key = `${guildId}:${userId}`;
 
-      // 🔒 Re-entrancy-Lock: wenn noch eine Aufnahme läuft, ignoriere weitere "start"-Events
+      // Re-entrancy-Lock: solange eine Aufnahme für diesen User läuft, ignorieren
       if (capturingUsers.has(key)) return;
       capturingUsers.add(key);
 
+      let killTimer = null;
+
       try {
         const opus = receiver.subscribe(userId, {
-          // etwas großzügiger, um harte Sprechpausen nicht zu splitten
-          end: { behavior: EndBehaviorType.AfterSilence, duration: 1200 },
+          end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS },
         });
 
         const pcm  = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
         const pass = new PassThrough();
         const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
+        // Streamen
         pcm.on("data", (chunk) => pass.write(chunk));
 
+        // Harter Cut nach MAX_UTTERANCE_MS (z.B. Monologe)
+        killTimer = setTimeout(() => {
+          try { opus.destroy(); } catch {}
+        }, MAX_UTTERANCE_MS);
+
         const finish = async () => {
+          if (killTimer) { clearTimeout(killTimer); killTimer = null; }
           pass.end();
+
           try {
             const { dir, file } = await wavPromise;
 
-            // Mini-Gate: extrem kurze Schnipsel wegwerfen
+            // sehr kurze Schnipsel verwerfen
             const st = await fs.promises.stat(file).catch(() => null);
-            if (!st || st.size < 48000) return; // ~0.5s mono @48kHz
+            if (!st || st.size < MIN_WAV_BYTES) return;
 
-            const text = await getTranscription(file, "whisper-1", "auto");
+            // Zielkanal bestimmen (und parallel Voice-Consent prüfen)
+            const latestTarget = await getLatestTarget();
+            if (!latestTarget) return;
+
+            let consentOk = true;
+            try {
+              // channel-scoped consent
+              consentOk = await hasVoiceConsent(userId, latestTarget.id);
+            } catch { /* falls Modul nicht geladen, default true */ }
+            if (!consentOk) return;
+
+            // SNR/Voicing-Gate auswerten
+            const { snrDb, voicedRatio, voicedFrames } = await analyzeWav(file);
+            if (snrDb < MIN_SNR_DB || voicedRatio < MIN_VOICED_RATIO || voicedFrames < MIN_VOICED_FRAMES) {
+              return; // zu viel Rauschen/Knister/Atmen → nicht transkribieren
+            }
+
+            // Transkribieren
+            const text  = await getTranscription(file, "whisper-1", "auto");
             const clean = (text || "").trim();
             if (!clean) return;
 
-            // 🧹 Duplikat-Filter: gleiche Aussage binnen 5s ignorieren
+            // Dubletten binnen 5s unterdrücken (normierter Textvergleich)
             const norm = normText(clean);
             const now  = Date.now();
             const last = lastUtteranceMap.get(key);
-            if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) {
-              return; // Dublette → nicht posten
-            }
+            if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) return;
             lastUtteranceMap.set(key, { norm, ts: now });
 
-            // Metadaten (Name/Avatar) ermitteln
+            // Metadaten (Name/Avatar)
             const speaker = await resolveSpeakerName(client, guildId, userId);
             let avatarURL;
             try {
@@ -574,18 +764,17 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
               avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
             } catch {}
 
-            // In den aktuell hinterlegten Zielkanal posten (Webhook)
-            const latestTarget = await getLatestTarget();
-            if (latestTarget) {
-              await sendTranscriptViaWebhook(latestTarget, clean, speaker, avatarURL);
-            }
+            // Post via Relay-Webhook in den (ggf. Thread-)Zielkanal
+            await sendTranscriptViaWebhook(latestTarget, clean, speaker, avatarURL);
           } catch (err) {
             console.warn("[Transcription] failed:", err?.message || err);
           } finally {
+            // Temp-Datei entsorgen & Lock lösen
             try {
               const { dir } = await wavPromise;
               await fs.promises.rm(dir, { recursive: true, force: true });
             } catch {}
+            capturingUsers.delete(key);
           }
         };
 
@@ -593,13 +782,14 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
         pcm.once("error", (e) => {
           console.warn("[PCM stream error]:", e?.message || e);
           try { pass.destroy(); } catch {}
+          if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+          capturingUsers.delete(key);
         });
 
       } catch (e) {
         console.warn("[Voice subscribe] failed:", e?.message || e);
-      } finally {
-        // kleinen Puffer lassen, damit kurzfristige Neu-Starts nicht sofort re-entrant sind
-        setTimeout(() => capturingUsers.delete(key), 250);
+        if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+        capturingUsers.delete(key);
       }
     });
 
@@ -611,6 +801,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
         }
       }
     });
+
   } catch (e) {
     console.warn("[setStartListening] failed:", e?.message || e);
   }
@@ -619,35 +810,53 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
 
 
 
-
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
+
   setEnqueueTTS(guildId, async () => {
     let player = playerMap.get(guildId);
     if (!player) {
       const { createAudioPlayer } = require("@discordjs/voice");
       player = createAudioPlayer();
+      // Optionales Sicherheitsnetz gegen Warnungen bei sehr vielen Chunks
+      if (typeof player.setMaxListeners === "function") player.setMaxListeners(50);
       playerMap.set(guildId, player);
     }
-    // WICHTIG: nach Channel-Wechsel IMMER (re)subscriben
+
+    // Nach Channel-Wechsel immer (re)subscriben
     try { connection.subscribe(player); } catch {}
+
+    const { AudioPlayerStatus } = require("@discordjs/voice");
 
     for (const chunk of chunks) {
       try {
         const response = await getTTS(chunk, "tts-1", voice);
         const pass = new PassThrough();
         response.pipe(pass);
-        const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
+
+        const decoder = new prism.FFmpeg({
+          args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"]
+        });
         const pcmStream = pass.pipe(decoder);
         const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
 
-        player.play(resource);
+        // Listener erst registrieren, dann play() aufrufen – und beim Abschluss wieder entfernen
         await new Promise((resolve, reject) => {
-          const { AudioPlayerStatus } = require("@discordjs/voice");
-          player.once(AudioPlayerStatus.Idle, resolve);
-          player.once("error", reject);
+          const onIdle = () => { cleanup(); resolve(); };
+          const onError = (err) => { cleanup(); reject(err); };
+          const cleanup = () => {
+            try { player.off(AudioPlayerStatus.Idle, onIdle); } catch {}
+            try { player.off("error", onError); } catch {}
+          };
+
+          player.on(AudioPlayerStatus.Idle, onIdle);
+          player.on("error", onError);
+
+          player.play(resource);
         });
+
+        // kleiner Puffer zwischen Chunks
         await new Promise((r) => setTimeout(r, 100));
       } catch (e) {
         console.error("[TTS ERROR]:", e);
@@ -655,6 +864,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
     }
   });
 }
+
 
 
 async function getOrCreateRelayWebhookFor(parentChannel) {
