@@ -1,211 +1,157 @@
 // aiCore.js
 const axios = require("axios");
-const Context = require("./context.js");
 
-// Kleine Helfer fürs API-Format
-function safeName(name) {
-  // OpenAI-Anforderung: ^[^\s<|\\/>]+$   -> keine Leerzeichen, keine Sonderzeichen <>|\/
-  const pat = /^[^\s<|\\/>]+$/;
-  if (typeof name !== "string" || !name.trim()) return undefined;  // lieber gar kein name als leer
-  return pat.test(name) ? name : undefined;                        // ungültig -> weglassen
-}
-function toStringContent(x) {
-  if (x == null) return "";
-  if (typeof x === "string") return x;
-  try { return JSON.stringify(x, null, 2); } catch { return String(x); }
+// ---- Helper: Name säubern (API erlaubt keine Spaces/Sonderzeichen) ----
+function sanitizeName(name) {
+  if (typeof name !== "string") return undefined;
+  const safe = name.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  return safe || undefined;
 }
 
-// Alle Nachrichten so aufbereiten, dass sie garantiert API-kompatibel sind
-function sanitizeForChatCompletions(messages) {
+// ---- Helper: Messages für OpenAI bereinigen ----
+function sanitizeMessagesForOpenAI(messages = []) {
+  const allowedRoles = new Set(["system", "user", "assistant", "tool"]);
   const out = [];
-  for (const m of messages || []) {
-    if (!m || !m.role) continue;
 
-    const role = m.role;
-    const next = { role };
+  for (const m of messages) {
+    if (!m || !allowedRoles.has(m.role)) continue;
 
-    // name nur, wenn erlaubt – und nie für assistant (ist optional/unnötig und oft fehlerträchtig)
-    if (role !== "assistant" && m.name) {
-      const sn = safeName(m.name);
-      if (sn) next.name = sn;
+    // content immer als String (oder für tool später gesetzt)
+    let content = m.content;
+    if (Array.isArray(content)) {
+      content = content.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join("");
+    }
+    if (content == null) content = ""; // <- WICHTIG gegen "content: null"
+
+    const item = { role: m.role, content };
+
+    // "name" NUR bei user erlaubt und ohne verbotene Zeichen
+    if (m.role === "user") {
+      const safe = sanitizeName(m.name);
+      if (safe) item.name = safe;
     }
 
-    // tool_calls-Fall (assistant mit Toolaufrufen braucht content = "")
-    if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-      next.content = ""; // WICHTIG: nie null/undefined
-      next.tool_calls = m.tool_calls.map(tc => ({
+    // Tool-call-Assistant: wir akzeptieren tool_calls, aber NIEMALS null content
+    if (m.role === "assistant" && m.tool_calls) {
+      item.tool_calls = m.tool_calls.map(tc => ({
         id: tc.id,
         type: "function",
-        function: {
-          name: tc.function?.name || "",
-          arguments: typeof tc.function?.arguments === "string"
-            ? tc.function.arguments
-            : toStringContent(tc.function?.arguments ?? "{}"),
-        }
+        function: { name: tc.function?.name, arguments: String(tc.function?.arguments || "{}") }
       }));
-      out.push(next);
-      continue;
+      if (item.content == null) item.content = "";
     }
 
-    // tool-Nachricht: content MUSS String sein
-    if (role === "tool") {
-      next.tool_call_id = m.tool_call_id;
-      if (m.name) {
-        const sn = safeName(m.name);
-        if (sn) next.name = sn;
-      }
-      next.content = toStringContent(m.content);
-      out.push(next);
-      continue;
+    // Tool-Result: nur übernehmen, wenn tool_call_id da ist
+    if (m.role === "tool" && m.tool_call_id) {
+      item.tool_call_id = String(m.tool_call_id);
+      // content bleibt String (oben bereits gesichert)
     }
 
-    // alle anderen Rollen: content als String, niemals null
-    next.content = toStringContent(m.content);
-    out.push(next);
+    out.push(item);
   }
   return out;
 }
 
-/**
- * Holt eine Antwort von OpenAI inkl. Tool-Loop.
- * Fixes:
- *  - assistant mit tool_calls wird mit content:"" geloggt
- *  - nie null/fehlendes content
- *  - ungültige name-Felder werden entfernt
- *  - Tool-Result immer als String
- */
-async function getAIResponse(
-  context_orig,
-  tokenlimit = 4096,
-  sequenceLimit = 1000,
-  model = "gpt-4-turbo",
-  apiKey = null
-) {
-  if (tokenlimit == null) tokenlimit = 4096;
-  const OPENAI_API_KEY = apiKey || process.env.OPENAI_API_KEY;
+// ---- Tool-Ausführung: aus assistant.tool_calls -> tool role messages bauen ----
+async function runToolCallsOnce({ openAIRequestBase, assistantMsg, toolRegistry }) {
+  const toolCalls = assistantMsg?.tool_calls || [];
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return null;
 
-  // Arbeitskopien, damit wir History/Tools sauber halten
-  const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
-  context.messages = [...context_orig.messages];
-
-  let responseMessage = "";
-  let sequenceCounter = 0;
-
-  // Tools (falls vorhanden) in OpenAI-Format bringen
-  const tools =
-    Array.isArray(context.tools)
-      ? context.tools.map(t => ({
-          type: "function",
-          function: {
-            name: t.function?.name,
-            description: t.function?.description || "",
-            parameters: t.function?.parameters || { type: "object", properties: {} },
-          }
-        }))
-      : undefined;
-
-  do {
-    const messagesToSend = sanitizeForChatCompletions(context.messages);
-
-    const requestBody = {
-      model,
-      messages: messagesToSend,
-      max_tokens: tokenlimit,
-    };
-    if (tools && tools.length) {
-      requestBody.tools = tools;
-      requestBody.tool_choice = "auto";
-    }
-
-    let aiMessage = null;
+  const toolResults = [];
+  for (const tc of toolCalls) {
+    const fname = tc?.function?.name;
+    const fargsRaw = tc?.function?.arguments || "{}";
+    let argsObj = {};
+    try { argsObj = JSON.parse(fargsRaw); } catch {}
+    let result;
     try {
-      const { data } = await axios.post(
-        "https://api.openai.com/v1/chat/completions",
-        requestBody,
-        {
-          headers: {
-            "Authorization": `Bearer ${OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          timeout: 30000
-        }
-      );
-
-      aiMessage = data?.choices?.[0]?.message || null;
-      const finishReason = data?.choices?.[0]?.finish_reason || null;
-
-      // Tool-Calls?
-      if (aiMessage && Array.isArray(aiMessage.tool_calls) && aiMessage.tool_calls.length > 0) {
-        // 1) Assistant mit tool_calls – **mit content:""** speichern
-        context.messages.push({
-          role: "assistant",
-          content: "",                     // <— WICHTIG: niemals null/undefined
-          tool_calls: aiMessage.tool_calls
-        });
-
-        // 2) Tool(s) ausführen und als tool-Nachrichten anhängen
-        for (const tc of aiMessage.tool_calls) {
-          const fnName = tc.function?.name;
-          const argStr = tc.function?.arguments || "{}";
-          let args;
-          try { args = JSON.parse(argStr); } catch { args = { raw: argStr }; }
-
-          let toolResult;
-          try {
-            // Dein Tool-Registry-Aufruf – passe das bei dir ggf. an:
-            const impl = context.toolRegistry?.[fnName];
-            if (!impl) {
-              toolResult = { error: `Tool '${fnName}' not found.` };
-            } else {
-              toolResult = await impl(args);
-            }
-          } catch (e) {
-            toolResult = { error: String(e?.message || e) };
-          }
-
-          context.messages.push({
-            role: "tool",
-            tool_call_id: tc.id,
-            name: fnName,
-            content: toStringContent(toolResult),  // <— immer String
-          });
-        }
-
-        // Loop fortsetzen, damit das Modell die Tool-Ergebnisse „liest“
-        sequenceCounter++;
-        if (sequenceCounter >= sequenceLimit) break;
-        continue;
+      const fn = toolRegistry?.[fname];
+      if (typeof fn !== "function") {
+        result = `{"error":"Unknown tool '${fname}'"}`;
+      } else {
+        const r = await fn(argsObj);
+        result = (typeof r === "string") ? r : JSON.stringify(r);
       }
+    } catch (e) {
+      result = JSON.stringify({ error: String(e?.message || e) });
+    }
+    toolResults.push({
+      role: "tool",
+      content: result,
+      tool_call_id: tc.id || `${fname}_${Date.now()}`
+    });
+  }
 
-      // Normale Assistenten-Antwort
-      const content = toStringContent(aiMessage?.content || "");
-      responseMessage += content;
+  // Neues Request: bisherige Messages + assistant (mit tool_calls) + tool-results
+  const followUp = {
+    ...openAIRequestBase,
+    messages: sanitizeMessagesForOpenAI([
+      ...openAIRequestBase.messages,
+      { role: "assistant", content: "", tool_calls: assistantMsg.tool_calls },
+      ...toolResults
+    ])
+  };
+  return followUp;
+}
 
-      // In die laufende History mitschreiben
-      context.messages.push({ role: "assistant", content });
+// ---- Hauptfunktion: Chat + Tools robust ----
+async function getAIResponse(ctx, maxTokens = 800, model = "gpt-4o", overrideTools, overrideToolRegistry) {
+  const tools = Array.isArray(overrideTools ?? ctx.tools) ? (overrideTools ?? ctx.tools) : [];
+  const toolRegistry = overrideToolRegistry ?? ctx.toolRegistry ?? {};
 
-      const reachedLength = (finishReason === "length");
-      sequenceCounter++;
-      if (sequenceCounter >= sequenceLimit || !reachedLength) {
-        break; // fertig
-      }
+  // Basis-Request bauen
+  const base = {
+    model,
+    max_tokens: maxTokens,
+    messages: sanitizeMessagesForOpenAI(ctx.messages || [])
+  };
 
-      // Falls abgeschnitten -> „continue“-Hint anhängen
-      context.messages.push({ role: "user", content: "continue" });
-      continue;
+  // Tools nur mitsenden, wenn vorhanden
+  if (tools.length > 0) {
+    base.tools = tools;
+    base.tool_choice = "auto";
+  }
 
-    } catch (err) {
-      // Vollständiges Logging hilft bei Diagnose
-      const detail = err?.response?.data || err?.message || err;
-      console.error("[getAIResponse] OpenAI error:", detail);
-      throw err;
+  // 1. Call
+  let req = base;
+  for (let hop = 0; hop < 4; hop++) { // bis zu 4 Tool-Hops
+    const { data } = await axios.post("https://api.openai.com/v1/chat/completions", req, {
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 30000
+    });
+
+    const choice = data?.choices?.[0];
+    const msg = choice?.message || {};
+    const finish = choice?.finish_reason;
+
+    // Toolcalls?
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      // Folge-Request mit tool role messages
+      const nextReq = await runToolCallsOnce({
+        openAIRequestBase: req,
+        assistantMsg: msg,
+        toolRegistry
+      });
+      if (!nextReq) break; // Sicherheitsnetz
+      req = nextReq;
+      continue; // nächster Hop
     }
 
-  } while (true);
+    // Kein Toolcall → finaler Text
+    const text = (msg.content || "").trim();
+    return {
+      text,
+      raw: data
+    };
+  }
 
-  return responseMessage;
+  // Fallback wenn wir hier landen
+  return { text: "", raw: null };
 }
 
 module.exports = {
-  getAIResponse,
+  getAIResponse
 };
