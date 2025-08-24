@@ -7,6 +7,8 @@ const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js")
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const { getAIResponse } = require("./aiCore.js");
+const { getSpeech, setReplyAsWebhook, getChannelConfig } = require("./discord-helper.js");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
 const { initCron, reloadCronForChannel } = require("./scheduler.js");
@@ -34,6 +36,7 @@ const client = new Client({
   ],
 });
 
+
 const contextStorage = new Map();
 const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS/Transcripts)
 const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
@@ -41,6 +44,101 @@ const ttsGate = new Map(); // channelId -> boolean
 
 
 const crypto = require("crypto");
+
+function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
+  const key = `channel:${channelId}`;
+  const signature = require("crypto").createHash("sha1").update(JSON.stringify({
+    persona: channelMeta.persona || "",
+    instructions: channelMeta.instructions || "",
+    tools: (channelMeta.tools || []).map(t => t?.function?.name || t?.name || "").sort(),
+    botname: channelMeta.botname || "",
+    voice: channelMeta.voice || "",
+    summaryPrompt: channelMeta.summaryPrompt || ""
+  })).digest("hex");
+
+  if (!contextStorage.has(key)) {
+    const Context = require("./context.js");
+    const ctx = new Context(
+      channelMeta.persona,
+      channelMeta.instructions,
+      channelMeta.tools,
+      channelMeta.toolRegistry,
+      channelId
+    );
+    contextStorage.set(key, { ctx, sig: signature });
+  } else {
+    const entry = contextStorage.get(key);
+    if (entry.sig !== signature) {
+      const Context = require("./context.js");
+      entry.ctx = new Context(
+        channelMeta.persona,
+        channelMeta.instructions,
+        channelMeta.tools,
+        channelMeta.toolRegistry,
+        channelId
+      );
+      entry.sig = signature;
+    }
+  }
+  return contextStorage.get(key).ctx;
+}
+
+
+async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
+  // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
+  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+  if (!ch) { console.warn("[voice] channel missing", evt.channelId); return; }
+
+  const channelMeta = getChannelConfig(evt.channelId);
+  const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
+
+  // ⬇️ Transkript wurde in deinem setStartListening bereits in die DB/Context geschrieben.
+  // Falls du hier sicher Dedupe willst, lass es so – wir fügen NICHT erneut hinzu.
+
+  // 1) GPT call auf Basis des Context (inkl. Persona/Tools)
+  let replyText = "";
+  try {
+    // getAIResponse(context, tokenlimit, sequenceLimit, model, apiKey)
+    replyText = await getAIResponse(
+      chatContext,
+      4096,
+      1000,
+      channelMeta.model || undefined,
+      channelMeta.apikey || null
+    );
+    replyText = (replyText || "").trim();
+  } catch (e) {
+    console.error("[voice] getAIResponse failed:", e?.message || e);
+    return;
+  }
+  if (!replyText) return;
+
+  // 2) Antwort in den Context schreiben (Assistant)
+  try {
+    await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
+  } catch {}
+
+  // 3) Als Text zusätzlich in den Channel posten (mit Persona-Avatar via Webhook)
+  try {
+    const msgShim = { channel: ch }; // reicht für setReplyAsWebhook
+    await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+  } catch (e) {
+    console.warn("[voice] setReplyAsWebhook failed, fallback send:", e?.message || e);
+    try { await ch.send(replyText); } catch {}
+  }
+
+  // 4) Über Voice ausgeben (TTS) – falls verbunden
+  try {
+    const conn = getVoiceConnection(evt.guildId);
+    if (conn) {
+      await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
+    } else {
+      console.warn("[voice] no connection for guild", evt.guildId);
+    }
+  } catch (e) {
+    console.warn("[voice] TTS failed:", e?.message || e);
+  }
+}
 
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
@@ -321,46 +419,25 @@ if ((message.content || "").startsWith("!joinvc")) {
 setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
   // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
 
-  // 1) Channel-Meta + ChatContext besorgen (Parent-Textkanal!)
+  // 1) Channel-Meta + ChatContext
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
-  // 2) Voice-Transkript in DB ablegen – MIT Start-Timestamp
+  // 2) Transkript ins Log (mit Start-Timestamp)
   try {
     await chatContext.add("user", evt.speaker, evt.text, evt.startedAtMs);
   } catch (e) {
     console.warn("[voice->DB] failed:", e?.message || e);
   }
 
-  // 3) Trigger checken (wie früher bei Transkript-Webhook – nur intern)
-  const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
-  const norm = (evt.text || "").trim().toLowerCase();
-  const isTrigger =
-    norm.startsWith(triggerName) ||
-    norm.startsWith(`!${triggerName}`) ||
-    norm.includes(triggerName);
-
-  if (!isTrigger) return;
-
-  // 4) TTS nur bei Voice-Trigger erlauben
-  ttsGate.set(evt.channelId, true);
-
-  // 5) KI aufrufen – Antwort wird normal in den Channel gepostet (nicht das Transkript)
-  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
-  if (!ch) return;
-
-  const proxyMsg = buildProxyMessageForVoice(ch, evt.text, evt.userId, evt.speaker);
-  const state = { isAIProcessing: 0 };
+  // 3) Direkt GPT -> TTS -> Voice (+ Text in Channel)
   try {
-    await getProcessAIRequest(proxyMsg, chatContext, client, state, channelMeta.model, channelMeta.apikey);
+    await handleVoiceTranscriptDirect(evt, client, contextStorage);
   } catch (e) {
-    console.error("[voice->AI] failed:", e?.message || e);
-  } finally {
-    // Optional: TTS-Gate nach erster Antwort wieder schließen (falls du das so willst)
-    // → falls du das reset in setTTS schon machst, kannst du das hier weglassen
-    // ttsGate.set(evt.channelId, false);
+    console.error("[voice->direct] failed:", e?.message || e);
   }
 });
+
 
 
     await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`);
