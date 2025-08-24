@@ -8,6 +8,26 @@ const axios = require('axios');
 const { OPENAI_API_URL } = require('./config.js');
 const Context = require('./context.js');
 
+function sanitizeName(name) {
+  if (!name) return undefined;
+  // verbotene Zeichen/Whitespace -> "_", Mehrfach "_" verdichten, auf 64 kürzen
+  let s = String(name).replace(/[\s<|\\/>]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  if (!s) return undefined;
+  return s.slice(0, 64);
+}
+
+function sanitizeMessageForOpenAI(m) {
+  const out = { role: m.role, content: m.content };
+
+  // 'name' NUR setzen, wo es sicher ist (User/Tool) – und immer sanitizen.
+  // Für 'system' und 'assistant' weglassen (reduziert Risiko und ist optional).
+  if (m.role === "user" || m.role === "tool") {
+    const nm = sanitizeName(m.name || m.sender);
+    if (nm) out.name = nm;
+  }
+  return out;
+}
+
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
@@ -55,9 +75,11 @@ async function getAIResponse(
       return out;
     });
 
+    const safeMessages = (ctx.messages || []).map(sanitizeMessageForOpenAI);
+
     const payload = {
       model: model,
-      messages: messagesToSend,
+      messages: safeMessages,
       max_tokens: tokenlimit,
       tool_choice: "auto",
       tools: context.tools
