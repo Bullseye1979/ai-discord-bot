@@ -20,8 +20,19 @@ const activeRecordings = new Map();
 const _avatarInFlight = new Map(); // ⬅️ verhindert parallele Generierungen
 const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
 
+// --- Dedup/Locks für Voice ---
+const capturingUsers = new Set();              // key = `${guildId}:${userId}` -> vermeidet parallele Captures
+const lastUtteranceMap = new Map();            // key -> { norm, ts }
+const DUP_WINDOW_MS = 5000;                    // 5s Fenster für 1:1-Dubletten
 
-// --- Persona → Visual-Prompt (per GPT) ---
+function normText(s = "") {
+  return String(s)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "") // Satzzeichen raus
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // --- Persona → Visual-Prompt (per GPT) ---
 async function buildVisualPromptFromPersona(personaText) {
   // local require avoids rare binding issues
@@ -494,104 +505,105 @@ async function setStartListening(connection, guildId, guildTextChannels, client)
   try {
     if (!connection || !guildId) return;
 
-    // Alte Aufnahme-Listener lösen, wenn andere Verbindung aktiv war
+    // Vorherige Verbindung/Listener sauber ersetzen
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
     }
-    // Diese Verbindung als aktiv merken
     activeRecordings.set(guildId, connection);
 
-    // Helper: immer den aktuell konfigurierten Ziel-Textkanal aus der Map holen
+    // Immer den aktuell gesetzten Ziel-Textkanal (für Transcripts) holen
     const getLatestTarget = async () => {
       const latestId = guildTextChannels.get(guildId);
-      if (latestId) {
-        const ch = await client.channels.fetch(latestId).catch(() => null);
-        if (ch) return ch;
-      }
-      return null;
+      if (!latestId) return null;
+      const ch = await client.channels.fetch(latestId).catch(() => null);
+      return ch || null;
     };
 
     const receiver = connection.receiver;
     if (!receiver) return;
 
-    // Duplikate vermeiden
-    receiver.speaking.removeAllListeners("start");
-
+    receiver.speaking.removeAllListeners("start"); // doppelte Listener vermeiden
     receiver.speaking.on("start", (userId) => {
-      (async () => {
-        try {
-          // Aktuellen Ziel-Textkanal holen
-          const latestTarget = await getLatestTarget();
-          if (!latestTarget) return;
-          const targetChannelId = latestTarget.id;
+      const key = `${guildId}:${userId}`;
 
-          // 🔐 Channel-basierter VOICE-Consent: ohne Consent gar nicht erst abonnieren/aufzeichnen
-          const allowed = await hasVoiceConsent(userId, targetChannelId);
-          if (!allowed) return;
+      // 🔒 Re-entrancy-Lock: wenn noch eine Aufnahme läuft, ignoriere weitere "start"-Events
+      if (capturingUsers.has(key)) return;
+      capturingUsers.add(key);
 
-          // Ab hier: Abo + Decode
-          const opus = receiver.subscribe(userId, {
-            end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
-          });
+      try {
+        const opus = receiver.subscribe(userId, {
+          // etwas großzügiger, um harte Sprechpausen nicht zu splitten
+          end: { behavior: EndBehaviorType.AfterSilence, duration: 1200 },
+        });
 
-          const pcm = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
-          const pass = new PassThrough();
-          const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
+        const pcm  = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
+        const pass = new PassThrough();
+        const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
-          pcm.on("data", (chunk) => pass.write(chunk));
-          pcm.on("end", async () => {
-            pass.end();
-            let tmpDir = null;
-            try {
-              const { dir, file } = await wavPromise;
-              tmpDir = dir;
+        pcm.on("data", (chunk) => pass.write(chunk));
 
-              // sehr kurze Schnipsel ignorieren
-              const st = await fs.promises.stat(file).catch(() => null);
-              if (!st || st.size < 48000) { // ~0.5s mono @ 48kHz
-                return;
-              }
+        const finish = async () => {
+          pass.end();
+          try {
+            const { dir, file } = await wavPromise;
 
-              // Transkribieren
-              const text = await getTranscription(file, "whisper-1", "auto");
-              if (text && text.trim()) {
-                const speaker = await resolveSpeakerName(client, guildId, userId);
-                let avatarURL;
-                try {
-                  const g = await client.guilds.fetch(guildId);
-                  const m = await g.members.fetch(userId).catch(() => null);
-                  avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
-                } catch {}
+            // Mini-Gate: extrem kurze Schnipsel wegwerfen
+            const st = await fs.promises.stat(file).catch(() => null);
+            if (!st || st.size < 48000) return; // ~0.5s mono @48kHz
 
-                // In Zielkanal/Thread spiegeln (Webhook)
-                await sendTranscriptViaWebhook(latestTarget, text.trim(), speaker, avatarURL);
-              }
-            } catch (err) {
-              console.warn("[Transcription] failed:", err?.message || err);
-            } finally {
-              // Temp-Datei/Ordner wegräumen
-              try {
-                const { dir } = await wavPromise;
-                tmpDir = tmpDir || dir;
-              } catch {}
-              if (tmpDir) {
-                try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch {}
-              }
+            const text = await getTranscription(file, "whisper-1", "auto");
+            const clean = (text || "").trim();
+            if (!clean) return;
+
+            // 🧹 Duplikat-Filter: gleiche Aussage binnen 5s ignorieren
+            const norm = normText(clean);
+            const now  = Date.now();
+            const last = lastUtteranceMap.get(key);
+            if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) {
+              return; // Dublette → nicht posten
             }
-          });
+            lastUtteranceMap.set(key, { norm, ts: now });
 
-          pcm.on("error", (e) => {
-            console.warn("[PCM stream error]:", e?.message || e);
-            try { pass.destroy(); } catch {}
-          });
-        } catch (e) {
-          console.warn("[Voice subscribe] failed:", e?.message || e);
-        }
-      })();
+            // Metadaten (Name/Avatar) ermitteln
+            const speaker = await resolveSpeakerName(client, guildId, userId);
+            let avatarURL;
+            try {
+              const g = await client.guilds.fetch(guildId);
+              const m = await g.members.fetch(userId).catch(() => null);
+              avatarURL = m?.user?.displayAvatarURL?.({ extension: "png", size: 256 });
+            } catch {}
+
+            // In den aktuell hinterlegten Zielkanal posten (Webhook)
+            const latestTarget = await getLatestTarget();
+            if (latestTarget) {
+              await sendTranscriptViaWebhook(latestTarget, clean, speaker, avatarURL);
+            }
+          } catch (err) {
+            console.warn("[Transcription] failed:", err?.message || err);
+          } finally {
+            try {
+              const { dir } = await wavPromise;
+              await fs.promises.rm(dir, { recursive: true, force: true });
+            } catch {}
+          }
+        };
+
+        pcm.once("end", finish);
+        pcm.once("error", (e) => {
+          console.warn("[PCM stream error]:", e?.message || e);
+          try { pass.destroy(); } catch {}
+        });
+
+      } catch (e) {
+        console.warn("[Voice subscribe] failed:", e?.message || e);
+      } finally {
+        // kleinen Puffer lassen, damit kurzfristige Neu-Starts nicht sofort re-entrant sind
+        setTimeout(() => capturingUsers.delete(key), 250);
+      }
     });
 
-    // Clean-up nur, wenn genau diese Verbindung endet
+    // Aufräumen, wenn diese Verbindung beendet wird
     connection.on("stateChange", (oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
         if (activeRecordings.get(guildId) === connection) {
