@@ -660,15 +660,13 @@ const isTrigger =
 if (!isTrigger) return;
 
 // getippte Nachricht ins Log (mit Anhängen etc.)
+const raw = (message?.content || "").trim();
 
-if (message.startsWith("!") || message.startsWith("+")) 
-{
-  return;
-} else {
-
-   await setAddUserMessage(message, chatContext);
-
+// nur überspringen wenn ! oder +
+if (!(raw.startsWith("!") || raw.startsWith("+"))) {
+  await setAddUserMessage(message, chatContext);
 }
+
 
 
 // KI aufrufen (Typed Flow; kein Proxy nötig)
