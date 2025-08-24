@@ -661,7 +661,7 @@ if (!isTrigger) return;
 
 // getippte Nachricht ins Log (mit Anhängen etc.)
 
-if (message.content.startsWith("!") || message.conntent.startsWith("+")) 
+if (message.startsWith("!") || message.startsWith("+")) 
 {
   return;
 } else {
