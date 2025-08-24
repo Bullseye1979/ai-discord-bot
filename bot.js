@@ -84,6 +84,27 @@ function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
   return contextStorage.get(key).ctx;
 }
 
+function firstWordEqualsName(text, triggerName) {
+  if (!triggerName) return false;
+  const t = String(triggerName).trim().toLowerCase();
+
+  // Erstes „Wort“ extrahieren, Satzzeichen am Rand ignorieren (Jenny, Jenny? "Jenny" etc.)
+  const m = String(text || "")
+    .trim()
+    .match(/^([^\s.,:;!?'"„“‚’«»()[\]{}<>—–-]+)/u);
+
+  const first = (m?.[1] || "").toLowerCase();
+  return first === t;
+}
+
+function stripLeadingName(text, triggerName) {
+  if (!triggerName) return String(text || "").trim();
+  const esc = triggerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Entfernt: <Spaces> + Name + optionales Satzzeichen + Spaces
+  const re = new RegExp(`^\\s*${esc}\\s*[.,:;!?'"„“‚’«»()\\[\\]{}<>—–-]*\\s*`, "i");
+  return String(text || "").replace(re, "").trim();
+}
+
 
 async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
   // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
@@ -419,21 +440,41 @@ if ((message.content || "").startsWith("!joinvc")) {
    // bot.js — im !joinvc-Handler:
 setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
   // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
-
-  // 1) Channel-Meta + ChatContext
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
-  // 2) Transkript ins Log (mit Start-Timestamp)
+  // ---- Gate: nur reagieren, wenn erstes Wort == channelMeta.name ----
+  const TRIGGER = (channelMeta.name || "").trim();
+  const invoked = firstWordEqualsName(evt.text, TRIGGER);
+
+  // Optional: trotzdem ALLE Transkripte loggen (auch ohne Invocation)
+  const LOG_ALL_TRANSCRIPTS = true;
+
+  if (!invoked) {
+    if (LOG_ALL_TRANSCRIPTS) {
+      try { await chatContext.add("user", evt.speaker, evt.text, evt.startedAtMs); } catch {}
+    }
+    return; // ← keine Antwort erzeugen
+  }
+
+  // Für die KI das Triggerwort vorne entfernen (damit der Prompt sauber ist)
+  const cleanedUserText = stripLeadingName(evt.text, TRIGGER);
+
+  // Transkript (bereinigt) in den Kontext
   try {
-    await chatContext.add("user", evt.speaker, evt.text, evt.startedAtMs);
+    await chatContext.add("user", evt.speaker, cleanedUserText, evt.startedAtMs);
   } catch (e) {
     console.warn("[voice->DB] failed:", e?.message || e);
   }
 
-  // 3) Direkt GPT -> TTS -> Voice (+ Text in Channel)
+  // Direktantwort (GPT -> Text in Channel via Webhook -> TTS in Voice)
   try {
-    await handleVoiceTranscriptDirect(evt, client, contextStorage);
+    // Wir nutzen die bestehende Direct-Pipeline aus deiner letzten Version
+    await handleVoiceTranscriptDirect(
+      { ...evt, text: cleanedUserText }, // sicherheitshalber den bereinigten Text weiterreichen
+      client,
+      contextStorage
+    );
   } catch (e) {
     console.error("[voice->direct] failed:", e?.message || e);
   }
