@@ -1,10 +1,12 @@
-// aiService.js — Version 1.2 (DEBUG minimal, keine Änderung an Tools / APIs)
+// aiService.js — Version 1.3 (Guard gegen leere messages + sichere name-Sanitization + Debug)
 require('dotenv').config();
 const axios = require('axios');
 const { OPENAI_API_URL } = require('./config.js');
 const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
+
+// ---------- shared utils ----------
 
 // Sichere Fehlerausgabe (Authorization-Header maskiert)
 function logAxiosErrorSafe(prefix, err) {
@@ -34,21 +36,66 @@ function logAxiosErrorSafe(prefix, err) {
   }
 }
 
+// OpenAI-konforme, verlustfreie Name-Sanitization (löscht keine Messages)
+function cleanOpenAIName(role, name) {
+  if (!name) return undefined;
+  if (role === "system" || role === "tool") return undefined;
+  let s = String(name)
+    .trim()
+    .replace(/[\s<|\\/>\u0000-\u001F]/g, "_")
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/_{2,}/g, "_")
+    .replace(/^_+|_+$/g, "");
+  s = s.slice(0, 64);
+  if (!s) return undefined;
+  const reserved = new Set(["assistant", "user", "system", "tool"]);
+  if (reserved.has(s.toLowerCase())) return undefined;
+  return s;
+}
+
+// ---------- core helpers ----------
+
 // Einfacher GPT-Call (ohne Tools)
 async function getAI(context, tokenlimit = 4096, model = "gpt-4o") {
+  // 1) defensiv klonen + prüfen
+  const msgs = Array.isArray(context?.messages) ? [...context.messages] : [];
+
+  if (!msgs.length) {
+    // Nichts senden – stattdessen klarer Debug + Stacktrace
+    const stack = new Error("getAI called with empty context.messages").stack;
+    console.error("[GUARD] getAI(): context.messages is empty. Caller must provide at least one message.");
+    console.error(stack);
+    // Optional: einen Mini-Preview des context-Objekts
+    try {
+      const preview = Object.fromEntries(Object.entries(context || {}).slice(0, 8));
+      console.error("[GUARD] context preview (first keys):", preview);
+    } catch (_) {}
+    // gezielt abbrechen, damit kein 400 entsteht
+    throw new Error("getAI(): empty messages – caller bug. See logs for details.");
+  }
+
+  // 2) Name-Sanitizing (verlustfrei)
+  const messagesToSend = msgs.map(m => {
+    const out = { role: m.role, content: m.content };
+    const safeName = cleanOpenAIName(m.role, m.name);
+    if (safeName) out.name = safeName;
+    // getAI() hat keine tool_calls – bewusst nicht übernehmen
+    return out;
+  });
+
   const payload = {
     model: model,
-    messages: [...context.messages],
+    messages: messagesToSend,
     max_tokens: tokenlimit
   };
 
-  // DEBUG: Minimalvorschau
+  // DEBUG: kompakte Payload-Vorschau
   try {
     console.log("──────────────── DEBUG:getAI → OpenAI Payload ───────────────────────");
     console.log(JSON.stringify({
       model,
       max_tokens: tokenlimit,
-      messages_preview: payload.messages.map(m => ({
+      messages_preview: messagesToSend.map(m => ({
         role: m.role,
         name: m.name,
         content: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 400)
