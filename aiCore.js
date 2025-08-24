@@ -75,7 +75,7 @@ async function getAIResponse(
       return out;
     });
 
-    const safeMessages = (ctx.messages || []).map(sanitizeMessageForOpenAI);
+    const safeMessages = (messagesToSend || []).map(sanitizeMessageForOpenAI);
 
     const payload = {
       model: model,
