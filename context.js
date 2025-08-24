@@ -1,13 +1,28 @@
-// context.js — v4.9 (safe names + tool messages + DB like v4.8)
-// - Sanitizes all message `name` fields to satisfy OpenAI ^[^\s<|\\/>]+$
-// - Adds first-class support for tool messages (role:"tool" + tool_call_id)
-// - Keeps DB schema/behavior from v4.8 intact
+// context.js — v4.9 (robust: safe name + always-memory + DB-optional)
+// Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
 
 let pool;
+
+// --- Helpers ---------------------------------------------------------
+
+function toMySQLDateTime(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
+// OpenAI akzeptiert names nur mit regex: ^[^\s<|\\/>]+$
+// Wir erlauben a–z, 0–9, _ und schneiden auf 64 Zeichen.
+function sanitizeName(input, fallback = "user") {
+  return String(input || fallback)
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]/gi, "")
+    .slice(0, 64) || fallback;
+}
 
 async function getPool() {
   if (!pool) {
@@ -61,19 +76,7 @@ async function ensureTables(pool) {
   }
 }
 
-function toMySQLDateTime(date = new Date()) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
-}
-
-// ✅ Name-Whitelist für OpenAI: keine Leerzeichen/Sonderzeichen, max 64
-function sanitizeName(s, fallback = "system") {
-  return String(s || fallback)
-    .toLowerCase()
-    .replace(/\s+/g, "_")
-    .replace(/[^a-z0-9_]/gi, "")
-    .slice(0, 64) || fallback;
-}
+// --- Context Class ---------------------------------------------------
 
 class Context {
   constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = "global", opts = {}) {
@@ -120,78 +123,56 @@ class Context {
   }
 
   /**
-   * Add a message to context + DB.
-   * @param {"system"|"user"|"assistant"|"tool"} role
-   * @param {string} sender - logical sender name (will be sanitized)
-   * @param {string} content
-   * @param {number|null} timestampMs
-   * @param {{ alsoMemory?: boolean, tool_call_id?: string, function_name?: string }} opts
+   * Robustes add():
+   * - Sanitized name (verhindert 400er).
+   * - Schreibt IMMER erst in-memory.
+   * - DB-Write best-effort (Fehler ≠ Verlust der Nachricht).
    */
-  async add(role, sender, content, timestampMs = null, opts = {}) {
-    const { alsoMemory = true, tool_call_id = null, function_name = null } = opts;
+  async add(role, sender, content, timestampMs = null, { alsoMemory = true } = {}) {
+    const safeRole = String(role || "user");
+    const safeName = sanitizeName(sender, safeRole === "system" ? "system" : "user");
+    const safeContent = String(content ?? "");
 
-    // Persist basic fields in DB (no tool_call_id column -> we store only text)
-    const db = await getPool();
-    const ts = toMySQLDateTime(timestampMs ? new Date(timestampMs) : new Date());
-    await db.execute(
-      `INSERT INTO context_log (timestamp, channel_id, role, sender, content)
-       VALUES (?, ?, ?, ?, ?)`,
-      [
-        ts,
-        this.channelId,
-        String(role || "user"),
-        sanitizeName(sender || (role === "system" ? "system" : "user")),
-        String(content || "")
-      ]
-    );
-
+    // 1) Sofort in-memory pushen (damit Tools ohne DB laufen).
     if (alsoMemory) {
-      const msg = {
-        role: String(role || "user"),
-        name: sanitizeName(
-          role === "tool"
-            ? (function_name || sender || "tool")
-            : (sender || (role === "system" ? "system" : "user"))
-        ),
-        content: String(content || "")
-      };
-
-      // ✅ Tool-IDs korrekt anheften (für Chat Completions Pflicht nach tool_calls)
-      if (role === "tool" && tool_call_id) {
-        msg.tool_call_id = String(tool_call_id);
-      }
-
-      this.messages.push(msg);
-      return msg;
+      this.messages.push({ role: safeRole, name: safeName, content: safeContent });
     }
-    return null;
-  }
 
-  /**
-   * Convenience: Tool-Ergebnis hinzufügen (richtige Felder gesetzt)
-   */
-  async addToolResult(tool_call_id, functionName, content) {
-    return this.add(
-      "tool",
-      functionName || "tool",
-      content || "",
-      null,
-      { tool_call_id, function_name: functionName || "tool", alsoMemory: true }
-    );
+    // 2) DB-Write best-effort (nicht blockierend für Tools).
+    try {
+      const db = await getPool();
+      const ts = toMySQLDateTime(timestampMs ? new Date(timestampMs) : new Date());
+      await db.execute(
+        `INSERT INTO context_log (timestamp, channel_id, role, sender, content)
+         VALUES (?, ?, ?, ?, ?)`,
+        [ts, this.channelId, safeRole, safeName, safeContent]
+      );
+    } catch (e) {
+      // Kein Drama im Toolfluss: nur loggen.
+      console.warn("[DB][add] write failed (non-fatal):", e.message);
+    }
+
+    return { role: safeRole, name: safeName, content: safeContent };
   }
 
   async getMessagesAfter(cutoffMs) {
-    const db = await getPool();
-    const [rows] = await db.execute(
-      `SELECT timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id=? AND timestamp >= ?
-        ORDER BY id ASC`,
-      [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
-    );
-    return rows || [];
+    try {
+      const db = await getPool();
+      const [rows] = await db.execute(
+        `SELECT timestamp, role, sender, content
+           FROM context_log
+          WHERE channel_id=? AND timestamp >= ?
+          ORDER BY id ASC`,
+        [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
+      );
+      return rows || [];
+    } catch (e) {
+      console.warn("[DB][getMessagesAfter] read failed:", e.message);
+      return [];
+    }
   }
 
+  // --- Summarizer (unverändert bis auf safeName-Nutzung) -------------
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (this.isSummarizing) {
       return { messages: this.messages, insertedSummaryId: null, usedMaxContextId: null };
@@ -248,7 +229,7 @@ Output:
 
       if (rows.length) {
         const text = rows
-          .map(r => `[#${r.id}] ${String(r.role).toUpperCase()}(${r.sender}): ${r.content}`)
+          .map(r => `[#${r.id}] ${String(r.role || "").toUpperCase()}(${r.sender}): ${r.content}`)
           .join("\n");
 
         const prompt =
@@ -259,13 +240,12 @@ Output:
         const sumCtx = new Context(
           "You are a channel summary generator.",
           prompt,
-          [],
-          {},
+          [], // keine Tools
+          {}, // kein Tool-Registry
           this.channelId,
           { skipInitialSummaries: true }
         );
 
-        // in-memory only
         sumCtx.messages.push({ role: "user", name: "system", content: text });
 
         const summary = (await getAI(sumCtx, 900, "gpt-4-turbo", { temperature: 0.1 }))?.trim() || "";
@@ -282,7 +262,6 @@ Output:
         console.debug("[SUMMARY] No new rows since last cursor/cutoff.");
       }
 
-      // Rebuild new context: system + last 5 summaries + all messages >= cutoff
       const [desc] = await db.execute(
         `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
         [this.channelId]
@@ -299,11 +278,7 @@ Output:
 
       const afterRows = await this.getMessagesAfter(cutoffMs);
       for (const r of afterRows) {
-        newMsgs.push({
-          role: r.role,
-          name: sanitizeName(r.sender || (r.role === "system" ? "system" : "user")),
-          content: r.content
-        });
+        newMsgs.push({ role: r.role, name: sanitizeName(r.sender), content: r.content });
       }
 
       this.messages = newMsgs;
@@ -317,21 +292,31 @@ Output:
   }
 
   async getLastSummaries(limit = 5) {
-    const db = await getPool();
-    const [rows] = await db.execute(
-      `SELECT id, timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
-      [this.channelId, Number(limit)]
-    );
-    return rows || [];
+    try {
+      const db = await getPool();
+      const [rows] = await db.execute(
+        `SELECT id, timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
+        [this.channelId, Number(limit)]
+      );
+      return rows || [];
+    } catch (e) {
+      console.warn("[DB][getLastSummaries] read failed:", e.message);
+      return [];
+    }
   }
 
   async getMaxContextId() {
-    const db = await getPool();
-    const [rows] = await db.execute(
-      `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
-      [this.channelId]
-    );
-    return rows?.[0]?.maxId ?? null;
+    try {
+      const db = await getPool();
+      const [rows] = await db.execute(
+        `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
+        [this.channelId]
+      );
+      return rows?.[0]?.maxId ?? null;
+    } catch (e) {
+      console.warn("[DB][getMaxContextId] read failed:", e.message);
+      return null;
+    }
   }
 
   async bumpCursorToCurrentMax() {
@@ -352,20 +337,26 @@ Output:
   }
 
   async purgeChannelData() {
-    const db = await getPool();
-    const [r1] = await db.execute(`DELETE FROM context_log WHERE channel_id=?`, [this.channelId]);
-    const [r2] = await db.execute(`DELETE FROM summaries WHERE channel_id=?`, [this.channelId]);
-    this._rebuildSystemOnly();
-    return {
-      contextDeleted: r1?.affectedRows ?? 0,
-      summariesDeleted: r2?.affectedRows ?? 0,
-    };
+    try {
+      const db = await getPool();
+      const [r1] = await db.execute(`DELETE FROM context_log WHERE channel_id=?`, [this.channelId]);
+      const [r2] = await db.execute(`DELETE FROM summaries WHERE channel_id=?`, [this.channelId]);
+      this._rebuildSystemOnly();
+      return {
+        contextDeleted: r1?.affectedRows ?? 0,
+        summariesDeleted: r2?.affectedRows ?? 0,
+      };
+    } catch (e) {
+      console.error("[PURGE] failed:", e.message);
+      this._rebuildSystemOnly();
+      return { contextDeleted: 0, summariesDeleted: 0 };
+    }
   }
 
   async getContextAsChunks() {
     const max = 1900;
     const full = JSON.stringify(
-      this.messages.map((m) => ({ role: m.role, name: m.name, content: m.content, tool_call_id: m.tool_call_id })),
+      this.messages.map((m) => ({ role: m.role, name: m.name, content: m.content })),
       null,
       2
     );
