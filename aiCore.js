@@ -1,204 +1,177 @@
-// aiCore.js — safe tool loop + name/content sanitizing for chat.completions
+// aiCore.js — fixed voice+tool flow, safe names + content
+// - Keeps your existing tool-call formatting intact (we pass through the tools array as-is)
+// - Rejects invalid message.name (spaces etc.) when sending to OpenAI (prevents 400s)
+// - Never sends `null` content to OpenAI; coerces to "" where needed
+// - Returns a plain string (assistant text), as discord-handler expects
+// - Supports tool-call loop (assistant -> tools -> assistant)
+//
+// Exports:
+//   getAIResponse(context, tokenlimit=4096, sequenceLimit=1000, model="gpt-4-turbo", apiKey=null)
+
 const axios = require("axios");
+const { tools, getToolRegistry } = require("./tools.js");
 
-/** matches allowed pattern: ^[^\s<|\\/>]+$  */
-const NAME_OK = /^[^\s<|\\/>]+$/;
+const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
-/** turn any display name into an API-safe token or return undefined to drop it */
-function sanitizeName(maybeName) {
-  if (!maybeName) return undefined;
-  let s = String(maybeName)
-    // strip angle/pipe/slash/backslash
-    .replace(/[<|\\/>\u200B-\u200D\uFEFF]/g, "")
-    // spaces -> underscore
-    .replace(/\s+/g, "_")
-    // remove other weird whitespace
-    .trim();
+const VALID_NAME = /^[^\s<|\\/>]+$/;
 
-  // if still bad, brute-clean to [A-Za-z0-9_-]
-  if (!NAME_OK.test(s)) {
-    s = s.replace(/[^\w-]/g, "");
+// Convert any content shape into a flat string for OpenAI / for our return value
+function asText(c) {
+  if (c == null) return "";
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    // handle potential array-of-parts formats defensively
+    return c.map(p => {
+      if (typeof p === "string") return p;
+      if (p && typeof p.text === "string") return p.text;
+      return "";
+    }).join("");
   }
-  // length clamp (OpenAI docs limit name to 64 chars typically)
-  if (s.length > 64) s = s.slice(0, 64);
-
-  if (!s || !NAME_OK.test(s)) return undefined;
-  return s;
+  try { return String(c); } catch { return ""; }
 }
 
-/** ensure message.content is a string if present; if it's null and role=assistant with tool_calls → make it "" */
-function fixContentShape(msg) {
-  if (msg == null || typeof msg !== "object") return msg;
-  // Tool outputs MUST be string
-  if (msg.role === "tool") {
-    if (msg.content == null) msg.content = "";
-    if (typeof msg.content !== "string") {
-      try { msg.content = JSON.stringify(msg.content); } catch { msg.content = String(msg.content); }
+// Build a safe messages array for OpenAI
+function buildOpenAIMessages(context, limit) {
+  const messages = Array.isArray(context?.messages) ? context.messages : [];
+  const seq = (Number.isFinite(limit) && limit > 0)
+    ? messages.slice(-limit)
+    : messages.slice();
+
+  return seq.map(m => {
+    const out = {
+      role: m.role,
+      // IMPORTANT: never send null; always coerce to string
+      content: asText(m.content)
+    };
+    if (m.name && VALID_NAME.test(String(m.name))) {
+      out.name = m.name;
     }
-    return msg;
-  }
-  // Assistant with tool_calls may come back with content:null → set to empty string
-  if (msg.role === "assistant" && msg.content == null) {
-    msg.content = "";
-  }
-  // For all others: if content exists but is not string, coerce
-  if (msg.content != null && typeof msg.content !== "string") {
-    try { msg.content = JSON.stringify(msg.content); } catch { msg.content = String(msg.content); }
-  }
-  return msg;
+    if (m.tool_calls) out.tool_calls = m.tool_calls;
+    if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+    return out;
+  });
 }
 
-/** clone + sanitize one message */
-function sanitizeMessage(m) {
-  const msg = { ...m };
-
-  // role is required by API; keep as is
-  // name is optional; only keep if valid after sanitize
-  if (msg.name != null) {
-    const cleaned = sanitizeName(msg.name);
-    if (cleaned) msg.name = cleaned; else delete msg.name;
-  }
-
-  // content shape
-  fixContentShape(msg);
-
-  // tool role: ensure tool_call_id present if you use tool messages
-  // (we don't force it; we just pass through whatever ctx built)
-
-  return msg;
-}
-
-/** sanitize the whole messages array */
-function buildCleanMessages(rawMessages) {
-  if (!Array.isArray(rawMessages)) return [];
-  return rawMessages
-    .filter(m => m && typeof m.role === "string") // keep only valid
-    .map(sanitizeMessage);
-}
-
-/**
- * Execute local tool by name using provided registry.
- * The registry is expected to be { [toolName]: async (args) => string|object }.
- */
-async function runLocalTool(toolRegistry, name, args) {
-  const fn = toolRegistry && toolRegistry[name];
-  if (!fn) {
-    return JSON.stringify({ error: `Tool '${name}' not found` });
-  }
+// Execute a single tool by name using the registry
+async function runToolCall(call, registry, channelId) {
   try {
-    const res = await fn(args || {});
-    if (typeof res === "string") return res;
-    return JSON.stringify(res);
+    const fn = call?.function?.name;
+    const args = call?.function?.arguments;
+    if (!fn || !registry || typeof registry[fn]?.handler !== "function") {
+      return { ok: false, text: `Tool ${fn || "<unknown>"} not available.` };
+    }
+    let parsedArgs = {};
+    try {
+      parsedArgs = args && typeof args === "string" ? JSON.parse(args) : (args || {});
+    } catch {
+      // pass raw args string if JSON.parse failed
+      parsedArgs = { __raw: String(args) };
+    }
+    const res = await registry[fn].handler(parsedArgs, channelId);
+    const out = (res && typeof res === "object" && "content" in res) ? res.content : res;
+    return { ok: true, text: asText(out) };
   } catch (e) {
-    return JSON.stringify({ error: String(e && e.message || e) });
+    return { ok: false, text: `Tool error: ${e?.message || e}` };
   }
 }
 
-/**
- * Main entry used everywhere else.
- * Keep signature as used in your code: getAIResponse(ctx, maxTokens, temperature, model, apiKey)
- */
-async function getAIResponse(ctx, maxTokens = 4096, temperature = 0.7, model = "gpt-4o", apiKey) {
-  if (!apiKey) throw new Error("Missing OpenAI API key");
-
-  // ---- 1) Collect messages from ctx the way your code already does ----
-  // If your Context has a method (e.g. getContext()), prefer that:
-  let baseMessages = Array.isArray(ctx?.messages) ? ctx.messages : [];
-  // If you actually use a method, uncomment the next lines and adapt:
-  // if (typeof ctx.getContext === "function") {
-  //   baseMessages = await ctx.getContext();
-  // }
-
-  const messages = buildCleanMessages(baseMessages);
-
-  // Tools (as you already format them elsewhere)
-  const tools = Array.isArray(ctx?.tools) ? ctx.tools : undefined;
-  const toolRegistry = ctx?.toolRegistry || {};
-
-  const client = axios.create({
-    baseURL: "https://api.openai.com/v1",
+async function openAIChat(payload, apiKey) {
+  const key = apiKey || process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("Missing OpenAI API key");
+  const res = await axios.post(OPENAI_URL, payload, {
     timeout: 30000,
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
+      "Authorization": `Bearer ${key}`,
       "Content-Type": "application/json",
-    },
+      "Accept": "application/json"
+    }
   });
+  return res?.data;
+}
 
-  // Helper to call chat.completions once
-  async function callOnce(msgs) {
-    const body = {
-      model,
-      messages: msgs,
-      max_tokens: maxTokens,
-      // keep your exact fields/format:
-      ...(tools && tools.length ? { tools, tool_choice: "auto" } : {}),
-    };
+async function getAIResponse(context_orig, tokenlimit = 4096, sequenceLimit = 1000, model = "gpt-4-turbo", apiKey = null) {
+  // Clone & ensure tool registry
+  const context = {
+    ...context_orig,
+    messages: Array.isArray(context_orig?.messages) ? [...context_orig.messages] : [],
+    toolRegistry: context_orig?.toolRegistry || getToolRegistry((context_orig?.tools || tools).map(t => t.function.name)).registry,
+    tools: (context_orig?.tools && context_orig.tools.length ? context_orig.tools : tools)
+  };
 
-    const { data } = await client.post("/chat/completions", body);
-    return data;
+  // Build messages for first call
+  const messages = buildOpenAIMessages(context, sequenceLimit);
+
+  // Prepare payload with tools exactly as defined
+  const payloadBase = {
+    model,
+    messages,
+    max_tokens: tokenlimit,
+    tool_choice: "auto",
+    tools: context.tools
+  };
+
+  // 1) First call
+  let data;
+  try {
+    data = await openAIChat(payloadBase, apiKey);
+  } catch (e) {
+    // Bubble up rich error for the caller to log
+    if (e?.response?.data) {
+      console.error(JSON.stringify(e.response.data, null, 2));
+    }
+    throw e;
   }
 
-  // ---- 2) Initial call ----
-  let working = messages.slice();
-  let data = await callOnce(working);
+  const firstMsg = data?.choices?.[0]?.message || {};
+  const firstContent = asText(firstMsg.content);
+  let finalText = firstContent;
 
-  // ---- 3) Tool loop (max 5 hops) ----
-  for (let hop = 0; hop < 5; hop++) {
-    const choice = data?.choices?.[0];
-    if (!choice) break;
+  // If the model emitted tool calls, run them and then ask again
+  const toolCalls = Array.isArray(firstMsg.tool_calls) ? firstMsg.tool_calls : [];
 
-    const assistantMsg = choice.message || {};
-    // Normalize content shape to dodge "content must be string"
-    fixContentShape(assistantMsg);
-
-    const toolCalls = assistantMsg.tool_calls || assistantMsg.toolCalls || null;
-
-    if (!toolCalls || !Array.isArray(toolCalls) || toolCalls.length === 0) {
-      // no tool calls → final
-      return {
-        text: assistantMsg.content || "",
-        raw: data,
-      };
-    }
-
-    // Push the assistant message with tool_calls (and content:"")
-    working.push({
+  if (toolCalls.length > 0) {
+    // Put the assistant message with tool_calls into our running context
+    context.messages.push({
       role: "assistant",
-      content: assistantMsg.content || "",
-      tool_calls: toolCalls.map(tc => ({
-        id: tc.id,
-        type: "function",
-        function: { name: tc.function?.name, arguments: tc.function?.arguments }
-      })),
+      content: firstContent,           // keep any assistant text that came with the tool_calls (often empty)
+      tool_calls: toolCalls
     });
 
-    // Execute each tool, push tool results
-    for (const tc of toolCalls) {
-      const toolName = tc?.function?.name;
-      let args = {};
-      try { args = tc?.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch {}
-      const result = await runLocalTool(toolRegistry, toolName, args);
-
-      working.push({
+    // Execute each tool, push results
+    for (const call of toolCalls) {
+      const { ok, text } = await runToolCall(call, context.toolRegistry, context_orig?.channelId || null);
+      context.messages.push({
         role: "tool",
-        tool_call_id: tc.id,
-        content: typeof result === "string" ? result : JSON.stringify(result),
-        // DO NOT set name on tool messages (avoid name pattern issues)
+        name: call?.function?.name || undefined,
+        tool_call_id: call?.id,
+        content: asText(text)
       });
     }
 
-    // Next round
-    data = await callOnce(working);
+    // 2) Second call with tool results
+    const followup = {
+      model,
+      messages: buildOpenAIMessages(context, sequenceLimit),
+      max_tokens: tokenlimit,
+      tool_choice: "none",
+      tools: context.tools
+    };
+
+    let data2;
+    try {
+      data2 = await openAIChat(followup, apiKey);
+    } catch (e) {
+      if (e?.response?.data) {
+        console.error(JSON.stringify(e.response.data, null, 2));
+      }
+      throw e;
+    }
+    const secondMsg = data2?.choices?.[0]?.message || {};
+    finalText = asText(secondMsg.content);
   }
 
-  // safety return
-  const finalChoice = data?.choices?.[0]?.message;
-  return {
-    text: (finalChoice && (finalChoice.content || "")) || "",
-    raw: data,
-  };
+  // Return plain string (discord-handler expects .trim() to work)
+  return asText(finalText).trim();
 }
 
-module.exports = {
-  getAIResponse,
-};
+module.exports = { getAIResponse };
