@@ -279,16 +279,25 @@ client.on("messageCreate", async (message) => {
     }
   }
   const chatContext = contextStorage.get(key).ctx;
-  const rawWindow =
-  channelMeta.max_user_messages ??
-  channelMeta.maxUserMessages ??
-  null; // wenn null => kein Trim
+
+
+// robustes Lesen (snake_case ODER camelCase, Zahl oder String)
+const rawWindow =
+  (channelMeta.max_user_messages ?? channelMeta.maxUserMessages ?? null);
+
+const parsedWindow =
+  (rawWindow === null || rawWindow === undefined || rawWindow === "")
+    ? null
+    : (Number.isFinite(Number(rawWindow)) ? Number(rawWindow) : null);
 
 if (typeof chatContext.setUserWindow === "function") {
-  chatContext.setUserWindow(rawWindow, { prunePerTwoNonUser: true });
-  console.log("[CTX] setUserWindow", { channel: baseChannelId, rawWindow, effective: chatContext._maxUserMessages });
+  chatContext.setUserWindow(parsedWindow, { prunePerTwoNonUser: true });
+  console.log("[CTX] setUserWindow", {
+    channel: baseChannelId,
+    rawWindow,
+    effective: chatContext._maxUserMessages
+  });
 }
-
 
 
   // ---- Zentrale Command-Gates ----
