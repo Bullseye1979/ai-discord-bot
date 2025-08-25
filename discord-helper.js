@@ -294,16 +294,19 @@ function getChannelConfig(channelId) {
   const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
   const def = getDefaultPersona();
 
-  // Defaults
-  let persona       = def.persona;
-  let instructions  = def.instructions;
-  let voice         = def.voice;
-  let name          = def.name;
-  let botname       = def.botname;
-  let selectedTools = def.selectedTools;
-  let blocks        = def.blocks;
-  let summaryPrompt = def.summaryPrompt;
-  let admins        = Array.isArray(def.admins) ? def.admins : [];
+  // Defaults (robust, inkl. Fallbacks)
+  let persona       = def.persona || "";
+  let instructions  = def.instructions || "";
+  let voice         = def.voice || "";
+  let name          = def.name || "";
+  let botname       = def.botname || "AI";
+  let selectedTools = def.selectedTools || def.tools || [];
+  let blocks        = Array.isArray(def.blocks) ? def.blocks : [];
+  let summaryPrompt = def.summaryPrompt || def.summary_prompt || "";
+  let max_user_messages = (Number.isFinite(Number(def.max_user_messages)) && Number(def.max_user_messages) >= 0)
+    ? Number(def.max_user_messages)
+    : null;
+  let admins        = Array.isArray(def.admins) ? def.admins.map(String) : [];
 
   const hasConfigFile = fs.existsSync(configPath);
 
@@ -319,11 +322,22 @@ function getChannelConfig(channelId) {
       if (typeof cfg.instructions === "string") instructions = cfg.instructions;
       if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
       if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
+
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
-      // WICHTIG: Admins sauber übernehmen (nicht def.admins mutieren)
+      // max_user_messages: snake_case oder camelCase, Zahl oder numerischer String
+      const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
+      if (rawMax === null || rawMax === undefined || rawMax === "") {
+        max_user_messages = null; // AUS
+      } else {
+        const n = Number(rawMax);
+        max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
+      }
+
+      // Admins sauber übernehmen
       if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
+
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -349,11 +363,13 @@ function getChannelConfig(channelId) {
     toolRegistry,
     blocks,
     summaryPrompt,
-    hasConfig: hasConfigFile,       // <- DARAUF prüft dein bot.js
-    summariesEnabled,               // <- nutzt Scheduler
-    admins                          // <- von oben, nicht aus def
+    max_user_messages,       // ← WICHTIG: an bot.js durchreichen
+    hasConfig: hasConfigFile,
+    summariesEnabled,
+    admins
   };
 }
+
 
 // ---------- Chunking & Senden ----------
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
