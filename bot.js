@@ -114,6 +114,11 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
+  chatContext.setUserWindow(channelMeta.max_user_messages /* Zahl aus deiner Channel-Config */, {
+    prunePerTwoNonUser: true
+  });
+
+
   // ⬇️ Transkript wurde in deinem setStartListening bereits in die DB/Context geschrieben.
   // Falls du hier sicher Dedupe willst, lass es so – wir fügen NICHT erneut hinzu.
 
@@ -221,35 +226,6 @@ async function deleteAllMessages(channel) {
   }
 }
 
-// bot.js
-function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
-  const key = `channel:${channelId}`;
-  const signature = metaSig(channelMeta);
-  if (!contextStorage.has(key)) {
-    const ctx = new Context(
-      channelMeta.persona,
-      channelMeta.instructions,
-      channelMeta.tools,
-      channelMeta.toolRegistry,
-      channelId
-    );
-    contextStorage.set(key, { ctx, sig: signature });
-  } else {
-    const entry = contextStorage.get(key);
-    if (entry.sig !== signature) {
-      entry.ctx = new Context(
-        channelMeta.persona,
-        channelMeta.instructions,
-        channelMeta.tools,
-        channelMeta.toolRegistry,
-        channelId
-      );
-      entry.sig = signature;
-    }
-  }
-  return contextStorage.get(key).ctx;
-}
-
 
 // bot.js
  function buildProxyMessageForVoice(channel, text, userId, username) {
@@ -303,6 +279,12 @@ client.on("messageCreate", async (message) => {
     }
   }
   const chatContext = contextStorage.get(key).ctx;
+
+// HIER ergänzen:
+if (typeof chatContext.setUserWindow === "function") {
+  chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
+}
+
 
   // ---- Zentrale Command-Gates ----
  // ---- Zentrale Command-Gates ----
@@ -448,6 +430,10 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
   // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
+
+    if (typeof chatContext.setUserWindow === "function") {
+    chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
+  }
 
   // ---- Gate: nur reagieren, wenn erstes Wort == channelMeta.name ----
   const TRIGGER = (channelMeta.name || "").trim();

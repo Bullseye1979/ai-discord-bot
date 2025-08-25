@@ -14,6 +14,189 @@ function toMySQLDateTime(date = new Date()) {
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
 
+
+// --- NEU ganz oben innerhalb der Datei (Hilfsfunktionen) ---------------------
+
+function isSystem(msg) {
+  return msg?.role === "system";
+}
+function isSummary(msg) {
+  // Wir lassen "assistant" + name === "summary" als Summary gelten (kompatibel zu DB-Variante)
+  return msg?.role === "assistant" && (msg?.name === "summary" || /^summary/i.test(msg?.name || ""));
+}
+function isUser(msg) {
+  return msg?.role === "user";
+}
+function isAssistantToolCall(msg) {
+  // assistant-message, die tool_calls enthält
+  return msg?.role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
+}
+function isTool(msg) {
+  return msg?.role === "tool";
+}
+
+// Gibt die Zahl der User-Messages (ohne system/summary) zurück
+function countUsers(messages) {
+  return messages.reduce((n, m) => n + (isUser(m) ? 1 : 0), 0);
+}
+
+// Zählt Tool-Paare (assistant(tool_calls) + folgendes tool)
+function countToolPairs(messages) {
+  let pairs = 0;
+  for (let i = 0; i < messages.length - 1; i++) {
+    if (isAssistantToolCall(messages[i]) && isTool(messages[i + 1])) {
+      pairs++;
+      i++; // das Paar überspringen
+    }
+  }
+  return pairs;
+}
+
+// Entfernt sicher vom ANFANG Nachrichten – achtet darauf, dass Tool-Paare zusammen entfernt werden.
+// removePredicate entscheidet, welche Kandidaten weg dürfen (z.B. nur user).
+function shiftSafely(messages, removePredicate, howMany) {
+  if (howMany <= 0) return 0;
+  let removed = 0;
+  // Index 0 ist (bei dir) immer System → den überspringen
+  let i = 0;
+  while (i < messages.length && removed < howMany) {
+    const msg = messages[i];
+
+    // System nie entfernen
+    if (isSystem(msg)) { i++; continue; }
+
+    // Summary i. d. R. behalten (kannst du optional erlauben zu löschen)
+    if (isSummary(msg)) { i++; continue; }
+
+    // Wenn es ein assistant tool_call ist und wir ihn löschen dürften,
+    // dann MUSS direkt danach (falls vorhanden) auch die tool-msg mit weg.
+    if (isAssistantToolCall(msg)) {
+      // Tool-Paare nur löschen, wenn removePredicate beide zulässt
+      const nextIsTool = i + 1 < messages.length && isTool(messages[i + 1]);
+      if (removePredicate(msg)) {
+        if (nextIsTool && removePredicate(messages[i + 1])) {
+          messages.splice(i, 2);
+          removed += 2;
+          continue; // an gleicher Stelle weitermachen
+        } else {
+          // unvollständiges Paar nicht anrühren → weiter
+          i++;
+          continue;
+        }
+      } else {
+        i++;
+        continue;
+      }
+    }
+
+    // Wenn es eine tool-Message ist, prüfen ob davor ein tool_call stand (ältester Teil eines Paares)
+    if (isTool(msg)) {
+      // Sicherheit: nur entfernen, wenn removePredicate erlaubt UND davor kein passender assistant(tool_calls) steht,
+      // oder wenn er direkt davor steht und removePredicate auch den assistant löschen würde (Paar!)
+      const prevIsAssistantToolCall = i - 1 >= 0 && isAssistantToolCall(messages[i - 1]);
+      if (prevIsAssistantToolCall) {
+        if (removePredicate(messages[i - 1]) && removePredicate(msg)) {
+          // lösche das Paar von i-1 (assistant) und i (tool)
+          messages.splice(i - 1, 2);
+          removed += 2;
+          // i zeigt nun auf den Eintrag, der nach dem gelöschten tool stand → nicht i++,
+          // aber um die Schleife sauber zu halten:
+          i = Math.max(0, i - 1);
+          continue;
+        } else {
+          i++;
+          continue;
+        }
+      } else {
+        // Einzelne Tool-Message ohne Partner niemals löschen (sonst crasht Bot)
+        i++;
+        continue;
+      }
+    }
+
+    // Normalfall (z.B. user/assistant ohne tools)
+    if (removePredicate(msg)) {
+      messages.splice(i, 1);
+      removed += 1;
+      continue;
+    } else {
+      i++;
+    }
+  }
+  return removed;
+}
+
+
+
+/** Baut Blöcke: Ein Block beginnt mit einer user-Message und enthält ALLES bis zur nächsten user.
+ *  Summaries werden separat gehalten; System bleibt unangetastet.
+ */
+function buildBlocks(messages) {
+  const hasSystem = messages.length && isSystem(messages[0]);
+  const headIdx = hasSystem ? 1 : 0;
+
+  // Summaries isolieren (werden nicht getrimmt)
+  const summaries = [];
+  const body = [];
+  for (let i = headIdx; i < messages.length; i++) {
+    const m = messages[i];
+    if (isSummary(m)) summaries.push(m);
+    else body.push(m);
+  }
+
+  // Blöcke bilden
+  const blocks = [];
+  let cur = [];
+  const flush = () => { if (cur.length) { blocks.push(cur); cur = []; } };
+
+  for (const m of body) {
+    if (isUser(m)) { flush(); cur = [m]; }
+    else { cur.push(m); }
+  }
+  flush();
+
+  return { headIdx, summaries, blocks };
+}
+
+/** Löscht die ältesten k User-Blöcke vollständig (inkl. assistant/tool, die darin liegen). */
+function dropOldestUserBlocks(messages, k) {
+  if (!k || k <= 0) return 0;
+
+  const hasSystem = messages.length && isSystem(messages[0]);
+  const headIdx = hasSystem ? 1 : 0;
+
+  // Zerlegen
+  const head = hasSystem ? [messages[0]] : [];
+  const { summaries, blocks } = buildBlocks(messages);
+
+  // Indizes der Blöcke, die eine user-Message enthalten
+  const userBlockIdx = blocks
+    .map((b, i) => ({ i, hasUser: b.some(isUser) }))
+    .filter(x => x.hasUser)
+    .map(x => x.i);
+
+  if (!userBlockIdx.length) return 0;
+
+  const toKill = Math.min(k, userBlockIdx.length);
+  const killSet = new Set(userBlockIdx.slice(0, toKill)); // älteste zuerst
+
+  const keptBlocks = blocks.filter((b, i) => !killSet.has(i));
+
+  // Neu zusammensetzen: System + Summaries + verbleibende Blöcke
+  const rebuilt = [
+    ...head,
+    ...summaries,
+    ...keptBlocks.flat()
+  ];
+
+  messages.splice(0, messages.length, ...rebuilt);
+  return toKill;
+}
+
+
+
+
+
 // OpenAI akzeptiert names nur mit regex: ^[^\s<|\\/>]+$
 // Wir erlauben a–z, 0–9, _ und schneiden auf 64 Zeichen.
 function sanitizeName(input, fallback = "user") {
@@ -88,6 +271,8 @@ class Context {
     this.toolRegistry = toolRegistry || {};
     this.channelId = String(channelId);
     this.isSummarizing = false;
+    this._maxUserMessages = null;   // z.B. aus Channel-Config
+    this._maxToolPairs = null;      // optional
 
     const sys = `${this.persona}\n${this.instructions}`.trim();
     if (sys) {
@@ -96,6 +281,54 @@ class Context {
 
     this._initLoaded = skipInitialSummaries ? Promise.resolve() : this._injectInitialSummaries();
   }
+
+
+
+    // -- NEU: von außen (bot.js) setzbar: maximale Anzahl User-Elemente (Blöcke)
+  setUserWindow(maxUserMessages, { prunePerTwoNonUser = true } = {}) {
+    const n = Number(maxUserMessages);
+    this._maxUserMessages = Number.isFinite(n) && n >= 0 ? n : null;
+    this._prunePerTwoNonUser = !!prunePerTwoNonUser;
+    this._nonUserSincePair = 0; // Zähler für "assistant(tool_call)+tool" -> danach 2 User-Blöcke entfernen
+  }
+
+  /** Zählt aktuelle User-Blöcke (ohne system & summaries). */
+  _countUserBlocks() {
+    const { blocks } = buildBlocks(this.messages);
+    return blocks.filter(b => b.some(isUser)).length;
+  }
+
+  /** Erzwingt das Fenster: max. _maxUserMessages User-Blöcke behalten (älteste zuerst entfernen). */
+  _enforceUserWindowCap() {
+    if (this._maxUserMessages == null) return;
+    let have = this._countUserBlocks();
+    if (have > this._maxUserMessages) {
+      const diff = have - this._maxUserMessages;
+      dropOldestUserBlocks(this.messages, diff);
+    }
+  }
+
+  /** Wird nach jedem add() aufgerufen, um proportional zu trimmen:
+   * - Wenn ein Tool-Paar fertig wurde (wir fangen es auf dem 'tool' an), entferne 2 User-Blöcke.
+   * - Danach immer die harte Obergrenze (_maxUserMessages) durchsetzen.
+   */
+  _afterAddTrim(lastRole) {
+    if (this._maxUserMessages == null) return;
+
+    // 1) Paarlogik: Wenn gerade ein 'tool' hinzugefügt wurde und davor ein assistant(tool_calls) steht,
+    //    gilt das als "2 Non-User-Elemente" -> entferne 2 User-Blöcke vom Anfang.
+    const L = this.messages.length;
+    if (L >= 2 && lastRole === "tool") {
+      const prev = this.messages[L - 2];
+      if (isAssistantToolCall(prev)) {
+        dropOldestUserBlocks(this.messages, 2);
+      }
+    }
+
+    // 2) Harte Cap immer zum Schluss sicherstellen
+    this._enforceUserWindowCap();
+  }
+
 
     /**
    * Reduziert den in‑memory Kontext auf:
@@ -153,11 +386,12 @@ class Context {
     this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
   }
 
-  /**
+    /**
    * Robustes add():
    * - Sanitized name (verhindert 400er).
    * - Schreibt IMMER erst in-memory.
    * - DB-Write best-effort (Fehler ≠ Verlust der Nachricht).
+   * - Trimmt danach den RAM-Kontext gemäß Fenster (System & Summaries bleiben).
    */
   async add(role, sender, content, timestampMs = null, { alsoMemory = true } = {}) {
     const safeRole = String(role || "user");
@@ -179,12 +413,19 @@ class Context {
         [ts, this.channelId, safeRole, safeName, safeContent]
       );
     } catch (e) {
-      // Kein Drama im Toolfluss: nur loggen.
       console.warn("[DB][add] write failed (non-fatal):", e.message);
+    }
+
+    // 3) Nachführen des Fensters:
+    //    - Tool-Paar → 2 User-Blöcke droppen
+    //    - danach Cap durchsetzen
+    if (alsoMemory) {
+      this._afterAddTrim(safeRole);
     }
 
     return { role: safeRole, name: safeName, content: safeContent };
   }
+
 
   async getMessagesAfter(cutoffMs) {
     try {
