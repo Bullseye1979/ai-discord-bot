@@ -326,14 +326,8 @@ if (isCommand) {
 }
 
 
+await setAddUserMessage(message, chatContext);
 
-// irgendwo in deiner messageCreate
-const raw = (message?.content || "").trim();
-
-// nur überspringen wenn ! oder +
-if (!(raw.startsWith("!") || raw.startsWith("+"))) {
-  await setAddUserMessage(message, chatContext);
-}
 
 // ab hier läuft die Funktion ganz normal weiter
 
@@ -518,11 +512,11 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
     return;
   }
 
-  // !summarize: Statusmeldung (EN), Cutoff, Summary, Channel leeren, 5 Summaries, Cursor bump, Abschluss
+    // !summarize: Statusmeldung (EN), Cutoff, Summary, Channel leeren, 5 Summaries, Cursor bump, Abschluss
   if ((message.content || "").startsWith("!summarize")) {
-      if (!channelMeta.summariesEnabled) {
-        await message.channel.send("⚠️ Summaries are disabled in this channel.");
-        return;
+    if (!channelMeta.summariesEnabled) {
+      await message.channel.send("⚠️ Summaries are disabled in this channel.");
+      return;
     }
 
     let progress = null;
@@ -539,11 +533,10 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
       await chatContext.summarizeSince(cutoffMs, customPrompt);
       const after = await chatContext.getLastSummaries(1).catch(() => []);
       const createdNew =
-      (before.length === 0 && after.length > 0) ||
-      (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
+        (before.length === 0 && after.length > 0) ||
+        (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
 
       if (!createdNew) {
-        // Keine neue Summary entstanden → nichts löschen, sauber beenden
         try { if (progress?.deletable) await progress.delete(); } catch {}
         await message.channel.send("ℹ️ No messages to summarize yet.");
         return;
@@ -551,10 +544,13 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
 
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
+      try { if (progress?.deletable) await progress.delete(); } catch {}
+      await message.channel.send("❌ Summary failed.");
+      return;
     }
 
-    // 2) Alle Messages im Channel löschen
-    
+    // 2) (Optional) Channel-Nachrichten löschen — derzeit bewusst übersprungen
+    //    -> Wenn du hier den Channel leeren willst, baue deleteAllMessages(message.channel) ein.
 
     // 3) 5 Summaries (älteste -> neueste) als einzelne Nachrichten posten (gechunked)
     try {
@@ -581,7 +577,16 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
       console.error("[!summarize] bumpCursorToCurrentMax error:", e?.message || e);
     }
 
-    // 5) Abschluss
+    // 5) **Memory reduzieren**: nur System + letzte Summary im RAM behalten
+    try {
+      await chatContext.collapseToSystemAndLastSummary();
+      await message.channel.send("🧠 RAM context collapsed to: **System + last summary**.");
+    } catch (e) {
+      console.error("[!summarize] collapseToSystemAndLastSummary error:", e?.message || e);
+      await message.channel.send("⚠️ RAM context collapse failed (kept full memory).");
+    }
+
+    // 6) Abschluss
     try {
       await message.channel.send("✅ **Summary completed.**");
     } catch {}
@@ -591,6 +596,7 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
 
     return;
   }
+
 
 
 // ---------------- Normaler Flow ----------------

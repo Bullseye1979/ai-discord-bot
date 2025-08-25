@@ -97,6 +97,37 @@ class Context {
     this._initLoaded = skipInitialSummaries ? Promise.resolve() : this._injectInitialSummaries();
   }
 
+    /**
+   * Reduziert den in‑memory Kontext auf:
+   *   [ system, letzte_DB_Summary? ]
+   * - System bleibt (Rolle nicht vergessen).
+   * - Wenn es eine Summary gibt, wird genau EINE (die jüngste) injiziert.
+   * - DB bleibt unverändert.
+   */
+  async collapseToSystemAndLastSummary() {
+    // 1) System wiederherstellen
+    const sys = `${this.persona}\n${this.instructions}`.trim();
+    this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
+
+    // 2) Jüngste Summary aus DB holen
+    try {
+      const last = await this.getLastSummaries(1); // [{ id, timestamp, summary }] oder []
+      const newest = last?.[0]?.summary;
+      if (newest && newest.trim()) {
+        this.messages.push({
+          role: "assistant",
+          name: "summary",
+          content: newest.trim()
+        });
+      }
+    } catch (e) {
+      console.warn("[collapseToSystemAndLastSummary] failed:", e.message);
+    }
+
+    return this.messages;
+  }
+
+
   async _injectInitialSummaries() {
     try {
       const db = await getPool();
