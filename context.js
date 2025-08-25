@@ -283,16 +283,27 @@ class Context {
   }
 
 
+// -- NEU: von außen (bot.js) setzbar: maximale Anzahl User-Elemente (Blöcke)
+setUserWindow(maxUserMessages, { prunePerTwoNonUser = true } = {}) {
+  const n = Number(maxUserMessages);
+  // 0, null, undefined, NaN, negative => ∞ (keine Cap)
+  const cap = Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 
-    // -- NEU: von außen (bot.js) setzbar: maximale Anzahl User-Elemente (Blöcke)
-  setUserWindow(maxUserMessages, { prunePerTwoNonUser = true } = {}) {
-    const n = Number(maxUserMessages);
-    this._maxUserMessages = Number.isFinite(n) && n >= 0 ? n : null;
-    this._prunePerTwoNonUser = !!prunePerTwoNonUser;
-    this._nonUserSincePair = 0; // Zähler für "assistant(tool_call)+tool" -> danach 2 User-Blöcke entfernen
+  this._maxUserMessages = cap;
+  this._prunePerTwoNonUser = !!prunePerTwoNonUser;
+  this._nonUserSincePair = 0;
 
-    this._enforceUserWindowCap?.();
-  }
+  // optionales Debug
+  console.log("[CTX] setUserWindow", {
+    channel: this.channelId,
+    rawWindow: maxUserMessages,
+    effective: cap ?? "∞"
+  });
+
+  // Falls eine echte Cap gesetzt ist, gleich anwenden
+  if (cap != null) this._enforceUserWindowCap();
+}
+
 
   /** Zählt aktuelle User-Blöcke (ohne system & summaries). */
   _countUserBlocks() {
