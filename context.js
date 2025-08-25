@@ -315,7 +315,9 @@ class Context {
    * - Danach immer die harte Obergrenze (_maxUserMessages) durchsetzen.
    */
   _afterAddTrim(lastRole) {
+    console.log("Trim started");
     if (this._maxUserMessages == null) return;
+    console.log("Gate done");
 
     // 1) Paarlogik: Wenn gerade ein 'tool' hinzugefügt wurde und davor ein assistant(tool_calls) steht,
     //    gilt das als "2 Non-User-Elemente" -> entferne 2 User-Blöcke vom Anfang.
@@ -367,7 +369,7 @@ class Context {
     try {
       const db = await getPool();
       const [rowsDesc] = await db.execute(
-        `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 5`,
+        `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
       if (!rowsDesc?.length) return;
