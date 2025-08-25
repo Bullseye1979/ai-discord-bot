@@ -279,11 +279,16 @@ client.on("messageCreate", async (message) => {
     }
   }
   const chatContext = contextStorage.get(key).ctx;
+  const rawWindow =
+  channelMeta.max_user_messages ??
+  channelMeta.maxUserMessages ??
+  null; // wenn null => kein Trim
 
-// HIER ergänzen:
 if (typeof chatContext.setUserWindow === "function") {
-  chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
+  chatContext.setUserWindow(rawWindow, { prunePerTwoNonUser: true });
+  console.log("[CTX] setUserWindow", { channel: baseChannelId, rawWindow, effective: chatContext._maxUserMessages });
 }
+
 
 
   // ---- Zentrale Command-Gates ----
