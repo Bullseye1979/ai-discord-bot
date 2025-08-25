@@ -342,7 +342,6 @@ await setAddUserMessage(message, chatContext);
 }
 
 
-
   // ---------------- Commands (vor Logging!) ----------------
 
 

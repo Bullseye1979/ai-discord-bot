@@ -290,6 +290,8 @@ class Context {
     this._maxUserMessages = Number.isFinite(n) && n >= 0 ? n : null;
     this._prunePerTwoNonUser = !!prunePerTwoNonUser;
     this._nonUserSincePair = 0; // Zähler für "assistant(tool_call)+tool" -> danach 2 User-Blöcke entfernen
+
+    this._enforceUserWindowCap?.();
   }
 
   /** Zählt aktuelle User-Blöcke (ohne system & summaries). */
@@ -561,7 +563,7 @@ Output:
   }
 }
 
-  async getLastSummaries(limit = 5) {
+  async getLastSummaries(limit = 1) {
     try {
       const db = await getPool();
       const [rows] = await db.execute(
