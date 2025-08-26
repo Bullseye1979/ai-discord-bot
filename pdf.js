@@ -104,7 +104,9 @@ async function getPDF(toolFunction, context, getAIResponse) {
         let imagelist = "";
         let segmentCount = 0;
         let persistentToolMessages = [];
-        while (true) {
+
+        while (segmentCount < 25) {
+
             const segmentContext = new Context("You are a took to generate segments of an HTML file.", "", tools, getToolRegistry());
             segmentContext.messages = [...generationContext.messages];
 
