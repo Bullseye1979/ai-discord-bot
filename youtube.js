@@ -101,7 +101,7 @@ async function getYoutube(toolFunction) {
         "instruction",
         `Based on the user's request: "${userPrompt}", summarize or condense the current section (${timestamp}): ${text} in the context of the entire conversation so far. Be concise, cumulative and structured.`
       );
-      const result = await getAI(analysisContext, 100, "gpt-3.5-turbo");
+      const result = await getAI(analysisContext, 100, "gpt-4o");
       if (result) {
         results.push(`[${timestamp}] ${result}`);
         await analysisContext.add("assistant", "gpt", result);
