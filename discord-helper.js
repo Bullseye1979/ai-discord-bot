@@ -708,28 +708,24 @@ async function quickSNR(wavPath) {
 }
 
 
-// In discord-helper.js
-// discord-helper.js
 async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript /* callback */) {
   try {
     if (!connection || !guildId) return;
 
-    // Persistent pro Prozesslauf
-    if (!setStartListening.__captures) setStartListening.__captures = new Map();         // key -> { opus }
-    if (!setStartListening.__lastUtteranceMap) setStartListening.__lastUtteranceMap = new Map();
-    const captures        = setStartListening.__captures;        // Map<`${guildId}:${userId}`, { opus }>
-    const lastUtteranceMap = setStartListening.__lastUtteranceMap;
+    // Persistente Strukturen pro Prozesslauf
+    if (!setStartListening.__captures) setStartListening.__captures = new Map(); // Map<`${guildId}:${userId}`, { opus }>
+    const captures = setStartListening.__captures;
 
-    // --- Tuning: schnelle Segmentierung & kleines Dublettenfenster ---
-    const SILENCE_MS        = Number(process.env.VOICE_SILENCE_MS || 1200);   // schneller cut
+    // Tuning per ENV, sinnvolle Defaults
+    const SILENCE_MS        = Number(process.env.VOICE_SILENCE_MS || 1200);   // schneller Cut nach Stille
     const MAX_UTTERANCE_MS  = Number(process.env.VOICE_MAX_UTTERANCE_MS || 15000);
-    const MIN_WAV_BYTES     = 96000; // ~1s @ 48k/16/mono
+    const MIN_WAV_BYTES     = 96000;  // ~1s @ 48k/16bit/mono
     const MIN_SNR_DB        = 8;
     const MIN_VOICED_RATIO  = 0.40;
     const MIN_VOICED_FRAMES = 15;
     const DUP_WINDOW_MS     = Number(process.env.VOICE_DUP_WINDOW_MS || 1500);
 
-    // Normierung nur für Dubletten-Erkennung
+    // Normierung nur für (leichte) Dubletten-Erkennung
     const normText = (s) =>
       String(s || "")
         .toLowerCase()
@@ -737,7 +733,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         .replace(/\s+/g, " ")
         .trim();
 
-    // Receiver sauber neu armeren, wenn sich die Connection geändert hat
+    // Receiver neu armieren, wenn Connection gewechselt hat
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
@@ -754,6 +750,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       return ch || null;
     };
 
+    // Lightweight-Analyse für SNR/Voicing
     async function analyzeWav(filePath) {
       try {
         const buf = await fs.promises.readFile(filePath);
@@ -763,7 +760,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         const pcm = buf.subarray(44);
         const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
 
-        const sr = 48000, frame = 960;
+        const sr = 48000, frame = 960; // 20ms
         const totalFrames = Math.floor(samples.length / frame);
         if (totalFrames <= 0) return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
 
@@ -810,11 +807,11 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
     receiver.speaking.on("start", (userId) => {
       const key = `${guildId}:${userId}`;
 
-      // >>> PREEMPT: früheren Capture für denselben User beenden, statt die neue Äußerung zu verwerfen
+      // PREEMPTION: Falls noch ein alter Capture läuft → beenden und durch neuen ersetzen
       const existing = captures.get(key);
       if (existing?.opus) {
         try { existing.opus.destroy(); } catch {}
-        // finish() des alten Captures läuft gleich asynchron durch
+        // dessen finishOnce läuft asynchron; wir starten sofort neu
       }
 
       let killTimer = null;
@@ -822,7 +819,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         const opus = receiver.subscribe(userId, {
           end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS },
         });
-        captures.set(key, { opus }); // jetzt ist dies der „aktive“ Capture für den User
+        captures.set(key, { opus });
 
         const startedAtMs = Date.now();
 
@@ -831,10 +828,18 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
         pcm.on("data", (chunk) => pass.write(chunk));
-        killTimer = setTimeout(() => { try { opus.destroy(); } catch {} }, MAX_UTTERANCE_MS);
 
-        const finish = async () => {
-          // Nur den „aktuellen“ Eintrag löschen, wenn er noch auf diesen opus zeigt
+        killTimer = setTimeout(() => {
+          try { opus.destroy(); } catch {}
+        }, MAX_UTTERANCE_MS);
+
+        // IDEMPOTENZ: finish nur einmal ausführen, egal welcher Event zuerst feuert
+        let finished = false;
+        const finishOnce = async (tag) => {
+          if (finished) return;
+          finished = true;
+
+          // nur „aktuellen“ Capture freigeben, falls noch identisch
           const cur = captures.get(key);
           if (cur?.opus === opus) captures.delete(key);
 
@@ -850,6 +855,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
             const latestTarget = await getLatestTarget();
             if (!latestTarget) return;
 
+            // DSGVO: Voice-Consent pro User x Channel
             let consentOk = true;
             try { consentOk = await hasVoiceConsent(userId, latestTarget.id); } catch {}
             if (!consentOk) return;
@@ -863,6 +869,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
             const clean = (text || "").trim();
             if (!clean) return;
 
+            // leichte Dubletten-Bremse
             const norm = normText(clean);
             const now  = Date.now();
             const last = lastUtteranceMap.get(key);
@@ -888,20 +895,23 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
               const { dir } = await wavPromise;
               await fs.promises.rm(dir, { recursive: true, force: true });
             } catch {}
+            // Hygiene: Listener lösen
+            try { opus.removeAllListeners(); } catch {}
+            try { pcm.removeAllListeners(); } catch {}
           }
         };
 
-        // Finish sicher an mehreren Events hängen (robuster als nur 'pcm.end')
-        opus.once("end",   finish);
-        opus.once("close", finish);
-        opus.once("error", finish);
-        pcm.once("end",    finish);
-        pcm.once("error",  finish);
+        // Mehrere mögliche Abschlussereignisse → finishOnce sichert 1x-Execution
+        opus.once("end",   () => finishOnce("opus:end"));
+        opus.once("close", () => finishOnce("opus:close"));
+        opus.once("error", () => finishOnce("opus:error"));
+        pcm.once("end",    () => finishOnce("pcm:end"));
+        pcm.once("error",  () => finishOnce("pcm:error"));
 
       } catch (e) {
         console.warn("[Voice subscribe] failed:", e?.message || e);
         const cur = captures.get(key);
-        if (cur?.opus && cur.opus.listenerCount) {
+        if (cur?.opus) {
           try { cur.opus.removeAllListeners(); } catch {}
         }
         captures.delete(key);
@@ -920,7 +930,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
     console.warn("[setStartListening] failed:", e?.message || e);
   }
 }
-
 
 
 
