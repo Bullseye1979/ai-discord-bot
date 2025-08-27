@@ -89,7 +89,6 @@ async function getAIResponse(
   let responseMessage = "";
   let hasToolCalls = false;
   let continueResponse = false;
-  let lastmessage = 0;
   let sequenceCounter = 0;
 
   const authKey = apiKey || process.env.OPENAI_API_KEY;
@@ -100,7 +99,7 @@ async function getAIResponse(
       const out = { role: m.role, content: m.content };
       const safeName = cleanOpenAIName(m.role, m.name);
       if (safeName) out.name = safeName;
-      if (m.tool_calls) out.tool_calls = m.tool_calls;     // falls wir tool_calls schon gesetzt haben
+      if (m.tool_calls)  out.tool_calls  = m.tool_calls;
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
       return out;
     });
@@ -183,7 +182,6 @@ async function getAIResponse(
     if (hasToolCalls) {
       for (const toolCall of aiMessage.tool_calls) {
         const fnName = toolCall?.function?.name;
-        const fnArgs = toolCall?.function?.arguments;
         const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
 
         // Helper: auch im Fehlerfall eine gültige tool-Message anfügen
@@ -199,17 +197,16 @@ async function getAIResponse(
           });
         };
 
-        if (!toolFunction || !fnArgs) {
+        if (!toolFunction) {
           const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
           console.error(msg);
-          replyTool(msg);           // <-- WICHTIG: tool-Reply auch bei Fehler
+          replyTool(msg);
           continue;
         }
 
         try {
           // DEBUG: Tool-Aufruf
-          console.log("DEBUG: Execute Tool:", { tool: fnName, args: fnArgs });
-
+          console.log("DEBUG: Execute Tool:", { tool: fnName, args: toolCall.function?.arguments });
           const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse);
 
           // DEBUG: Tool-Result (gekürzt)
@@ -218,30 +215,42 @@ async function getAIResponse(
             typeof toolResult === "string" ? toolResult.slice(0, 400) : toolResult
           );
 
-          replyTool(toolResult || "");  // <-- Erfolgsantwort
+          replyTool(toolResult || "");
         } catch (toolError) {
           const emsg = toolError?.message || String(toolError);
           console.error(`[ERROR] Tool execution failed for '${fnName}':`, emsg);
-          replyTool({ error: emsg, tool: fnName }); // <-- Fehlerantwort als tool-Reply
+          replyTool({ error: emsg, tool: fnName });
         }
       }
-    } else {
-      if (lastmessage) {
-        // historisches Verhalten beibehalten
-        context_orig.add("assistant", "", lastmessage);
-      }
     }
 
-    // Fortsetzung, wenn wegen Tokenlänge abgebrochen
-    continueResponse = !hasToolCalls && finishReason === "length";
-    if (continueResponse) {
-      context.messages.push({ role: "user", content: "continue" });
-    }
-
+    // ================== Auto-Continue sicher begrenzen ==================
+    // diesen Durchlauf zählen (Text-Antwort-Schritt)
     sequenceCounter++;
-    if (sequenceCounter >= sequenceLimit && !hasToolCalls && !continueResponse) {
-      break;
+
+    // Nur wenn wegen Tokenlänge abgebrochen wurde und KEINE Tools im Spiel sind
+    const dueToLength = (!hasToolCalls && finishReason === "length");
+
+    if (sequenceLimit <= 1) {
+      // z.B. Voice: Niemals "continue" pushen
+      continueResponse = false;
+    } else if (dueToLength) {
+      if (sequenceCounter < sequenceLimit) {
+        // (Optional, aber sauber): abgeschnittene Antwort in den Verlauf hängen
+        if ((aiMessage.content || "").trim()) {
+          context.messages.push({ role: "assistant", content: (aiMessage.content || "").trim() });
+        }
+        // genau EIN continue anfügen
+        context.messages.push({ role: "user", content: "continue" });
+        continueResponse = true;
+      } else {
+        // Limit erreicht → kein continue mehr
+        continueResponse = false;
+      }
+    } else {
+      continueResponse = false;
     }
+
   } while (hasToolCalls || continueResponse);
 
   return responseMessage;
