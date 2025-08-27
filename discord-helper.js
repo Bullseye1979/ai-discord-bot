@@ -803,7 +803,6 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       avatarURL: personaAvatarUrl || undefined,
       embeds,
       allowedMentions: { parse: [] },
-      flags: 4,                            // SUPPRESS_EMBEDS (safety)
       threadId: isThread ? message.channel.id : undefined
     });
 

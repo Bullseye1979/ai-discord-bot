@@ -16,7 +16,7 @@ const {
   getSpeech,
   getChannelConfig,
   setReplyAsWebhookEmbed,
-  setReokyAsWebhook,
+  setReplyAsWebhook,
   setStartListening,
   setAddUserMessage,
   setBotPresence,
