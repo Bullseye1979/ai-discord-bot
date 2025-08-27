@@ -61,7 +61,7 @@ function logAxiosErrorSafe(prefix, err) {
  * @param {string} model
  * @param {string|null} apiKey
  */
-a// Run an AI request
+// Run an AI request
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
   if (state.isAIProcessing >= 3) {
     try { await setMessageReaction(message, "❌"); } catch {}
