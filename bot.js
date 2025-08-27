@@ -449,51 +449,45 @@ if ((message.content || "").startsWith("!joinvc")) {
 
     // (Re)Start Listening – Transkripte posten ab jetzt in den aktuellen Textkanal
    // bot.js — im !joinvc-Handler:
+// bot.js — im !joinvc-Handler:
 setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
   // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
+
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
-    if (typeof chatContext.setUserWindow === "function") {
+  if (typeof chatContext.setUserWindow === "function") {
     chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
   }
 
-  // ---- Gate: nur reagieren, wenn erstes Wort == channelMeta.name ----
+  // ---- Invocation per Name am Satzanfang ----
   const TRIGGER = (channelMeta.name || "").trim();
   const invoked = firstWordEqualsName(evt.text, TRIGGER);
 
-  // Optional: trotzdem ALLE Transkripte loggen (auch ohne Invocation)
-  const LOG_ALL_TRANSCRIPTS = true;
-
-  if (!invoked) {
-    if (LOG_ALL_TRANSCRIPTS) {
-      try { await chatContext.add("user", evt.speaker, evt.text, evt.startedAtMs); } catch {}
-    }
-    return; // ← keine Antwort erzeugen
-  }
-  // Busy? → höflich ablehnen und NICHT loggen
-if (voiceBusy.get(evt.channelId)) {
-  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
-  try { await ch?.send("⏳ Ich antworte gerade – bitte kurz warten."); } catch {}
-  return;
-}
-
-
-  // Für die KI das Triggerwort vorne entfernen (damit der Prompt sauber ist)
-  const cleanedUserText = stripLeadingName(evt.text, TRIGGER);
-
-  // Transkript (bereinigt) in den Kontext
+  // --- IMMER LOGGEN (auch wenn nicht invoked) ---
+  const textForLog = invoked ? stripLeadingName(evt.text, TRIGGER) : evt.text;
   try {
-    await chatContext.add("user", evt.speaker, cleanedUserText, evt.startedAtMs);
+    await chatContext.add("user", evt.speaker, (textForLog || "").trim(), evt.startedAtMs);
   } catch (e) {
     console.warn("[voice->DB] failed:", e?.message || e);
   }
 
-  // Direktantwort (GPT -> Text in Channel via Webhook -> TTS in Voice)
+  // Wenn nicht invoked -> nur loggen, keine KI-Antwort
+  if (!invoked) return;
+
+  // --- WICHTIG: Busy-Check NACH dem Loggen ---
+  if (voiceBusy.get(evt.channelId)) {
+    try {
+      const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+      await ch?.send("⏳ Ich antworte gerade – bitte kurz warten.");
+    } catch {}
+    return; // Keine KI-Anfrage starten, aber Transkript blieb erhalten
+  }
+
+  // KI-Antwort + TTS (setzt/cleart voiceBusy intern)
   try {
-    // Wir nutzen die bestehende Direct-Pipeline aus deiner letzten Version
     await handleVoiceTranscriptDirect(
-      { ...evt, text: cleanedUserText }, // sicherheitshalber den bereinigten Text weiterreichen
+      { ...evt, text: textForLog }, // bereinigter Text
       client,
       contextStorage
     );
@@ -501,6 +495,7 @@ if (voiceBusy.get(evt.channelId)) {
     console.error("[voice->direct] failed:", e?.message || e);
   }
 });
+
 
 
 
