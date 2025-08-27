@@ -308,6 +308,10 @@ function getChannelConfig(channelId) {
     : null;
   let admins        = Array.isArray(def.admins) ? def.admins.map(String) : [];
 
+  // NEU: getrennte Tokenlimits (Default Chat > Speaker)
+  let max_tokens_chat    = (Number.isFinite(Number(def.max_tokens_chat))    && Number(def.max_tokens_chat)    > 0) ? Math.floor(Number(def.max_tokens_chat))    : 4096;
+  let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0) ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
+
   const hasConfigFile = fs.existsSync(configPath);
 
   if (hasConfigFile) {
@@ -333,6 +337,18 @@ function getChannelConfig(channelId) {
       } else {
         const n = Number(rawMax);
         max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
+      }
+
+      // NEU: Tokenlimits snake+camel lesen
+      const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
+      if (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "") {
+        const n = Number(rawTokChat);
+        if (Number.isFinite(n) && n > 0) max_tokens_chat = Math.floor(n);
+      }
+      const rawTokSpk = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
+      if (rawTokSpk !== undefined && rawTokSpk !== null && rawTokSpk !== "") {
+        const n = Number(rawTokSpk);
+        if (Number.isFinite(n) && n > 0) max_tokens_speaker = Math.floor(n);
       }
 
       // Admins sauber übernehmen
@@ -363,12 +379,17 @@ function getChannelConfig(channelId) {
     toolRegistry,
     blocks,
     summaryPrompt,
-    max_user_messages,       // ← WICHTIG: an bot.js durchreichen
+    max_user_messages,       // ← bleibt bestehen
     hasConfig: hasConfigFile,
     summariesEnabled,
-    admins
+    admins,
+
+    // NEU: an alle Call-Sites durchreichen
+    max_tokens_chat,
+    max_tokens_speaker
   };
 }
+
 
 
 // ---------- Chunking & Senden ----------

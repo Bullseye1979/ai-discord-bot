@@ -42,6 +42,8 @@ const contextStorage = new Map();
 const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS/Transcripts)
 const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
 const ttsGate = new Map(); // channelId -> boolean
+const voiceBusy = new Map(); // key = channelId -> boolean
+
 
 
 const crypto = require("crypto");
@@ -111,59 +113,69 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
   const ch = await client.channels.fetch(evt.channelId).catch(() => null);
   if (!ch) { console.warn("[voice] channel missing", evt.channelId); return; }
 
+  // Busy-Gate
+  if (voiceBusy.get(evt.channelId)) {
+    try { await ch.send("⏳ Ich antworte gerade – bitte kurz warten."); } catch {}
+    return;
+  }
+
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
-  chatContext.setUserWindow(channelMeta.max_user_messages /* Zahl aus deiner Channel-Config */, {
-    prunePerTwoNonUser: true
-  });
-
-
-  // ⬇️ Transkript wurde in deinem setStartListening bereits in die DB/Context geschrieben.
-  // Falls du hier sicher Dedupe willst, lass es so – wir fügen NICHT erneut hinzu.
-
-  // 1) GPT call auf Basis des Context (inkl. Persona/Tools)
-  let replyText = "";
-  try {
-    // getAIResponse(context, tokenlimit, sequenceLimit, model, apiKey)
-    replyText = await getAIResponse(
-      chatContext,
-      4096,
-      1000,
-      channelMeta.model || undefined,
-      channelMeta.apikey || null
-    );
-    replyText = (replyText || "").trim();
-  } catch (e) {
-    console.error("[voice] getAIResponse failed:", e?.message || e);
-    return;
-  }
-  if (!replyText) return;
-
-  // 2) Antwort in den Context schreiben (Assistant)
-  try {
-    await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
-  } catch {}
-
-  // 3) Als Text zusätzlich in den Channel posten (mit Persona-Avatar via Webhook)
-  try {
-    const msgShim = { channel: ch }; // reicht für setReplyAsWebhook
-    await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
-  } catch (e) {
-    console.warn("[voice] setReplyAsWebhook failed, fallback send:", e?.message || e);
-    try { await ch.send(replyText); } catch {}
+  if (typeof chatContext.setUserWindow === "function") {
+    chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
   }
 
-  // 4) Über Voice ausgeben (TTS) – falls verbunden
+  // Tokenlimit (Speaker)
+  const tokenlimit = Number(channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker) || 1024;
+
+  voiceBusy.set(evt.channelId, true);
   try {
-    const conn = getVoiceConnection(evt.guildId);
-    if (conn) {
-      await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
-    } else {
-      console.warn("[voice] no connection for guild", evt.guildId);
+    // 1) GPT call
+    let replyText = "";
+    try {
+      replyText = await getAIResponse(
+        chatContext,
+        tokenlimit,     // <-- NEU
+        1000,
+        channelMeta.model || undefined,
+        channelMeta.apikey || null
+      );
+      replyText = (replyText || "").trim();
+    } catch (e) {
+      console.error("[voice] getAIResponse failed:", e?.message || e);
+      return;
     }
-  } catch (e) {
-    console.warn("[voice] TTS failed:", e?.message || e);
+    if (!replyText) return;
+
+    // 2) Kontext (Assistant)
+    try {
+      await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
+    } catch {}
+
+    // 3) Textantwort im Channel (Webhook/Avatar)
+    try {
+      const msgShim = { channel: ch };
+      await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+    } catch (e) {
+      console.warn("[voice] setReplyAsWebhook failed, fallback send:", e?.message || e);
+      try { await ch.send(replyText); } catch {}
+    }
+
+    // 4) TTS in Voice (falls verbunden) – Lock bleibt bis Ende TTS
+    try {
+      const { getVoiceConnection } = require("@discordjs/voice");
+      const conn = getVoiceConnection(evt.guildId);
+      if (conn) {
+        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
+      } else {
+        console.warn("[voice] no connection for guild", evt.guildId);
+      }
+    } catch (e) {
+      console.warn("[voice] TTS failed:", e?.message || e);
+    }
+  } finally {
+    voiceBusy.set(evt.channelId, false);
   }
 }
 

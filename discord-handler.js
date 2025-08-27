@@ -51,6 +51,12 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     // Transkript/Webhook? -> NUR speaker prüfen
     const isSpeakerMsg = !!message.webhookId;
 
+  // Tokenlimit abhängig von Voice (Webhook) vs. Text
+const tokenlimit = isSpeakerMsg
+  ? (Number(channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker) || 1024)
+  : (Number(channelMeta.max_tokens_chat    ?? channelMeta.maxTokensChat)    || 4096);
+
+
     // Effektive Channel-ID wie in setTTS (Threads → Parent)
 const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
 const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
@@ -158,7 +164,13 @@ if (imageUrls.length) {
 
 
 
-    const output = await getAIResponse(chatContext, null, null, effectiveModel, effectiveApiKey);
+    const output = await getAIResponse(
+  chatContext,
+  tokenlimit,         // <-- statt null
+  1000,               // sequenceLimit wie bisher
+  effectiveModel,
+  effectiveApiKey
+);
 
     if (output && output.trim()) {
       // 1) Im Textkanal als Webhook antworten
