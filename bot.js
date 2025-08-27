@@ -351,9 +351,9 @@ if (isCommand) {
   }
 }
 
-
-await setAddUserMessage(message, chatContext);
-
+if (!message.author?.bot && !message.webhookId) {
+  await setAddUserMessage(message, chatContext);
+}
 
 // ab hier läuft die Funktion ganz normal weiter
 
