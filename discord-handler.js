@@ -28,6 +28,7 @@ function markTTSAllowedForChannel(channelId, ttlMs = TTS_TTL_MS) {
 }
 
 // Run an AI request
+// Run an AI request
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
   if (state.isAIProcessing >= 3) {
     try { await setMessageReaction(message, "❌"); } catch {}
@@ -35,70 +36,57 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
   }
 
   state.isAIProcessing++;
+  let _instrBackup = chatContext.instructions;
   try {
     await setMessageReaction(message, "⏳");
 
-
     const channelMeta = getChannelConfig(message.channelId);
-    if (!channelMeta) {
-      await setMessageReaction(message, "❌");
-      return;
-    }
+    if (!channelMeta) { await setMessageReaction(message, "❌"); return; }
 
-    // ---- Strikte Block-Auswahl: speaker-only (Webhook/Transkript) vs user-only (Text) ----
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-
-    // Transkript/Webhook? -> NUR speaker prüfen
     const isSpeakerMsg = !!message.webhookId;
 
-// Tokenlimit abhängig von Voice (Webhook) vs. Text — robust eingeklemmt
-const tokenlimit = (() => {
-  const raw = isSpeakerMsg
-    ? (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker)
-    : (channelMeta.max_tokens_chat    ?? channelMeta.maxTokensChat);
-  const v = Number(raw);
-  const def = isSpeakerMsg ? 1024 : 4096;
-  // Klemme auf sinnvolle Grenzen (verhindert NaN/0)
-  return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
-})();
+    // Tokenlimit abhängig von Voice (Webhook) vs. Text — robust & geklemmt
+    const tokenlimit = (() => {
+      const raw = isSpeakerMsg
+        ? (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker)
+        : (channelMeta.max_tokens_chat    ?? channelMeta.maxTokensChat);
+      const v = Number(raw);
+      const def = isSpeakerMsg ? 1024 : 4096;
+      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+    })();
 
+    // WICHTIG: Auto-Continue für Speaker hart abschalten
+    const sequenceLimit = isSpeakerMsg ? 1 : 1000;
 
-    // Effektive Channel-ID wie in setTTS (Threads → Parent)
-const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
-const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+    // Effektive Channel-ID (Threads → Parent)
+    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
 
-// Nur wenn Voice/Transkript der Auslöser war → TTS erlauben (zeitlich begrenzt)
-if (isSpeakerMsg) {
-  markTTSAllowedForChannel(effectiveChannelId);
-}
+    // Wenn Voice/Transkript der Auslöser war → TTS nur zeitlich erlauben (separat handled)
+    if (isSpeakerMsg) {
+      markTTSAllowedForChannel(effectiveChannelId);
+    }
 
-
-    // Für Speaker (Transkript) nehmen wir den (Proxy-)Namen:
-    const speakerName = (message.member?.displayName || message.author?.username || "")
-      .trim()
-      .toLowerCase();
-
-    // Für Text nehmen wir die echte Discord-User-ID:
+    // Speaker-Name vs. User-ID für Block-Matching
+    const speakerName = (message.member?.displayName || message.author?.username || "").trim().toLowerCase();
     const userId = String(message.author?.id || "").trim();
 
     function pickBlockForSpeaker() {
-      let exact = null;
-      let wildcard = null;
+      let exact = null, wildcard = null;
       for (const b of blocks) {
         const sp = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).trim().toLowerCase()) : [];
-        if (sp.length === 0) continue;
+        if (!sp.length) continue;
         if (sp.includes("*") && !wildcard) wildcard = b;
         if (speakerName && sp.includes(speakerName) && !exact) exact = b;
       }
       return exact || wildcard || null;
     }
-
     function pickBlockForUser() {
-      let exact = null;
-      let wildcard = null;
+      let exact = null, wildcard = null;
       for (const b of blocks) {
         const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
-        if (us.length === 0) continue;
+        if (!us.length) continue;
         if (us.includes("*") && !wildcard) wildcard = b;
         if (userId && us.includes(userId) && !exact) exact = b;
       }
@@ -106,14 +94,8 @@ if (isSpeakerMsg) {
     }
 
     const matchingBlock = isSpeakerMsg ? pickBlockForSpeaker() : pickBlockForUser();
+    if (!matchingBlock) { await setMessageReaction(message, "❌"); return; }
 
-    // Kein Block => Ablehnen
-    if (!matchingBlock) {
-      await setMessageReaction(message, "❌");
-      return;
-    }
-
-    // Tools/Model/API-Key strikt aus dem Treffer-Block (Fallback auf Channel-Defaults wie gehabt)
     const effectiveModel  = matchingBlock.model  || model;
     const effectiveApiKey = matchingBlock.apikey || apiKey;
 
@@ -126,68 +108,56 @@ if (isSpeakerMsg) {
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    // Guard: Wenn es noch keine Summary gibt, KI streng darauf hinweisen, nichts zu erfinden
-    let _instrBackup = chatContext.instructions;
+    // Guard: Wenn (noch) keine Summary existiert, Halluzinationen deutlich verbieten
     try {
       const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
       if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
+        _instrBackup = chatContext.instructions;
         chatContext.instructions = (_instrBackup || "") +
           "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
           "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
       }
     } catch {}
 
-
-
-    // --- [PATCH] Bild-Uploads automatisch in den Prompt aufnehmen ---
-const imageUrls = [];
-try {
-  // Nur bei normalen User-Posts (nicht bei Webhooks/Transkripten)
-  if (!message.webhookId && message.attachments?.size > 0) {
-    for (const att of message.attachments.values()) {
-      const ct = (att.contentType || att.content_type || "").toLowerCase();
-      const isImageCT  = ct.startsWith("image/");
-      const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
-      if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
+    // Bild-Uploads automatisch in den Prompt aufnehmen (nur bei echten User-Posts)
+    const imageUrls = [];
+    try {
+      if (!message.webhookId && message.attachments?.size > 0) {
+        for (const att of message.attachments.values()) {
+          const ct = (att.contentType || att.content_type || "").toLowerCase();
+          const isImageCT  = ct.startsWith("image/");
+          const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
+          if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
+        }
+      }
+    } catch {}
+    if (imageUrls.length) {
+      const hasGetImageTool =
+        Array.isArray(chatContext.tools) &&
+        chatContext.tools.some(t => (t.function?.name || t.name) === "getImage");
+      const hint =
+        "\n\n[IMAGE UPLOAD]\n" +
+        imageUrls.map(u => `- ${u}`).join("\n") +
+        "\nAufgabe: Was ist auf diesem Bild zu sehen?" +
+        (hasGetImageTool ? " Nutze dafür das Tool `getImage`." : "");
+      chatContext.instructions = (chatContext.instructions || "") + hint;
     }
-  }
-} catch {}
 
-if (imageUrls.length) {
-  const hasGetImageTool =
-    Array.isArray(chatContext.tools) &&
-    chatContext.tools.some(t => (t.function?.name || t.name) === "getImage");
-
-  const hint =
-    "\n\n[IMAGE UPLOAD]\n" +
-    imageUrls.map(u => `- ${u}`).join("\n") +
-    "\nAufgabe: Was ist auf diesem Bild zu sehen?" +
-    (hasGetImageTool ? " Nutze dafür das Tool `getImage`." : "");
-
-  // _instrBackup ist in deinem Code bereits vorher gesetzt
-  chatContext.instructions = (chatContext.instructions || "") + hint;
-}
-
-
-
+    // KI abrufen
     const output = await getAIResponse(
-  chatContext,
-  tokenlimit,         // <-- statt null
-  1000,               // sequenceLimit wie bisher
-  effectiveModel,
-  effectiveApiKey
-);
+      chatContext,
+      tokenlimit,
+      sequenceLimit,   // <<<<<< Auto-Continue bei Speaker = 1 ⇒ keine „continue“-Spirale
+      effectiveModel,
+      effectiveApiKey
+    );
 
-    if (output && output.trim()) {
-      // 1) Im Textkanal als Webhook antworten
+    if (output && String(output).trim()) {
       await setReplyAsWebhook(message, output, {
         botname: channelMeta.botname,
         avatarUrl: channelMeta.avatarUrl
       });
-
-      // 3) In den Kontext loggen als Bot
       await chatContext.add("assistant", channelMeta?.botname || "AI", output);
-
       await setMessageReaction(message, "✅");
     } else {
       await setMessageReaction(message, "❌");
@@ -196,13 +166,14 @@ if (imageUrls.length) {
     console.error("[AI ERROR]:", err);
     try { await setMessageReaction(message, "❌"); } catch {}
   } finally {
-    // restore instructions if modified
-    if (typeof _instrBackup === "string") {
-      try { chatContext.instructions = _instrBackup; } catch {}
-    }
+    // Instructions zurücksetzen
+    try {
+      if (typeof _instrBackup === "string") chatContext.instructions = _instrBackup;
+    } catch {}
     state.isAIProcessing--;
   }
 }
+
 
 // Enter a voice channel and start listening
 async function setVoiceChannel(message, guildTextChannels, _activeRecordings, _chatContext, _client) {
