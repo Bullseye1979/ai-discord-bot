@@ -61,190 +61,151 @@ function logAxiosErrorSafe(prefix, err) {
  * @param {string} model
  * @param {string|null} apiKey
  */
-async function getAIResponse(
-  context_orig,
-  tokenlimit = 4096,
-  sequenceLimit = 1000,
-  model = "gpt-4o",
-  apiKey = null
-) {
-  if (tokenlimit == null) tokenlimit = 4096;
+a// Run an AI request
+async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
+  if (state.isAIProcessing >= 3) {
+    try { await setMessageReaction(message, "❌"); } catch {}
+    return;
+  }
 
-  // Arbeitskontexte
-  const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
-  context.messages = [...context_orig.messages];
+  state.isAIProcessing++;
+  let _instrBackup = chatContext.instructions;
+  try {
+    await setMessageReaction(message, "⏳");
 
-  const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry);
-  handoverContext.messages = [...context_orig.messages];
+    const channelMeta = getChannelConfig(message.channelId);
+    if (!channelMeta) { await setMessageReaction(message, "❌"); return; }
 
-  const toolRegistry = context.toolRegistry;
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const isSpeakerMsg = !!message.webhookId;
 
-  // Zeitkontext vorn anstellen
-  const nowUtc = new Date().toISOString();
-  context.messages.unshift({
-    role: "system",
-    content: `Current UTC time: ${nowUtc} <- Use this time, whenever you are asked for the current time. Translate it to the location for which the time is requested. If no location is specified use your current location.`
-  });
+    // Tokenlimit abhängig von Voice (Webhook) vs. Text — robust & geklemmt
+    const tokenlimit = (() => {
+      const raw = isSpeakerMsg
+        ? (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker)
+        : (channelMeta.max_tokens_chat    ?? channelMeta.maxTokensChat);
+      const v = Number(raw);
+      const def = isSpeakerMsg ? 1024 : 4096;
+      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+    })();
 
-  let responseMessage = "";
-  let hasToolCalls = false;
-  let continueResponse = false;
-  let lastmessage = 0;
-  let sequenceCounter = 0;
+    // WICHTIG: Auto-Continue für Speaker hart abschalten
+    const sequenceLimit = isSpeakerMsg ? 1 : 1000;
 
-  const authKey = apiKey || process.env.OPENAI_API_KEY;
+    // Effektive Channel-ID (Threads → Parent)
+    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
 
-  do {
-    // Messages serialisieren (nur gültige Felder; name sicher bereinigt)
-    const messagesToSend = context.messages.map(m => {
-      const out = { role: m.role, content: m.content };
-      const safeName = cleanOpenAIName(m.role, m.name);
-      if (safeName) out.name = safeName;
-      if (m.tool_calls) out.tool_calls = m.tool_calls;     // falls wir tool_calls schon gesetzt haben
-      if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
-      return out;
-    });
-
-    const payload = {
-      model,
-      messages: messagesToSend,
-      max_tokens: tokenlimit,
-      tool_choice: "auto",
-      tools: context.tools
-    };
-
-    // DEBUG: kompaktes Preview
-    try {
-      console.log("──────────────── DEBUG:getAIResponse → OpenAI Payload ────────────────");
-      console.log(JSON.stringify({
-        model,
-        max_tokens: tokenlimit,
-        tools: (context.tools || []).map(t => t.function?.name),
-        messages_preview: messagesToSend.map(m => ({
-          role: m.role,
-          name: m.name,
-          content: (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 400)
-        }))
-      }, null, 2));
-      console.log("──────────────────────────────────────────────────────────────────────");
-    } catch { /* ignore */ }
-
-    let aiResponse;
-    try {
-      aiResponse = await axios.post(OPENAI_API_URL, payload, {
-        headers: { Authorization: `Bearer ${authKey}`, "Content-Type": "application/json" }
-      });
-
-      // DEBUG: Antwort-Meta
-      try {
-        const meta = {
-          created: aiResponse.data?.created,
-          model: aiResponse.data?.model,
-          finish_reason: aiResponse.data?.choices?.[0]?.finish_reason,
-          has_tool_calls: !!aiResponse.data?.choices?.[0]?.message?.tool_calls
-        };
-        console.log("DEBUG:getAIResponse ← OpenAI Meta:", meta);
-      } catch { /* ignore */ }
-    } catch (err) {
-      logAxiosErrorSafe("[FATAL] Error from OpenAI:", err);
-      throw err;
+    // Wenn Voice/Transkript der Auslöser war → TTS nur zeitlich erlauben (separat handled)
+    if (isSpeakerMsg) {
+      markTTSAllowedForChannel(effectiveChannelId);
     }
 
-    const choice = aiResponse.data.choices[0];
-    const aiMessage = choice.message;
-    const finishReason = choice.finish_reason;
+    // Speaker-Name vs. User-ID für Block-Matching
+    const speakerName = (message.member?.displayName || message.author?.username || "").trim().toLowerCase();
+    const userId = String(message.author?.id || "").trim();
 
-    hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
-
-    // Assistant macht Tool-Calls?
-    if (aiMessage.tool_calls) {
-      context.messages.push({
-        role: "assistant",
-        tool_calls: aiMessage.tool_calls || null
-      });
-
-      // DEBUG: Registry/Tools sichtbar machen
-      try {
-        console.log("DEBUG: toolRegistry keys:", Object.keys(toolRegistry || {}));
-        console.log("DEBUG: ToolCalls received:", aiMessage.tool_calls.map(tc => ({
-          id: tc.id,
-          name: tc.function?.name,
-          args: tc.function?.arguments
-        })));
-      } catch { /* ignore */ }
-    }
-
-    // Freitext anhängen (falls vorhanden)
-    if (aiMessage.content) {
-      responseMessage += (aiMessage.content || "").trim();
-    }
-
-    // Tool-Calls ausführen — robust: immer ein tool-Reply zurückschreiben
-    if (hasToolCalls) {
-      for (const toolCall of aiMessage.tool_calls) {
-        const fnName = toolCall?.function?.name;
-        const fnArgs = toolCall?.function?.arguments;
-        const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
-
-        // Helper: auch im Fehlerfall eine gültige tool-Message anfügen
-        const replyTool = (content) => {
-          const out = (typeof content === "string" || content == null)
-            ? (content || "")
-            : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
-
-          context.messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: out
-          });
-        };
-
-        if (!toolFunction || !fnArgs) {
-          const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
-          console.error(msg);
-          replyTool(msg);           // <-- WICHTIG: tool-Reply auch bei Fehler
-          continue;
-        }
-
-        try {
-          // DEBUG: Tool-Aufruf
-          console.log("DEBUG: Execute Tool:", { tool: fnName, args: fnArgs });
-
-          const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse);
-
-          // DEBUG: Tool-Result (gekürzt)
-          console.log(
-            "DEBUG: Tool Result (first 400 chars):",
-            typeof toolResult === "string" ? toolResult.slice(0, 400) : toolResult
-          );
-
-          replyTool(toolResult || "");  // <-- Erfolgsantwort
-        } catch (toolError) {
-          const emsg = toolError?.message || String(toolError);
-          console.error(`[ERROR] Tool execution failed for '${fnName}':`, emsg);
-          replyTool({ error: emsg, tool: fnName }); // <-- Fehlerantwort als tool-Reply
-        }
+    function pickBlockForSpeaker() {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const sp = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).trim().toLowerCase()) : [];
+        if (!sp.length) continue;
+        if (sp.includes("*") && !wildcard) wildcard = b;
+        if (speakerName && sp.includes(speakerName) && !exact) exact = b;
       }
+      return exact || wildcard || null;
+    }
+    function pickBlockForUser() {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
+        if (!us.length) continue;
+        if (us.includes("*") && !wildcard) wildcard = b;
+        if (userId && us.includes(userId) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    }
+
+    const matchingBlock = isSpeakerMsg ? pickBlockForSpeaker() : pickBlockForUser();
+    if (!matchingBlock) { await setMessageReaction(message, "❌"); return; }
+
+    const effectiveModel  = matchingBlock.model  || model;
+    const effectiveApiKey = matchingBlock.apikey || apiKey;
+
+    if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
     } else {
-      if (lastmessage) {
-        // historisches Verhalten beibehalten
-        context_orig.add("assistant", "", lastmessage);
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+
+    // Guard: Wenn (noch) keine Summary existiert, Halluzinationen deutlich verbieten
+    try {
+      const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
+      if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
+        _instrBackup = chatContext.instructions;
+        chatContext.instructions = (_instrBackup || "") +
+          "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
+          "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
       }
+    } catch {}
+
+    // Bild-Uploads automatisch in den Prompt aufnehmen (nur bei echten User-Posts)
+    const imageUrls = [];
+    try {
+      if (!message.webhookId && message.attachments?.size > 0) {
+        for (const att of message.attachments.values()) {
+          const ct = (att.contentType || att.content_type || "").toLowerCase();
+          const isImageCT  = ct.startsWith("image/");
+          const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
+          if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
+        }
+      }
+    } catch {}
+    if (imageUrls.length) {
+      const hasGetImageTool =
+        Array.isArray(chatContext.tools) &&
+        chatContext.tools.some(t => (t.function?.name || t.name) === "getImage");
+      const hint =
+        "\n\n[IMAGE UPLOAD]\n" +
+        imageUrls.map(u => `- ${u}`).join("\n") +
+        "\nAufgabe: Was ist auf diesem Bild zu sehen?" +
+        (hasGetImageTool ? " Nutze dafür das Tool `getImage`." : "");
+      chatContext.instructions = (chatContext.instructions || "") + hint;
     }
 
-    // Fortsetzung, wenn wegen Tokenlänge abgebrochen
-    continueResponse = !hasToolCalls && finishReason === "length";
-    if (continueResponse) {
-      context.messages.push({ role: "user", content: "continue" });
-    }
+    // KI abrufen
+    const output = await getAIResponse(
+      chatContext,
+      tokenlimit,
+      sequenceLimit,   // <<<<<< Auto-Continue bei Speaker = 1 ⇒ keine „continue“-Spirale
+      effectiveModel,
+      effectiveApiKey
+    );
 
-    sequenceCounter++;
-    if (sequenceCounter >= sequenceLimit && !hasToolCalls && !continueResponse) {
-      break;
+    if (output && String(output).trim()) {
+      await setReplyAsWebhook(message, output, {
+        botname: channelMeta.botname,
+        avatarUrl: channelMeta.avatarUrl
+      });
+      await chatContext.add("assistant", channelMeta?.botname || "AI", output);
+      await setMessageReaction(message, "✅");
+    } else {
+      await setMessageReaction(message, "❌");
     }
-  } while (hasToolCalls || continueResponse);
-
-  return responseMessage;
+  } catch (err) {
+    console.error("[AI ERROR]:", err);
+    try { await setMessageReaction(message, "❌"); } catch {}
+  } finally {
+    // Instructions zurücksetzen
+    try {
+      if (typeof _instrBackup === "string") chatContext.instructions = _instrBackup;
+    } catch {}
+    state.isAIProcessing--;
+  }
 }
+
 
 module.exports = { getAIResponse };
