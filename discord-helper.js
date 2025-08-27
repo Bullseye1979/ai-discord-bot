@@ -734,7 +734,6 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
   try {
     if (!aiText || !String(aiText).trim()) return;
 
-    // Thread-sicherer Hook (am Parent anlegen/senden)
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
     const hookChannel = isThread ? message.channel.parent : message.channel;
 
@@ -751,31 +750,30 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       });
     }
 
-    // ---- Links sammeln & Text für Embed aufbereiten ----
-    const allUrls = collectAllUrls(aiText);                  // inkl. Bild- und Normal-Links (dedupliziert)
-    const imageUrls = allUrls.filter(looksLikeImage);
-    const firstImageUrl = imageUrls.length ? imageUrls[0] : null;
+    // 1) Links (inkl. Labels/Alt-Text) sammeln – Reihenfolge beibehalten
+    const links = collectUrlsWithLabels(aiText); // [{url,label,kind,isImageExt}]
+    // 2) Ersten Bild-Kandidaten finden (Markdown-Image bevorzugt, sonst via Content-Type-Check)
+    const firstImage = await pickFirstImageCandidate(links);
 
-    // Wichtig: Bild-Markdown (!) im Text NICHT löschen, sondern in normalen Link umwandeln
-    // => Link bleibt klickbar, wird aber nicht als Bild im Text „gerendert“
+    // 3) Text für die Beschreibung: Markdown-Bilder in normale Links umwandeln,
+    //    sonst original belassen (keine Maskierung/Entfernung)
     const bodyText = prepareTextForEmbed(aiText);
 
-    // Bullet-Liste „weitere Links“ (ohne das erste Bild)
-    const restUrls = allUrls.filter(u => u !== firstImageUrl);
-    const bullets =
-      restUrls.length
-        ? "\n\n**Weitere Links**\n" + restUrls.map(u => `• <${u}>`).join("\n")
-        : "";
+    // 4) Weitere Links als Bulletliste (mit Label, wenn vorhanden), ersten Bildlink auslassen
+    const rest = links.filter(l => !(firstImage && l.url === firstImage.url));
+    const bullets = rest.length
+      ? "\n\n**Weitere Links**\n" + rest.map(l => {
+          const label = (l.label && l.label.trim()) ? l.label.trim() : null;
+          return label ? `• ${label} — <${l.url}>` : `• <${l.url}>`;
+        }).join("\n")
+      : "";
 
-    // Gesamte Beschreibung sauber kürzen (4096 hard limit)
-    // Platz für Bulletliste freihalten
     const themeColor = Number.isInteger(color) ? color : 0x5865F2;
     const MAX_EMBED = 4096;
-    const bulletsLen = bullets.length;
-    const maxBodyLen = Math.max(0, MAX_EMBED - bulletsLen - 2);
-    const description = truncateForEmbed(bodyText, maxBodyLen) + bullets;
+    const roomForBody = Math.max(0, MAX_EMBED - bullets.length - 2);
+    const description = truncateForEmbed(bodyText, roomForBody) + bullets;
 
-    const mainEmbed = {
+    const embed = {
       color: themeColor,
       author: {
         name: botname || meta?.botname || "AI",
@@ -785,15 +783,16 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       timestamp: new Date().toISOString(),
       footer: { text: meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI") }
     };
-    if (firstImageUrl) {
-      mainEmbed.image = { url: firstImageUrl }; // großes Bild
+
+    if (firstImage && firstImage.url) {
+      embed.image = { url: firstImage.url };
     }
 
     await hook.send({
-      content: "", // nichts im Content -> keine Auto-Previews durch Discord
+      content: "", // kein Content -> keine Auto-Unfurls im Text
       username: botname || meta?.botname || "AI",
       avatarURL: personaAvatarUrl || undefined,
-      embeds: [mainEmbed],
+      embeds: [embed],
       allowedMentions: { parse: [] },
       threadId: isThread ? message.channel.id : undefined
     });
@@ -802,6 +801,96 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
     console.error("[Webhook Embed Reply] failed:", e);
     try { await sendChunked(message.channel, aiText); } catch {}
   }
+}
+
+/* ----------------- Helfer ----------------- */
+
+// Sammle alle Links in Reihenfolge und halte Label/Alt fest
+function collectUrlsWithLabels(text) {
+  const out = [];
+  const seen = new Set();
+
+  const pushOnce = (url, label, kind, isImageExt) => {
+    const clean = cleanUrl(url);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
+  };
+
+  // Markdown-Image: ![alt](url)
+  text.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url));
+    return "";
+  });
+
+  // Markdown-Link: [label](url)  (Achtung: negative Lookbehind ist nicht überall sicher -> wir filtern md_image vorher)
+  text.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => {
+    pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url));
+    return "";
+  });
+
+  // nackte URLs
+  text.replace(/https?:\/\/[^\s)]+/g, (url) => {
+    pushOnce(url, null, "plain", looksLikeImage(url));
+    return "";
+  });
+
+  return out;
+}
+
+// Besten Bildkandidaten wählen: 1) md_image 2) URL mit Bild-Endung 3) Content-Type probe
+async function pickFirstImageCandidate(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+
+  // Priorität 1: Markdown-Image
+  const mdImg = list.find(l => l.kind === "md_image");
+  if (mdImg) {
+    // Wenn Alt der md_image im Text vorkommt, ist es sicher ein Bild; kein Netz-Check nötig
+    return mdImg;
+  }
+
+  // Priorität 2: bekannte Bildendung
+  const withExt = list.find(l => l.isImageExt);
+  if (withExt) return withExt;
+
+  // Priorität 3: Content-Type-Check der Reihe nach
+  for (const l of list) {
+    try {
+      const ct = await headContentType(l.url);
+      if (ct && /^image\//i.test(ct)) return l;
+    } catch {}
+  }
+  return null;
+}
+
+// HEAD (Fallback auf GET stream) um Content-Type herauszufinden
+async function headContentType(url) {
+  try {
+    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
+    if (ct) return String(ct);
+  } catch {}
+  // Fallback GET (nur Header)
+  try {
+    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
+    try { res.data?.destroy?.(); } catch {}
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
+    if (ct) return String(ct);
+  } catch {}
+  return null;
+}
+
+// Bild-Markdown zu normalem Link machen (damit es im Text nicht „als Bild“ erscheint)
+function prepareTextForEmbed(text) {
+  let s = String(text || "");
+  // ![alt](url) -> [alt](url) bzw. <url> wenn alt leer
+  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    const a = String(alt || "").trim();
+    return a ? `[${a}](${url})` : `<${url}>`;
+  });
+  // Kosmetik
+  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+  return s;
 }
 
 // ---- Helfer: alle URLs (Markdownde/Plain) sammeln & deduplizieren ----
