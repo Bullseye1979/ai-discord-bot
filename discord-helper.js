@@ -729,12 +729,12 @@ async function quickSNR(wavPath) {
   return { snrDb, voicedRatio, frames: energies.length };
 }
 
-// --- NEU: hübsches Embed-Reply via Webhook (mit Bild-Extraktion & Link-Masking) ---
+// ---- NEU: hübsches Embed-Reply (1 Embed, 1 großes Bild, Bullet-Liste weiterer Links) ----
 async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) {
   try {
     if (!aiText || !String(aiText).trim()) return;
 
-    // Thread-sicherer Hook: immer am Parent erstellen/holen
+    // Thread-sicherer Hook (am Parent anlegen/senden)
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
     const hookChannel = isThread ? message.channel.parent : message.channel;
 
@@ -751,19 +751,29 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       });
     }
 
-    // 1) Bilder aus dem AI-Text ziehen (Markdown-Bilder, nackte URLs mit Bild-Endungen, Links auf Bilder)
-    const allImages = extractImageUrlsFromText(aiText);
+    // ---- Links sammeln & Text für Embed aufbereiten ----
+    const allUrls = collectAllUrls(aiText);                  // inkl. Bild- und Normal-Links (dedupliziert)
+    const imageUrls = allUrls.filter(looksLikeImage);
+    const firstImageUrl = imageUrls.length ? imageUrls[0] : null;
 
-    // 2) Beschreibung aufbereiten:
-    //    - Markdown-Image-Tags komplett entfernen
-    //    - nackte URLs/Links maskieren => kein unfurl
-    //    - überschaubar halten
-    const cleanedDesc = maskLinksAndStripImageSyntax(aiText).trim();
+    // Wichtig: Bild-Markdown (!) im Text NICHT löschen, sondern in normalen Link umwandeln
+    // => Link bleibt klickbar, wird aber nicht als Bild im Text „gerendert“
+    const bodyText = prepareTextForEmbed(aiText);
 
-    // 3) Embeds bauen:
-    //    Embed #1 = Hauptantwort + großes Bild (falls vorhanden)
-    const themeColor = Number.isInteger(color) ? color : 0x5865F2; // Blurple als Default
-    const nowIso = new Date().toISOString();
+    // Bullet-Liste „weitere Links“ (ohne das erste Bild)
+    const restUrls = allUrls.filter(u => u !== firstImageUrl);
+    const bullets =
+      restUrls.length
+        ? "\n\n**Weitere Links**\n" + restUrls.map(u => `• <${u}>`).join("\n")
+        : "";
+
+    // Gesamte Beschreibung sauber kürzen (4096 hard limit)
+    // Platz für Bulletliste freihalten
+    const themeColor = Number.isInteger(color) ? color : 0x5865F2;
+    const MAX_EMBED = 4096;
+    const bulletsLen = bullets.length;
+    const maxBodyLen = Math.max(0, MAX_EMBED - bulletsLen - 2);
+    const description = truncateForEmbed(bodyText, maxBodyLen) + bullets;
 
     const mainEmbed = {
       color: themeColor,
@@ -771,68 +781,68 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
         name: botname || meta?.botname || "AI",
         icon_url: personaAvatarUrl || undefined
       },
-      description: truncateForEmbed(cleanedDesc, 4096),
-      timestamp: nowIso,
-      footer: {
-        text: meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI")
-      }
+      description,
+      timestamp: new Date().toISOString(),
+      footer: { text: meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI") }
     };
-
-    if (allImages.length > 0) {
-      mainEmbed.image = { url: allImages[0] }; // großes Bild
+    if (firstImageUrl) {
+      mainEmbed.image = { url: firstImageUrl }; // großes Bild
     }
 
-    const embeds = [mainEmbed];
-
-    // 4) Weitere Bilder als kleine Thumbnails in separaten Embeds (Discord kann keine Images in Fields)
-    const moreImages = allImages.slice(1, 10); // max. 9 weitere (insgesamt 10 Embeds/Nachricht)
-    for (let i = 0; i < moreImages.length; i++) {
-      embeds.push({
-        color: 0x2b2d31, // etwas dunkler für Sekundär-Embeds
-        timestamp: nowIso,
-        author: { name: `Bild ${i + 2}` },
-        thumbnail: { url: moreImages[i] },
-        description: `Vorschau ${i + 2}`
-      });
-    }
-
-    // 5) Senden (links NICHT rendern: flags: 4)
     await hook.send({
-      content: "",                         // nichts im Content => keine Auto-Previews
+      content: "", // nichts im Content -> keine Auto-Previews durch Discord
       username: botname || meta?.botname || "AI",
       avatarURL: personaAvatarUrl || undefined,
-      embeds,
+      embeds: [mainEmbed],
       allowedMentions: { parse: [] },
       threadId: isThread ? message.channel.id : undefined
     });
 
   } catch (e) {
     console.error("[Webhook Embed Reply] failed:", e);
-    // Fallback: Plain-Text ohne Links zu rendern
-    try {
-      const safe = maskLinksAndStripImageSyntax(aiText).trim();
-      await sendChunked(message.channel, safe);
-    } catch {}
+    try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
 
-// ---- Helpers ----
+// ---- Helfer: alle URLs (Markdownde/Plain) sammeln & deduplizieren ----
+function collectAllUrls(text) {
+  const urls = [];
+  const seen = new Set();
 
-// Bild-URLs aus Text extrahieren
-function extractImageUrlsFromText(text) {
-  const urls = new Set();
+  const add = (u) => {
+    if (!u) return;
+    const clean = cleanUrl(u);
+    if (!seen.has(clean)) { seen.add(clean); urls.push(clean); }
+  };
 
-  // ![alt](url)
-  text.replace(/!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/g, (_, u) => { if (looksLikeImage(u)) urls.add(cleanUrl(u)); return ""; });
+  // 1) Markdown-Bild: ![alt](url)
+  text.replace(/!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/g, (_m, u) => { add(u); return ""; });
+  // 2) Markdown-Link: [label](url)
+  text.replace(/\[[^\]]+]\((https?:\/\/[^\s)]+)\)/g, (_m, u) => { add(u); return ""; });
+  // 3) nackte URLs
+  text.replace(/https?:\/\/[^\s)]+/g, (u) => { add(u); return ""; });
 
-  // [label](url) -> nur wenn url wie Bild
-  text.replace(/\[[^\]]+]\((https?:\/\/[^\s)]+)\)/g, (_, u) => { if (looksLikeImage(u)) urls.add(cleanUrl(u)); return ""; });
-
-  // nackte URLs
-  text.replace(/https?:\/\/[^\s)]+/g, (u) => { if (looksLikeImage(u)) urls.add(cleanUrl(u)); return ""; });
-
-  return Array.from(urls);
+  return urls;
 }
+
+// ---- Helfer: Bild-Markdown in normalen Link wandeln, sonst Original belassen ----
+function prepareTextForEmbed(text) {
+  let s = String(text || "");
+
+  // ![alt](url) -> [alt](url)  (bei leerem alt: <url>)
+  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    const a = String(alt || "").trim();
+    return a ? `[${a}](${url})` : `<${url}>`;
+  });
+
+  // Ansonsten belassen wir normale Links & nackte URLs – im Embed gibt es sowieso kein Auto-Unfurl
+  // Kosmetik
+  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+  return s;
+}
+
+// (deine Helpers looksLikeImage / cleanUrl / truncateForEmbed bleiben wie sie sind)
+
 
 function looksLikeImage(u) {
   return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
