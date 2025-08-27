@@ -79,7 +79,19 @@ async function getAIResponse(
 
   const toolRegistry = context.toolRegistry;
 
-  // Zeitkontext vorn anstellen
+  // ⬇️⬇️⬇️ NEU: Persona + (ggf. angehängte) Instructions explizit einfügen
+  try {
+    const sysParts = [];
+    if ((context_orig.persona || "").trim())       sysParts.push(String(context_orig.persona).trim());
+    if ((context_orig.instructions || "").trim())  sysParts.push(String(context_orig.instructions).trim());
+    const sysCombined = sysParts.join("\n\n").trim();
+    if (sysCombined) {
+      context.messages.unshift({ role: "system", content: sysCombined });
+    }
+  } catch {}
+  // ⬆️⬆️⬆️
+
+  // Zeitkontext vorn anstellen (bleibt ganz oben)
   const nowUtc = new Date().toISOString();
   context.messages.unshift({
     role: "system",
