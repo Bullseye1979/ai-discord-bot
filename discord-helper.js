@@ -710,24 +710,26 @@ async function quickSNR(wavPath) {
 
 // In discord-helper.js
 // discord-helper.js
-async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript /* <= NEU */) {
+async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript /* callback */) {
   try {
     if (!connection || !guildId) return;
 
-    if (!setStartListening.__capturingUsers) setStartListening.__capturingUsers = new Set();
+    // Persistent pro Prozesslauf
+    if (!setStartListening.__captures) setStartListening.__captures = new Map();         // key -> { opus }
     if (!setStartListening.__lastUtteranceMap) setStartListening.__lastUtteranceMap = new Map();
-    const capturingUsers   = setStartListening.__capturingUsers;   // Set<`${guildId}:${userId}`>
-    const lastUtteranceMap = setStartListening.__lastUtteranceMap; // Map<key, {norm, ts}>
+    const captures        = setStartListening.__captures;        // Map<`${guildId}:${userId}`, { opus }>
+    const lastUtteranceMap = setStartListening.__lastUtteranceMap;
 
-    const DUP_WINDOW_MS      = 5000;
-    const SILENCE_MS         = 2100;
-    const MAX_UTTERANCE_MS   = 30000;
-    const MIN_WAV_BYTES      = 96000; // ~1s @ 48k/16bit/mono
+    // --- Tuning: schnelle Segmentierung & kleines Dublettenfenster ---
+    const SILENCE_MS        = Number(process.env.VOICE_SILENCE_MS || 1200);   // schneller cut
+    const MAX_UTTERANCE_MS  = Number(process.env.VOICE_MAX_UTTERANCE_MS || 15000);
+    const MIN_WAV_BYTES     = 96000; // ~1s @ 48k/16/mono
+    const MIN_SNR_DB        = 8;
+    const MIN_VOICED_RATIO  = 0.40;
+    const MIN_VOICED_FRAMES = 15;
+    const DUP_WINDOW_MS     = Number(process.env.VOICE_DUP_WINDOW_MS || 1500);
 
-    const MIN_SNR_DB         = 8;
-    const MIN_VOICED_RATIO   = 0.40;
-    const MIN_VOICED_FRAMES  = 15;
-
+    // Normierung nur für Dubletten-Erkennung
     const normText = (s) =>
       String(s || "")
         .toLowerCase()
@@ -735,11 +737,15 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         .replace(/\s+/g, " ")
         .trim();
 
+    // Receiver sauber neu armeren, wenn sich die Connection geändert hat
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
     }
     activeRecordings.set(guildId, connection);
+
+    const receiver = connection.receiver;
+    if (!receiver) return;
 
     const getLatestTarget = async () => {
       const latestId = guildTextChannels.get(guildId);
@@ -800,32 +806,38 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       }
     }
 
-    const receiver = connection.receiver;
-    if (!receiver) return;
-
     receiver.speaking.removeAllListeners("start");
     receiver.speaking.on("start", (userId) => {
       const key = `${guildId}:${userId}`;
-      if (capturingUsers.has(key)) return;
-      capturingUsers.add(key);
 
-      const startedAtMs = Date.now(); // <<<<< WICHTIG: Start-Timestamp
+      // >>> PREEMPT: früheren Capture für denselben User beenden, statt die neue Äußerung zu verwerfen
+      const existing = captures.get(key);
+      if (existing?.opus) {
+        try { existing.opus.destroy(); } catch {}
+        // finish() des alten Captures läuft gleich asynchron durch
+      }
 
       let killTimer = null;
       try {
         const opus = receiver.subscribe(userId, {
           end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS },
         });
+        captures.set(key, { opus }); // jetzt ist dies der „aktive“ Capture für den User
+
+        const startedAtMs = Date.now();
 
         const pcm  = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
         const pass = new PassThrough();
         const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
 
         pcm.on("data", (chunk) => pass.write(chunk));
-
         killTimer = setTimeout(() => { try { opus.destroy(); } catch {} }, MAX_UTTERANCE_MS);
 
         const finish = async () => {
+          // Nur den „aktuellen“ Eintrag löschen, wenn er noch auf diesen opus zeigt
+          const cur = captures.get(key);
+          if (cur?.opus === opus) captures.delete(key);
+
           if (killTimer) { clearTimeout(killTimer); killTimer = null; }
           pass.end();
 
@@ -859,7 +871,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
 
             const speaker = await resolveSpeakerName(client, guildId, userId);
 
-            // <<<<< NEU: NICHT posten – per Callback an bot.js liefern
             if (typeof onTranscript === "function") {
               await onTranscript({
                 guildId,
@@ -867,7 +878,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
                 userId,
                 speaker,
                 text: clean,
-                startedAtMs: startedAtMs
+                startedAtMs
               });
             }
           } catch (err) {
@@ -877,22 +888,24 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
               const { dir } = await wavPromise;
               await fs.promises.rm(dir, { recursive: true, force: true });
             } catch {}
-            capturingUsers.delete(key);
           }
         };
 
-        pcm.once("end", finish);
-        pcm.once("error", (e) => {
-          console.warn("[PCM stream error]:", e?.message || e);
-          try { pass.destroy(); } catch {}
-          if (killTimer) { clearTimeout(killTimer); killTimer = null; }
-          capturingUsers.delete(key);
-        });
+        // Finish sicher an mehreren Events hängen (robuster als nur 'pcm.end')
+        opus.once("end",   finish);
+        opus.once("close", finish);
+        opus.once("error", finish);
+        pcm.once("end",    finish);
+        pcm.once("error",  finish);
 
       } catch (e) {
         console.warn("[Voice subscribe] failed:", e?.message || e);
+        const cur = captures.get(key);
+        if (cur?.opus && cur.opus.listenerCount) {
+          try { cur.opus.removeAllListeners(); } catch {}
+        }
+        captures.delete(key);
         if (killTimer) { clearTimeout(killTimer); killTimer = null; }
-        capturingUsers.delete(key);
       }
     });
 
