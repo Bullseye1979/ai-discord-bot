@@ -51,10 +51,16 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     // Transkript/Webhook? -> NUR speaker prüfen
     const isSpeakerMsg = !!message.webhookId;
 
-  // Tokenlimit abhängig von Voice (Webhook) vs. Text
-const tokenlimit = isSpeakerMsg
-  ? (Number(channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker) || 1024)
-  : (Number(channelMeta.max_tokens_chat    ?? channelMeta.maxTokensChat)    || 4096);
+// Tokenlimit abhängig von Voice (Webhook) vs. Text — robust eingeklemmt
+const tokenlimit = (() => {
+  const raw = isSpeakerMsg
+    ? (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker)
+    : (channelMeta.max_tokens_chat    ?? channelMeta.maxTokensChat);
+  const v = Number(raw);
+  const def = isSpeakerMsg ? 1024 : 4096;
+  // Klemme auf sinnvolle Grenzen (verhindert NaN/0)
+  return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+})();
 
 
     // Effektive Channel-ID wie in setTTS (Threads → Parent)

@@ -109,7 +109,6 @@ function stripLeadingName(text, triggerName) {
 
 
 async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
-  // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
   const ch = await client.channels.fetch(evt.channelId).catch(() => null);
   if (!ch) { console.warn("[voice] channel missing", evt.channelId); return; }
 
@@ -126,17 +125,19 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
     chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
   }
 
-  // Tokenlimit (Speaker)
-  const tokenlimit = Number(channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker) || 1024;
+  // Tokenlimit (Speaker) robust
+  const tokenlimit = (() => {
+    const v = Number(channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 1024;
+  })();
 
   voiceBusy.set(evt.channelId, true);
   try {
-    // 1) GPT call
     let replyText = "";
     try {
       replyText = await getAIResponse(
         chatContext,
-        tokenlimit,     // <-- NEU
+        tokenlimit,
         1000,
         channelMeta.model || undefined,
         channelMeta.apikey || null
@@ -148,12 +149,8 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
     }
     if (!replyText) return;
 
-    // 2) Kontext (Assistant)
-    try {
-      await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
-    } catch {}
+    try { await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now()); } catch {}
 
-    // 3) Textantwort im Channel (Webhook/Avatar)
     try {
       const msgShim = { channel: ch };
       await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
@@ -162,12 +159,12 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
       try { await ch.send(replyText); } catch {}
     }
 
-    // 4) TTS in Voice (falls verbunden) – Lock bleibt bis Ende TTS
+    // *** WICHTIG: TTS wirklich abwarten ***
     try {
       const { getVoiceConnection } = require("@discordjs/voice");
       const conn = getVoiceConnection(evt.guildId);
       if (conn) {
-        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
+        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || ""); // ⟵ wartet bis fertig
       } else {
         console.warn("[voice] no connection for guild", evt.guildId);
       }
@@ -178,6 +175,7 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
     voiceBusy.set(evt.channelId, false);
   }
 }
+
 
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
@@ -473,6 +471,13 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
     }
     return; // ← keine Antwort erzeugen
   }
+  // Busy? → höflich ablehnen und NICHT loggen
+if (voiceBusy.get(evt.channelId)) {
+  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+  try { await ch?.send("⏳ Ich antworte gerade – bitte kurz warten."); } catch {}
+  return;
+}
+
 
   // Für die KI das Triggerwort vorne entfernen (damit der Prompt sauber ist)
   const cleanedUserText = stripLeadingName(evt.text, TRIGGER);

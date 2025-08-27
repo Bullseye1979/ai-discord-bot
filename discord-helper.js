@@ -515,26 +515,31 @@ async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignori
 const queueMap = new Map();
 const playerMap = new Map();
 
+// NEU: liefert ein Promise zurück, das erst RESOLVEd, wenn die TTS-Task komplett fertig ist
 function setEnqueueTTS(guildId, task) {
-  if (!queueMap.has(guildId)) queueMap.set(guildId, []);
-  const q = queueMap.get(guildId);
-  q.push(task);
-  if (q.length === 1) setProcessTTSQueue(guildId);
+  return new Promise((resolve, reject) => {
+    if (!queueMap.has(guildId)) queueMap.set(guildId, []);
+    const q = queueMap.get(guildId);
+    q.push({ task, resolve, reject });
+    if (q.length === 1) setProcessTTSQueue(guildId);
+  });
 }
 
 async function setProcessTTSQueue(guildId) {
   const q = queueMap.get(guildId);
   if (!q?.length) return;
-  const task = q[0];
+  const { task, resolve, reject } = q[0];
   try {
     await task();
+    resolve();
   } catch (e) {
-    console.error("[TTS ERROR]:", e);
+    reject(e);
   } finally {
     q.shift();
     if (q.length > 0) setProcessTTSQueue(guildId);
   }
 }
+
 
 function getSplitTextToChunks(text, maxChars = 500) {
   const sentences = text.match(/[^.!?\n]+[.!?\n]?/g) || [text];
@@ -910,34 +915,30 @@ async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
 
-  setEnqueueTTS(guildId, async () => {
+  return setEnqueueTTS(guildId, async () => {   // ⟵ NEU: Promise an Aufrufer zurückgeben
     let player = playerMap.get(guildId);
     if (!player) {
       const { createAudioPlayer } = require("@discordjs/voice");
       player = createAudioPlayer();
-      // Optionales Sicherheitsnetz gegen Warnungen bei sehr vielen Chunks
       if (typeof player.setMaxListeners === "function") player.setMaxListeners(50);
       playerMap.set(guildId, player);
     }
 
-    // Nach Channel-Wechsel immer (re)subscriben
     try { connection.subscribe(player); } catch {}
-
     const { AudioPlayerStatus } = require("@discordjs/voice");
 
     for (const chunk of chunks) {
       try {
         const response = await getTTS(chunk, "tts-1", voice);
-        const pass = new PassThrough();
+        const pass = new (require("stream").PassThrough)();
         response.pipe(pass);
 
-        const decoder = new prism.FFmpeg({
-          args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"]
-        });
+        const prism = require("prism-media");
+        const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
         const pcmStream = pass.pipe(decoder);
+        const { createAudioResource, StreamType } = require("@discordjs/voice");
         const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
 
-        // Listener erst registrieren, dann play() aufrufen – und beim Abschluss wieder entfernen
         await new Promise((resolve, reject) => {
           const onIdle = () => { cleanup(); resolve(); };
           const onError = (err) => { cleanup(); reject(err); };
@@ -945,21 +946,19 @@ async function getSpeech(connection, guildId, text, client, voice) {
             try { player.off(AudioPlayerStatus.Idle, onIdle); } catch {}
             try { player.off("error", onError); } catch {}
           };
-
           player.on(AudioPlayerStatus.Idle, onIdle);
           player.on("error", onError);
-
           player.play(resource);
         });
 
-        // kleiner Puffer zwischen Chunks
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 100)); // kleiner Puffer
       } catch (e) {
         console.error("[TTS ERROR]:", e);
       }
     }
   });
 }
+
 
 
 
