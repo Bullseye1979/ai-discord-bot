@@ -729,6 +729,147 @@ async function quickSNR(wavPath) {
   return { snrDb, voicedRatio, frames: energies.length };
 }
 
+// --- NEU: hübsches Embed-Reply via Webhook (mit Bild-Extraktion & Link-Masking) ---
+async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) {
+  try {
+    if (!aiText || !String(aiText).trim()) return;
+
+    // Thread-sicherer Hook: immer am Parent erstellen/holen
+    const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    const hookChannel = isThread ? message.channel.parent : message.channel;
+
+    const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+    const meta = getChannelConfig(effectiveChannelId);
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
+
+    const hooks = await hookChannel.fetchWebhooks();
+    let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
+    if (!hook) {
+      hook = await hookChannel.createWebhook({
+        name: botname || meta?.botname || "AI",
+        avatar: personaAvatarUrl || undefined,
+      });
+    }
+
+    // 1) Bilder aus dem AI-Text ziehen (Markdown-Bilder, nackte URLs mit Bild-Endungen, Links auf Bilder)
+    const allImages = extractImageUrlsFromText(aiText);
+
+    // 2) Beschreibung aufbereiten:
+    //    - Markdown-Image-Tags komplett entfernen
+    //    - nackte URLs/Links maskieren => kein unfurl
+    //    - überschaubar halten
+    const cleanedDesc = maskLinksAndStripImageSyntax(aiText).trim();
+
+    // 3) Embeds bauen:
+    //    Embed #1 = Hauptantwort + großes Bild (falls vorhanden)
+    const themeColor = Number.isInteger(color) ? color : 0x5865F2; // Blurple als Default
+    const nowIso = new Date().toISOString();
+
+    const mainEmbed = {
+      color: themeColor,
+      author: {
+        name: botname || meta?.botname || "AI",
+        icon_url: personaAvatarUrl || undefined
+      },
+      description: truncateForEmbed(cleanedDesc, 4096),
+      timestamp: nowIso,
+      footer: {
+        text: meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI")
+      }
+    };
+
+    if (allImages.length > 0) {
+      mainEmbed.image = { url: allImages[0] }; // großes Bild
+    }
+
+    const embeds = [mainEmbed];
+
+    // 4) Weitere Bilder als kleine Thumbnails in separaten Embeds (Discord kann keine Images in Fields)
+    const moreImages = allImages.slice(1, 10); // max. 9 weitere (insgesamt 10 Embeds/Nachricht)
+    for (let i = 0; i < moreImages.length; i++) {
+      embeds.push({
+        color: 0x2b2d31, // etwas dunkler für Sekundär-Embeds
+        timestamp: nowIso,
+        author: { name: `Bild ${i + 2}` },
+        thumbnail: { url: moreImages[i] },
+        description: `Vorschau ${i + 2}`
+      });
+    }
+
+    // 5) Senden (links NICHT rendern: flags: 4)
+    await hook.send({
+      content: "",                         // nichts im Content => keine Auto-Previews
+      username: botname || meta?.botname || "AI",
+      avatarURL: personaAvatarUrl || undefined,
+      embeds,
+      allowedMentions: { parse: [] },
+      flags: 4,                            // SUPPRESS_EMBEDS (safety)
+      threadId: isThread ? message.channel.id : undefined
+    });
+
+  } catch (e) {
+    console.error("[Webhook Embed Reply] failed:", e);
+    // Fallback: Plain-Text ohne Links zu rendern
+    try {
+      const safe = maskLinksAndStripImageSyntax(aiText).trim();
+      await sendChunked(message.channel, safe);
+    } catch {}
+  }
+}
+
+// ---- Helpers ----
+
+// Bild-URLs aus Text extrahieren
+function extractImageUrlsFromText(text) {
+  const urls = new Set();
+
+  // ![alt](url)
+  text.replace(/!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/g, (_, u) => { if (looksLikeImage(u)) urls.add(cleanUrl(u)); return ""; });
+
+  // [label](url) -> nur wenn url wie Bild
+  text.replace(/\[[^\]]+]\((https?:\/\/[^\s)]+)\)/g, (_, u) => { if (looksLikeImage(u)) urls.add(cleanUrl(u)); return ""; });
+
+  // nackte URLs
+  text.replace(/https?:\/\/[^\s)]+/g, (u) => { if (looksLikeImage(u)) urls.add(cleanUrl(u)); return ""; });
+
+  return Array.from(urls);
+}
+
+function looksLikeImage(u) {
+  return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
+}
+function cleanUrl(u) {
+  try {
+    // kleine Säuberung (abschließende Klammern/Kommas etc. entfernen)
+    return u.replace(/[),.]+$/g, "");
+  } catch { return u; }
+}
+
+// Links maskieren + Markdown-Image rauswerfen
+function maskLinksAndStripImageSyntax(text) {
+  let s = String(text || "");
+
+  // Bild-Markdown komplett entfernen
+  s = s.replace(/!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/g, "");
+
+  // Normale Markdown-Links in "[Text] [Link]" umwandeln (ohne nackte URL)
+  s = s.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label) => `${label} [Link]`);
+
+  // nackte URLs maskieren -> [Link]
+  s = s.replace(/https?:\/\/[^\s)]+/g, "[Link]");
+
+  // Doppelte Spaces trimmen
+  return s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+}
+
+// Embed-Hardlimit
+function truncateForEmbed(s, max = 4096) {
+  if (!s) return "";
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + "…";
+}
+
+
 
 async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript /* callback */) {
   try {
@@ -1075,5 +1216,6 @@ module.exports = {
   resetRecordingFlag, 
   postSummariesIndividually,
   sendTranscriptViaWebhook,
+  setReplyAsWebhookEmbed,
 
 };

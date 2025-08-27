@@ -171,8 +171,14 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
 
     // Senden als Webhook (Avatar/Name aus Channel-Meta)
     try {
-      const msgShim = { channel: ch };
-      await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+      // const msgShim = { channel: ch };
+// await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+
+const msgShim = { channel: ch };
+await setReplyAsWebhookEmbed(msgShim, replyText, {
+  botname: channelMeta.botname || "AI"
+});
+
     } catch (e) {
       console.warn("[voice] setReplyAsWebhook failed, fallback send:", e?.message || e);
       try { await ch.send(replyText); } catch {}
@@ -499,7 +505,7 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
   if (voiceBusy.get(evt.channelId)) {
     try {
       const ch = await client.channels.fetch(evt.channelId).catch(() => null);
-      await ch?.send("⏳ Ich antworte gerade – bitte kurz warten.");
+      await ch?.send("⏳ ...");
     } catch {}
     return; // Keine KI-Anfrage starten, aber Transkript blieb erhalten
   }

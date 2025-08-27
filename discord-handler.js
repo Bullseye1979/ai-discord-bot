@@ -163,10 +163,10 @@ try {
     );
 
     if (output && String(output).trim()) {
-      await setReplyAsWebhook(message, output, {
-        botname: channelMeta.botname,
-        avatarUrl: channelMeta.avatarUrl
-      });
+      await setReplyAsWebhookEmbed(message, output, {
+  botname: channelMeta.botname,
+  color: 0x00b3ff // optional; sonst Default
+});
       await chatContext.add("assistant", channelMeta?.botname || "AI", output);
       await setMessageReaction(message, "✅");
     } else {
