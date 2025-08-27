@@ -277,24 +277,32 @@ function getDefaultPersona() {
       selectedTools: json.tools || [],
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
       summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
-      admins: Array.isArray(json.admins) ? json.admins : []      // ← NEU
+      admins: Array.isArray(json.admins) ? json.admins : [],
+      // NEU: Zusatzprompts (Default)
+      chatAppend: json.chatAppend || json.chatPrompt || json.chat_prompt || json.prompt_chat || "",
+      speechAppend: json.speechAppend || json.speechPrompt || json.speech_prompt || json.prompt_speech || "",
+      // optionale Limits
+      max_user_messages: json.max_user_messages ?? json.maxUserMessages ?? null,
+      max_tokens_chat: json.max_tokens_chat ?? json.maxTokensChat,
+      max_tokens_speaker: json.max_tokens_speaker ?? json.maxTokensSpeaker,
     };
   } catch {
     return {
       persona: "", instructions: "", voice: "", name: "", botname: "",
-      selectedTools: [], blocks: [], summaryPrompt: "", admins: [] // ← NEU
+      selectedTools: [], blocks: [], summaryPrompt: "", admins: [],
+      chatAppend: "", speechAppend: "",
+      max_user_messages: null, max_tokens_chat: undefined, max_tokens_speaker: undefined,
     };
   }
 }
 
 
 // ---------- Channel-Config ----------
-
 function getChannelConfig(channelId) {
   const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
   const def = getDefaultPersona();
 
-  // Defaults (robust, inkl. Fallbacks)
+  // Defaults
   let persona       = def.persona || "";
   let instructions  = def.instructions || "";
   let voice         = def.voice || "";
@@ -308,9 +316,13 @@ function getChannelConfig(channelId) {
     : null;
   let admins        = Array.isArray(def.admins) ? def.admins.map(String) : [];
 
-  // NEU: getrennte Tokenlimits (Default Chat > Speaker)
+  // Tokenlimits (Defaults)
   let max_tokens_chat    = (Number.isFinite(Number(def.max_tokens_chat))    && Number(def.max_tokens_chat)    > 0) ? Math.floor(Number(def.max_tokens_chat))    : 4096;
   let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0) ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
+
+  // NEU: Zusatzprompts (Defaults)
+  let chatAppend   = typeof def.chatAppend   === "string" ? def.chatAppend.trim()   : "";
+  let speechAppend = typeof def.speechAppend === "string" ? def.speechAppend.trim() : "";
 
   const hasConfigFile = fs.existsSync(configPath);
 
@@ -339,7 +351,7 @@ function getChannelConfig(channelId) {
         max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
       }
 
-      // NEU: Tokenlimits snake+camel lesen
+      // Tokenlimits snake+camel lesen
       const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
       if (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "") {
         const n = Number(rawTokChat);
@@ -351,8 +363,17 @@ function getChannelConfig(channelId) {
         if (Number.isFinite(n) && n > 0) max_tokens_speaker = Math.floor(n);
       }
 
-      // Admins sauber übernehmen
+      // Admins
       if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
+
+      // NEU: Zusatzprompts aus Channel-Config (beliebte Schlüsselvarianten)
+      const cfgChatAppend =
+        cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
+      const cfgSpeechAppend =
+        cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
+
+      if (typeof cfgChatAppend === "string")   chatAppend   = cfgChatAppend.trim();
+      if (typeof cfgSpeechAppend === "string") speechAppend = cfgSpeechAppend.trim();
 
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
@@ -379,17 +400,18 @@ function getChannelConfig(channelId) {
     toolRegistry,
     blocks,
     summaryPrompt,
-    max_user_messages,       // ← bleibt bestehen
+    max_user_messages,
     hasConfig: hasConfigFile,
     summariesEnabled,
     admins,
-
-    // NEU: an alle Call-Sites durchreichen
     max_tokens_chat,
-    max_tokens_speaker
+    max_tokens_speaker,
+
+    // NEU: für Aufrufer verfügbar
+    chatAppend,
+    speechAppend,
   };
 }
-
 
 
 // ---------- Chunking & Senden ----------

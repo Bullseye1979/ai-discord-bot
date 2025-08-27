@@ -143,6 +143,16 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.instructions = (chatContext.instructions || "") + hint;
     }
 
+    // --- [ADD] Mode-spezifischen Zusatzprompt anhängen ---
+try {
+  const modeAppend = (isSpeakerMsg ? channelMeta.speechAppend : channelMeta.chatAppend) || "";
+  if (modeAppend.trim()) {
+    // NICHT dauerhaft ändern – Backup existiert bereits oben in _instrBackup
+    chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
+  }
+} catch {}
+
+
     // KI abrufen
     const output = await getAIResponse(
       chatContext,

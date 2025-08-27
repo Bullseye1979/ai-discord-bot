@@ -112,7 +112,7 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
   const ch = await client.channels.fetch(evt.channelId).catch(() => null);
   if (!ch) { console.warn("[voice] channel missing", evt.channelId); return; }
 
-  // Busy-Gate: KI & TTS blockieren – aber Transkript/Logging NICHT blockieren
+  // WICHTIG: Busy-Gate blockiert NUR KI & TTS – Transkripte/Logging werden vorher schon erledigt.
   if (voiceBusy.get(evt.channelId)) {
     try { await ch.send("⏳ Ich antworte gerade – bitte kurz warten."); } catch {}
     return;
@@ -121,18 +121,30 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
   const channelMeta = getChannelConfig(evt.channelId);
   const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
+  // Window anwenden (robust für null/number)
   if (typeof chatContext.setUserWindow === "function") {
     chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
   }
 
   // Tokenlimit (Speaker) robust & geklemmt
   const tokenlimit = (() => {
-    const v = Number(channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
-    return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : 1024;
+    const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
+    const v = Number(raw);
+    const def = 1024;
+    return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
   })();
 
-  // *** WICHTIG: Für Voice/Transkript KEINE Auto-Continue-Kette ***
+  // Für Voice: KEINE Auto-Continue-Kette
   const sequenceLimit = 1;
+
+  // NEU: Speech-Append temporär an die Instructions hängen
+  const instrBackup = chatContext.instructions;
+  try {
+    const add = (channelMeta.speechAppend || "").trim();
+    if (add) {
+      chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
+    }
+  } catch {}
 
   voiceBusy.set(evt.channelId, true);
   try {
@@ -141,7 +153,7 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
       replyText = await getAIResponse(
         chatContext,
         tokenlimit,
-        sequenceLimit,           // <<<<<< verhindert „continue“-Runden
+        sequenceLimit,
         channelMeta.model || undefined,
         channelMeta.apikey || null
       );
@@ -152,12 +164,12 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
     }
     if (!replyText) return;
 
-    // Assistant in den Kontext
+    // Bot-Antwort in den Kontext
     try {
       await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
     } catch {}
 
-    // Textantwort in den Channel (Webhook)
+    // Senden als Webhook (Avatar/Name aus Channel-Meta)
     try {
       const msgShim = { channel: ch };
       await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
@@ -166,9 +178,8 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
       try { await ch.send(replyText); } catch {}
     }
 
-    // TTS nur, wenn Verbindung da – diese Funktion wartet (wg. deiner Queue/Promise)
+    // TTS (wartet dank Queue/Promise, damit voiceBusy korrekt gehalten wird)
     try {
-      const { getVoiceConnection } = require("@discordjs/voice");
       const conn = getVoiceConnection(evt.guildId);
       if (conn) {
         await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
@@ -179,6 +190,8 @@ async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
       console.warn("[voice] TTS failed:", e?.message || e);
     }
   } finally {
+    // Instructions zurücksetzen + Busy öffnen
+    try { chatContext.instructions = instrBackup; } catch {}
     voiceBusy.set(evt.channelId, false);
   }
 }
