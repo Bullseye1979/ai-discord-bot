@@ -15,7 +15,8 @@ const Context = require("./context.js");
 const {
   getSpeech,
   getChannelConfig,
-  setReplyAsWebhook,
+  setReplyAsWebhookEmbed,
+  setReokyAsWebhook,
   setStartListening,
   setAddUserMessage,
   setBotPresence,

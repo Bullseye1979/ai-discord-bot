@@ -6,6 +6,7 @@ const {
   setMessageReaction,
   getChannelConfig,
   setReplyAsWebhook,
+  setReplyAsWebhookEmbed,
   getSpeech,
 } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
