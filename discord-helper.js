@@ -606,7 +606,7 @@ async function setProcessTTSQueue(guildId) {
   }
 }
 
-/* Split text into smaller parts for TTS playback */
+/* Split text into smaller parts for TTS playback  */
 function getSplitTextToChunks(text, maxChars = 500) {
   const sentences = String(text || "").match(/[^.!?\n]+[.!?\n]?/g) || [String(text || "")];
   const chunks = [];
