@@ -1,10 +1,11 @@
-// getHistory.js
-// Flexible READ-ONLY SQL-Select über die Channel-History
-// ALLOWED tables: context_log, summaries
+// history.js — clean v1.1
+// Run a flexible READ-ONLY MySQL SELECT over the channel history (context_log, summaries only).
 
-const mysql = require('mysql2/promise');
+const mysql = require("mysql2/promise");
 
 let pool = null;
+
+/** Returns a singleton MySQL pool. */
 async function getPool() {
   if (!pool) {
     pool = mysql.createPool({
@@ -14,85 +15,72 @@ async function getPool() {
       database: process.env.DB_NAME,
       waitForConnections: true,
       connectionLimit: 5,
-      charset: 'utf8mb4'
+      charset: "utf8mb4"
     });
   }
   return pool;
 }
 
-// :named → ?  (und values[] in richtiger Reihenfolge)
+/** Compiles named placeholders (:name) into positional (?) and returns { sql, values }. Adds LIMIT if missing. */
 function compileNamed(sql, bindings) {
   const values = [];
-  const cleaned = String(sql || '').replace(/;+\s*$/,''); // trailing ; entfernen
-
+  const cleaned = String(sql || "").replace(/;+\s*$/, "");
   const out = cleaned.replace(/:(\w+)/g, (_, name) => {
     if (!(name in bindings)) {
       throw new Error(`Missing binding for :${name}`);
     }
     values.push(bindings[name]);
-    return '?';
+    return "?";
   });
-
-  // Falls kein LIMIT vorhanden: begrenzen
-  if (!/\blimit\s+\d+/i.test(out)) {
-    return { sql: `${out} LIMIT 200`, values };
-  }
+  if (!/\blimit\s+\d+/i.test(out)) return { sql: `${out} LIMIT 200`, values };
   return { sql: out, values };
 }
 
-function truncate(s, n=1200) {
-  if (typeof s !== 'string') return s;
-  return s.length > n ? s.slice(0, n) + '…' : s;
+/** Truncates long string fields in result rows. */
+function truncate(s, n = 1200) {
+  if (typeof s !== "string") return s;
+  return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
-// Tool-Entry (rückwärtskompatibel):
-// getHistory(toolFunction, handoverContext, _getAIResponse, runtime)
+/** Tool entry: executes a safe SELECT over context_log/summaries scoped to the provided channel_id. */
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   try {
-    const args = JSON.parse(toolFunction.arguments || '{}');
-    const sql = String(args.sql || '').trim();
-    const extra = (args.bindings && typeof args.bindings === 'object') ? args.bindings : {};
+    const args =
+      typeof toolFunction.arguments === "string"
+        ? JSON.parse(toolFunction.arguments || "{}")
+        : (toolFunction.arguments || {});
+    const sql = String(args.sql || "").trim();
+    const extra = (args.bindings && typeof args.bindings === "object") ? args.bindings : {};
 
-    if (!sql) throw new Error("sql missing");
+    if (!sql) throw new Error("SQL missing");
 
-    // channelId: bevorzugt aus runtime, sonst aus handoverContext.channelId
     let channelId = "";
-    if (runtime && runtime.channel_id) {
-      channelId = String(runtime.channel_id).trim();
-    } else if (ctxOrUndefined && ctxOrUndefined.channelId) {
-      channelId = String(ctxOrUndefined.channelId).trim();
-    }
+    if (runtime && runtime.channel_id) channelId = String(runtime.channel_id).trim();
+    else if (ctxOrUndefined && ctxOrUndefined.channelId) channelId = String(ctxOrUndefined.channelId).trim();
     if (!channelId) throw new Error("channel_id missing");
 
-    // Sicherheitsgitter
     const lowered = sql.toLowerCase();
-    if (!lowered.startsWith('select')) throw new Error("Only SELECT is allowed");
+    if (!lowered.startsWith("select")) throw new Error("Only SELECT is allowed");
     if (!/(from|join)\s+(context_log|summaries)\b/i.test(sql)) {
       throw new Error("Only tables context_log or summaries are allowed");
     }
-    if (!/:channel_id\b/.test(sql)) {
-      throw new Error("Query must include :channel_id in WHERE");
-    }
+    if (!/:channel_id\b/.test(sql)) throw new Error("Query must include :channel_id in WHERE");
 
-    // :channel_id IMMER bereitstellen (zusätzlich zu evtl. extra Bindings)
     const bindings = { channel_id: channelId, ...extra };
-    console.log(sql);
-      const { sql: compiled, values } = compileNamed(sql, bindings);
+    const { sql: compiled, values } = compileNamed(sql, bindings);
+
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);
-    console.log(rows);
 
-    const safe = (rows || []).map(r => {
+    const safe = (rows || []).map((r) => {
       const obj = {};
-      for (const [k, v] of Object.entries(r)) {
-        obj[k] = typeof v === 'string' ? truncate(v) : v;
-      }
+      for (const [k, v] of Object.entries(r)) obj[k] = typeof v === "string" ? truncate(v) : v;
       return obj;
     });
 
     return JSON.stringify({ rowCount: safe.length, rows: safe });
   } catch (err) {
-    return JSON.stringify({ error: String(err && err.message || err) });
+    return JSON.stringify({ error: `[ERROR]: ${err?.message || String(err)}` });
   }
 }
 

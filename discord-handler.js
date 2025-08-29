@@ -1,35 +1,32 @@
-// discord-handler.js — v2.7
-// KI-Flow + TTS + Transcripts-Mirroring + !summarize-Helper
+// discord-handler.js — clean v2.8
+// Discord AI flow: routing to AI, token limits, tool setup, voice join, and gated TTS playback.
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const {
   setMessageReaction,
   getChannelConfig,
-  setReplyAsWebhook,
   setReplyAsWebhookEmbed,
   getSpeech,
 } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
 const { getToolRegistry } = require("./tools.js");
 
+// TTS gate per channel (enabled temporarily after voice-triggered input)
+const ttsGate = new Map();
+const TTS_TTL_MS = 15000;
 
-    // ---- TTS Gate: nur sprechen, wenn Voice der Auslöser war ----
-const ttsGate = new Map(); // channelId -> expiresAt (ms since epoch)
-const TTS_TTL_MS = 15000;  // 15s reichen i.d.R. für alle Reply-Chunks
-
+/** Temporarily allow TTS for a channel */
 function markTTSAllowedForChannel(channelId, ttlMs = TTS_TTL_MS) {
   if (!channelId) return;
   const expires = Date.now() + ttlMs;
   ttsGate.set(String(channelId), expires);
-  // Auto-Cleanup
   setTimeout(() => {
     const cur = ttsGate.get(String(channelId));
     if (cur && cur <= Date.now()) ttsGate.delete(String(channelId));
   }, ttlMs + 1000);
 }
 
-// Run an AI request
-// Run an AI request
+/** Run a full AI request for a Discord message (tools, limits, instructions, reply & logging) */
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
   if (state.isAIProcessing >= 3) {
     try { await setMessageReaction(message, "❌"); } catch {}
@@ -38,6 +35,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
   state.isAIProcessing++;
   let _instrBackup = chatContext.instructions;
+
   try {
     await setMessageReaction(message, "⏳");
 
@@ -47,7 +45,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const isSpeakerMsg = !!message.webhookId;
 
-    // Tokenlimit abhängig von Voice (Webhook) vs. Text — robust & geklemmt
+    // Token limit per mode (speaker vs chat) with sane clamps
     const tokenlimit = (() => {
       const raw = isSpeakerMsg
         ? (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker)
@@ -57,19 +55,19 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
     })();
 
-    // WICHTIG: Auto-Continue für Speaker hart abschalten
+    // Disable auto-continue for speaker mode
     const sequenceLimit = isSpeakerMsg ? 1 : 1000;
 
-    // Effektive Channel-ID (Threads → Parent)
+    // Effective channel id (threads → parent)
     const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
     const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
 
-    // Wenn Voice/Transkript der Auslöser war → TTS nur zeitlich erlauben (separat handled)
+    // If speaker-triggered (voice), allow TTS for a short time window on this channel
     if (isSpeakerMsg) {
       markTTSAllowedForChannel(effectiveChannelId);
     }
 
-    // Speaker-Name vs. User-ID für Block-Matching
+    // Block matching
     const speakerName = (message.member?.displayName || message.author?.username || "").trim().toLowerCase();
     const userId = String(message.author?.id || "").trim();
 
@@ -83,6 +81,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       }
       return exact || wildcard || null;
     }
+
     function pickBlockForUser() {
       let exact = null, wildcard = null;
       for (const b of blocks) {
@@ -100,6 +99,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     const effectiveModel  = matchingBlock.model  || model;
     const effectiveApiKey = matchingBlock.apikey || apiKey;
 
+    // Tool selection (block overrides channel)
     if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
@@ -109,7 +109,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    // Guard: Wenn (noch) keine Summary existiert, Halluzinationen deutlich verbieten
+    // Strict guard if no summaries exist
     try {
       const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
       if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
@@ -120,7 +120,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       }
     } catch {}
 
-    // Bild-Uploads automatisch in den Prompt aufnehmen (nur bei echten User-Posts)
+    // Auto-append image URLs found in user attachments (non-webhook messages)
     const imageUrls = [];
     try {
       if (!message.webhookId && message.attachments?.size > 0) {
@@ -132,6 +132,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
         }
       }
     } catch {}
+
     if (imageUrls.length) {
       const hasGetImageTool =
         Array.isArray(chatContext.tools) &&
@@ -139,35 +140,33 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       const hint =
         "\n\n[IMAGE UPLOAD]\n" +
         imageUrls.map(u => `- ${u}`).join("\n") +
-        "\nAufgabe: Was ist auf diesem Bild zu sehen?" +
-        (hasGetImageTool ? " Nutze dafür das Tool `getImage`." : "");
+        "\nTask: Describe what is shown in these images." +
+        (hasGetImageTool ? " You may use the `getImage` tool." : "");
       chatContext.instructions = (chatContext.instructions || "") + hint;
     }
 
-    // --- [ADD] Mode-spezifischen Zusatzprompt anhängen ---
-try {
-  const modeAppend = (isSpeakerMsg ? channelMeta.speechAppend : channelMeta.chatAppend) || "";
-  if (modeAppend.trim()) {
-    // NICHT dauerhaft ändern – Backup existiert bereits oben in _instrBackup
-    chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
-  }
-} catch {}
+    // Mode-specific instruction append (chat vs speech)
+    try {
+      const modeAppend = (isSpeakerMsg ? channelMeta.speechAppend : channelMeta.chatAppend) || "";
+      if (modeAppend.trim()) {
+        chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
+      }
+    } catch {}
 
-
-    // KI abrufen
+    // AI call
     const output = await getAIResponse(
       chatContext,
       tokenlimit,
-      sequenceLimit,   // <<<<<< Auto-Continue bei Speaker = 1 ⇒ keine „continue“-Spirale
+      sequenceLimit,
       effectiveModel,
       effectiveApiKey
     );
 
     if (output && String(output).trim()) {
       await setReplyAsWebhookEmbed(message, output, {
-  botname: channelMeta.botname,
-  color: 0x00b3ff // optional; sonst Default
-});
+        botname: channelMeta.botname,
+        color: 0x00b3ff,
+      });
       await chatContext.add("assistant", channelMeta?.botname || "AI", output);
       await setMessageReaction(message, "✅");
     } else {
@@ -177,7 +176,6 @@ try {
     console.error("[AI ERROR]:", err);
     try { await setMessageReaction(message, "❌"); } catch {}
   } finally {
-    // Instructions zurücksetzen
     try {
       if (typeof _instrBackup === "string") chatContext.instructions = _instrBackup;
     } catch {}
@@ -185,14 +183,14 @@ try {
   }
 }
 
-
-// Enter a voice channel and start listening
-async function setVoiceChannel(message, guildTextChannels, _activeRecordings, _chatContext, _client) {
+/** Join the caller’s voice channel and remember the associated text channel */
+async function setVoiceChannel(message, guildTextChannels) {
   const channel = message.member?.voice?.channel;
   if (!channel) {
     await message.channel.send("❌ Join a voice channel first, then run `!joinvc`.");
     return;
   }
+
   joinVoiceChannel({
     channelId: channel.id,
     guildId: message.guild.id,
@@ -200,34 +198,28 @@ async function setVoiceChannel(message, guildTextChannels, _activeRecordings, _c
     selfDeaf: false,
   });
 
-  // Merke den zugehörigen Textkanal (für TTS & Transcripts)
   guildTextChannels.set(message.guild.id, message.channel.id);
   await message.channel.send(`🔊 Joined **${channel.name}**. TTS ready.`);
 }
 
-// Handle speech output in voice chat (TTS)
-// (Wird im bot.js bei jedem messageCreate event aufgerufen)
+/** Speak AI webhook replies via TTS if the channel is temporarily allowed for TTS */
 async function setTTS(message, client, guildTextChannels) {
   if (!message.guild) return;
 
-  // Nicht im Transcripts-Thread vorlesen
   const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
   if (inThread && message.channel.name === "Transcripts") return;
 
-  // Summaries NIEMALS vorlesen
   const txt = (message.content || "").trim();
   const looksLikeSummary =
     txt.startsWith("**Summary") ||
     txt.includes("Summary in progress…") ||
     txt.includes("Summary completed.");
-
   if (looksLikeSummary) return;
 
-  // Nur KI-Antworten vorlesen, nicht alles
-  // Prüfe, ob es eine Webhook-Nachricht unseres Bots ist
   const isWebhook = !!message.webhookId;
   const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
   const meta = getChannelConfig(effectiveChannelId);
+
   const isAIWebhook =
     isWebhook &&
     (await message.channel.fetchWebhooks().then(ws => {
@@ -235,35 +227,25 @@ async function setTTS(message, client, guildTextChannels) {
       return w && w.name === (meta?.botname || "AI");
     }).catch(() => false));
 
-  if (!isAIWebhook) return; // Nur echte AI-Ausgaben vorlesen (keine Userposts usw.)
+  if (!isAIWebhook) return;
 
-// Nur sprechen, wenn der Kanal innerhalb der TTL freigeschaltet wurde (Voice-Auslöser)
-const gate = ttsGate.get(String(effectiveChannelId));
-if (!gate || gate < Date.now()) {
-  return; // keine Freigabe → still bleiben
-}
+  const gate = ttsGate.get(String(effectiveChannelId));
+  if (!gate || gate < Date.now()) return;
 
-
-
-  // Muss im selben Guild-Textkanal sein, in dem der Bot gerade "hängt"
   const guildId = message.guild.id;
   const expectedChannelId = guildTextChannels.get(guildId);
   if (expectedChannelId && message.channel.id !== expectedChannelId) return;
 
-  // Verbindung und Voice-Channel prüfen
-  const { getVoiceConnection } = require("@discordjs/voice");
   const connection = getVoiceConnection(guildId);
   if (!connection) return;
 
-  // Jetzt wirklich sprechen
   const cleaned = txt
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
-    .replace(/https?:\/\/\S+/g, 'Link')
-    .replace(/<@!?(\d+)>/g, 'someone')
-    .replace(/:[^:\s]+:/g, '');
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "Link")
+    .replace(/<@!?(\d+)>/g, "someone")
+    .replace(/:[^:\s]+:/g, "");
 
   if (cleaned) {
-    const { getSpeech } = require("./discord-helper.js");
     await getSpeech(connection, guildId, cleaned, client, meta?.voice);
   }
 }

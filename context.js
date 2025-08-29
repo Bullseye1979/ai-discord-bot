@@ -1,5 +1,5 @@
-// context.js — v4.9 (robust: safe name + always-memory + DB-optional)
-// Nach !summarize: Kontext = System + 5 Summaries (älteste→neueste) + ALLE Einzel-Messages >= Cutoff
+// context.js — clean v5.0
+// Conversation context with optional MySQL persistence, summaries, and user-window trimming.
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -7,135 +7,24 @@ const { getAI } = require("./aiService.js");
 
 let pool;
 
-// --- Helpers ---------------------------------------------------------
-
+/** Format Date as MySQL DATETIME (UTC). */
 function toMySQLDateTime(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
 
+/** Message role predicates. */
+function isSystem(msg) { return msg?.role === "system"; }
+function isSummary(msg) { return msg?.role === "assistant" && (msg?.name === "summary" || /^summary/i.test(msg?.name || "")); }
+function isUser(msg) { return msg?.role === "user"; }
+function isAssistantToolCall(msg) { return msg?.role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0; }
+function isTool(msg) { return msg?.role === "tool"; }
 
-// --- NEU ganz oben innerhalb der Datei (Hilfsfunktionen) ---------------------
-
-function isSystem(msg) {
-  return msg?.role === "system";
-}
-function isSummary(msg) {
-  // Wir lassen "assistant" + name === "summary" als Summary gelten (kompatibel zu DB-Variante)
-  return msg?.role === "assistant" && (msg?.name === "summary" || /^summary/i.test(msg?.name || ""));
-}
-function isUser(msg) {
-  return msg?.role === "user";
-}
-function isAssistantToolCall(msg) {
-  // assistant-message, die tool_calls enthält
-  return msg?.role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
-}
-function isTool(msg) {
-  return msg?.role === "tool";
-}
-
-// Gibt die Zahl der User-Messages (ohne system/summary) zurück
-function countUsers(messages) {
-  return messages.reduce((n, m) => n + (isUser(m) ? 1 : 0), 0);
-}
-
-// Zählt Tool-Paare (assistant(tool_calls) + folgendes tool)
-function countToolPairs(messages) {
-  let pairs = 0;
-  for (let i = 0; i < messages.length - 1; i++) {
-    if (isAssistantToolCall(messages[i]) && isTool(messages[i + 1])) {
-      pairs++;
-      i++; // das Paar überspringen
-    }
-  }
-  return pairs;
-}
-
-// Entfernt sicher vom ANFANG Nachrichten – achtet darauf, dass Tool-Paare zusammen entfernt werden.
-// removePredicate entscheidet, welche Kandidaten weg dürfen (z.B. nur user).
-function shiftSafely(messages, removePredicate, howMany) {
-  if (howMany <= 0) return 0;
-  let removed = 0;
-  // Index 0 ist (bei dir) immer System → den überspringen
-  let i = 0;
-  while (i < messages.length && removed < howMany) {
-    const msg = messages[i];
-
-    // System nie entfernen
-    if (isSystem(msg)) { i++; continue; }
-
-    // Summary i. d. R. behalten (kannst du optional erlauben zu löschen)
-    if (isSummary(msg)) { i++; continue; }
-
-    // Wenn es ein assistant tool_call ist und wir ihn löschen dürften,
-    // dann MUSS direkt danach (falls vorhanden) auch die tool-msg mit weg.
-    if (isAssistantToolCall(msg)) {
-      // Tool-Paare nur löschen, wenn removePredicate beide zulässt
-      const nextIsTool = i + 1 < messages.length && isTool(messages[i + 1]);
-      if (removePredicate(msg)) {
-        if (nextIsTool && removePredicate(messages[i + 1])) {
-          messages.splice(i, 2);
-          removed += 2;
-          continue; // an gleicher Stelle weitermachen
-        } else {
-          // unvollständiges Paar nicht anrühren → weiter
-          i++;
-          continue;
-        }
-      } else {
-        i++;
-        continue;
-      }
-    }
-
-    // Wenn es eine tool-Message ist, prüfen ob davor ein tool_call stand (ältester Teil eines Paares)
-    if (isTool(msg)) {
-      // Sicherheit: nur entfernen, wenn removePredicate erlaubt UND davor kein passender assistant(tool_calls) steht,
-      // oder wenn er direkt davor steht und removePredicate auch den assistant löschen würde (Paar!)
-      const prevIsAssistantToolCall = i - 1 >= 0 && isAssistantToolCall(messages[i - 1]);
-      if (prevIsAssistantToolCall) {
-        if (removePredicate(messages[i - 1]) && removePredicate(msg)) {
-          // lösche das Paar von i-1 (assistant) und i (tool)
-          messages.splice(i - 1, 2);
-          removed += 2;
-          // i zeigt nun auf den Eintrag, der nach dem gelöschten tool stand → nicht i++,
-          // aber um die Schleife sauber zu halten:
-          i = Math.max(0, i - 1);
-          continue;
-        } else {
-          i++;
-          continue;
-        }
-      } else {
-        // Einzelne Tool-Message ohne Partner niemals löschen (sonst crasht Bot)
-        i++;
-        continue;
-      }
-    }
-
-    // Normalfall (z.B. user/assistant ohne tools)
-    if (removePredicate(msg)) {
-      messages.splice(i, 1);
-      removed += 1;
-      continue;
-    } else {
-      i++;
-    }
-  }
-  return removed;
-}
-
-
-
-/** Baut Blöcke: Ein Block beginnt mit einer user-Message und enthält ALLES bis zur nächsten user.
- *  Summaries werden separat gehalten; System bleibt unangetastet.
- */
+/** Group messages into user-led blocks (system isolated, summaries separated). */
 function buildBlocks(messages) {
   const hasSystem = messages.length && isSystem(messages[0]);
   const headIdx = hasSystem ? 1 : 0;
 
-  // Summaries isolieren (werden nicht getrimmt)
   const summaries = [];
   const body = [];
   for (let i = headIdx; i < messages.length; i++) {
@@ -144,7 +33,6 @@ function buildBlocks(messages) {
     else body.push(m);
   }
 
-  // Blöcke bilden
   const blocks = [];
   let cur = [];
   const flush = () => { if (cur.length) { blocks.push(cur); cur = []; } };
@@ -158,18 +46,13 @@ function buildBlocks(messages) {
   return { headIdx, summaries, blocks };
 }
 
-/** Löscht die ältesten k User-Blöcke vollständig (inkl. assistant/tool, die darin liegen). */
+/** Drop the oldest k user blocks entirely (including assistant/tool messages in them). */
 function dropOldestUserBlocks(messages, k) {
   if (!k || k <= 0) return 0;
-
   const hasSystem = messages.length && isSystem(messages[0]);
-  const headIdx = hasSystem ? 1 : 0;
-
-  // Zerlegen
   const head = hasSystem ? [messages[0]] : [];
-  const { summaries, blocks } = buildBlocks(messages);
 
-  // Indizes der Blöcke, die eine user-Message enthalten
+  const { summaries, blocks } = buildBlocks(messages);
   const userBlockIdx = blocks
     .map((b, i) => ({ i, hasUser: b.some(isUser) }))
     .filter(x => x.hasUser)
@@ -178,27 +61,15 @@ function dropOldestUserBlocks(messages, k) {
   if (!userBlockIdx.length) return 0;
 
   const toKill = Math.min(k, userBlockIdx.length);
-  const killSet = new Set(userBlockIdx.slice(0, toKill)); // älteste zuerst
-
+  const killSet = new Set(userBlockIdx.slice(0, toKill));
   const keptBlocks = blocks.filter((b, i) => !killSet.has(i));
 
-  // Neu zusammensetzen: System + Summaries + verbleibende Blöcke
-  const rebuilt = [
-    ...head,
-    ...summaries,
-    ...keptBlocks.flat()
-  ];
-
+  const rebuilt = [...head, ...summaries, ...keptBlocks.flat()];
   messages.splice(0, messages.length, ...rebuilt);
   return toKill;
 }
 
-
-
-
-
-// OpenAI akzeptiert names nur mit regex: ^[^\s<|\\/>]+$
-// Wir erlauben a–z, 0–9, _ und schneiden auf 64 Zeichen.
+/** Sanitize a display name into OpenAI-safe 'name'. */
 function sanitizeName(input, fallback = "user") {
   return String(input || fallback)
     .toLowerCase()
@@ -207,6 +78,7 @@ function sanitizeName(input, fallback = "user") {
     .slice(0, 64) || fallback;
 }
 
+/** Get or create a MySQL pool and ensure required tables. */
 async function getPool() {
   if (!pool) {
     pool = await mysql.createPool({
@@ -225,6 +97,7 @@ async function getPool() {
   return pool;
 }
 
+/** Create tables if they do not exist. */
 async function ensureTables(pool) {
   const c = await pool.getConnection();
   try {
@@ -259,311 +132,265 @@ async function ensureTables(pool) {
   }
 }
 
-// --- Context Class ---------------------------------------------------
-
+/** Conversation context with optional DB persistence and summarization. */
 class Context {
-constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = null, opts = {}) {
-  const { skipInitialSummaries = false, persistToDB, summaryPrompt = "" } = opts;
+  constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = null, opts = {}) {
+    const { skipInitialSummaries = false, persistToDB, summaryPrompt = "" } = opts;
 
-  this.messages = [];
-  this.persona = persona || "";
-  this.instructions = instructions || "";
-  this.tools = tools || [];
-  this.toolRegistry = toolRegistry || {};
-  this.channelId = channelId ? String(channelId) : null;
-  this.summaryPrompt = summaryPrompt || "";
+    this.messages = [];
+    this.persona = persona || "";
+    this.instructions = instructions || "";
+    this.tools = tools || [];
+    this.toolRegistry = toolRegistry || {};
+    this.channelId = channelId ? String(channelId) : null;
+    this.summaryPrompt = summaryPrompt || "";
+    this.persistent = typeof persistToDB === "boolean" ? persistToDB : !!this.channelId;
 
-  // Persistenz: nur mit channelId – außer explizit via opts.persistToDB überschrieben
-  this.persistent = typeof persistToDB === "boolean" ? persistToDB : !!this.channelId;
+    this._maxUserMessages = null;
+    this._prunePerTwoNonUser = true;
+    this.isSummarizing = false;
 
-  // Cap nur wenn explizit > 0 gesetzt (sonst ∞)
-  this._maxUserMessages = null;
-  this._prunePerTwoNonUser = true;
+    const sys = `${this.persona}\n${this.instructions}`.trim();
+    if (sys) this.messages.push({ role: "system", name: "system", content: sys });
 
-  this.isSummarizing = false;
+    this._initLoaded = (!this.persistent || skipInitialSummaries)
+      ? Promise.resolve()
+      : this._injectInitialSummaries();
+  }
 
-  const sys = `${this.persona}\n${this.instructions}`.trim();
-  if (sys) this.messages.push({ role: "system", name: "system", content: sys });
+  /** Set the rolling window in user-blocks; null disables trimming. */
+  setUserWindow(maxUserMessages, { prunePerTwoNonUser = true } = {}) {
+    const n = Number(maxUserMessages);
+    const cap = Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+    this._maxUserMessages = cap;
+    this._prunePerTwoNonUser = !!prunePerTwoNonUser;
+    if (cap != null) this._enforceUserWindowCap();
+  }
 
-  this._initLoaded = (!this.persistent || skipInitialSummaries)
-    ? Promise.resolve()
-    : this._injectInitialSummaries();
-}
-
-
-
-setUserWindow(maxUserMessages, { prunePerTwoNonUser = true } = {}) {
-  const n = Number(maxUserMessages);
-  const cap = Number.isFinite(n) && n > 0 ? Math.floor(n) : null; // 0/undef => ∞
-  this._maxUserMessages = cap;
-  this._prunePerTwoNonUser = !!prunePerTwoNonUser;
-  if (cap != null) this._enforceUserWindowCap();
-}
-
-
-
-  /** Zählt aktuelle User-Blöcke (ohne system & summaries). */
+  /** Count user-led blocks. */
   _countUserBlocks() {
     const { blocks } = buildBlocks(this.messages);
     return blocks.filter(b => b.some(isUser)).length;
   }
 
-  /** Erzwingt das Fenster: max. _maxUserMessages User-Blöcke behalten (älteste zuerst entfernen). */
+  /** Enforce the rolling window by dropping oldest user-blocks. */
   _enforceUserWindowCap() {
     if (this._maxUserMessages == null) return;
-    let have = this._countUserBlocks();
+    const have = this._countUserBlocks();
     if (have > this._maxUserMessages) {
-      const diff = have - this._maxUserMessages;
-      dropOldestUserBlocks(this.messages, diff);
+      dropOldestUserBlocks(this.messages, have - this._maxUserMessages);
     }
   }
 
-_afterAddTrim(lastRole) {
-  if (this._maxUserMessages == null) return; // ∞ => nichts trimmen
-
-  const L = this.messages.length;
-  if (L >= 2 && lastRole === "tool") {
-    const prev = this.messages[L - 2];
-    if (isAssistantToolCall(prev)) dropOldestUserBlocks(this.messages, 2);
+  /** Post-add trimming hook to keep tool-call pairs and window intact. */
+  _afterAddTrim(lastRole) {
+    if (this._maxUserMessages == null) return;
+    const L = this.messages.length;
+    if (L >= 2 && lastRole === "tool") {
+      const prev = this.messages[L - 2];
+      if (isAssistantToolCall(prev)) dropOldestUserBlocks(this.messages, 2);
+    }
+    this._enforceUserWindowCap();
   }
-  this._enforceUserWindowCap();
-}
 
-
-
-    /**
-   * Reduziert den in‑memory Kontext auf:
-   *   [ system, letzte_DB_Summary? ]
-   * - System bleibt (Rolle nicht vergessen).
-   * - Wenn es eine Summary gibt, wird genau EINE (die jüngste) injiziert.
-   * - DB bleibt unverändert.
-   */
+  /** Keep only system and last DB summary in memory. */
   async collapseToSystemAndLastSummary() {
-    // 1) System wiederherstellen
     const sys = `${this.persona}\n${this.instructions}`.trim();
     this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
-
-    // 2) Jüngste Summary aus DB holen
     try {
-      const last = await this.getLastSummaries(1); // [{ id, timestamp, summary }] oder []
+      const last = await this.getLastSummaries(1);
       const newest = last?.[0]?.summary;
       if (newest && newest.trim()) {
-        this.messages.push({
-          role: "assistant",
-          name: "summary",
-          content: newest.trim()
-        });
+        this.messages.push({ role: "assistant", name: "summary", content: newest.trim() });
       }
     } catch (e) {
       console.warn("[collapseToSystemAndLastSummary] failed:", e.message);
     }
-
     return this.messages;
   }
 
-
+  /** Inject the newest summary from DB into memory at startup. */
   async _injectInitialSummaries() {
-  if (!this.persistent) return;
-  try {
-    const db = await getPool();
-    const [rowsDesc] = await db.execute(
-      `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
-      [this.channelId]
-    );
-    if (!rowsDesc?.length) return;
-    const head = this.messages[0]?.role === "system" ? 1 : 0;
-    this.messages.splice(head, 0, ...rowsDesc.slice().reverse().map(r => ({
-      role: "assistant", name: "summary", content: r.summary
-    })));
-  } catch (e) {
-    console.error("[DB] load initial summaries failed:", e.message);
+    if (!this.persistent) return;
+    try {
+      const db = await getPool();
+      const [rowsDesc] = await db.execute(
+        `SELECT timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        [this.channelId]
+      );
+      if (!rowsDesc?.length) return;
+      const head = this.messages[0]?.role === "system" ? 1 : 0;
+      this.messages.splice(head, 0, ...rowsDesc.slice().reverse().map(r => ({
+        role: "assistant", name: "summary", content: r.summary
+      })));
+    } catch (e) {
+      console.error("[DB] load initial summaries failed:", e.message);
+    }
   }
-}
 
-
+  /** Rebuild memory to only the system message. */
   _rebuildSystemOnly() {
     const sys = `${this.persona}\n${this.instructions}`.trim();
     this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
   }
 
-    /**
-   * Robustes add():
-   * - Sanitized name (verhindert 400er).
-   * - Schreibt IMMER erst in-memory.
-   * - DB-Write best-effort (Fehler ≠ Verlust der Nachricht).
-   * - Trimmt danach den RAM-Kontext gemäß Fenster (System & Summaries bleiben).
-   */
+  /** Add a message to memory and best-effort persist to DB. */
   async add(role, sender, content, timestampMs = null, { alsoMemory = true } = {}) {
-  const safeRole = String(role || "user");
-  const safeName = sanitizeName(sender, safeRole === "system" ? "system" : "user");
-  const safeContent = String(content ?? "");
+    const safeRole = String(role || "user");
+    const safeName = sanitizeName(sender, safeRole === "system" ? "system" : "user");
+    const safeContent = String(content ?? "");
 
-  if (alsoMemory) this.messages.push({ role: safeRole, name: safeName, content: safeContent });
+    if (alsoMemory) this.messages.push({ role: safeRole, name: safeName, content: safeContent });
 
-  if (this.persistent) {
-    try {
-      const db = await getPool();
-      const ts = toMySQLDateTime(timestampMs ? new Date(timestampMs) : new Date());
-      await db.execute(
-        `INSERT INTO context_log (timestamp, channel_id, role, sender, content)
-         VALUES (?, ?, ?, ?, ?)`,
-        [ts, this.channelId, safeRole, safeName, safeContent]
-      );
-    } catch (e) {
-      console.warn("[DB][add] write failed (non-fatal):", e.message);
-    }
-  }
-
-  if (alsoMemory) this._afterAddTrim(safeRole);
-  return { role: safeRole, name: safeName, content: safeContent };
-}
-
-
-async getMessagesAfter(cutoffMs) {
-  if (!this.persistent) return [];
-  try {
-    const db = await getPool();
-    const [rows] = await db.execute(
-      `SELECT timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id=? AND timestamp >= ?
-        ORDER BY id ASC`,
-      [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
-    );
-    return rows || [];
-  } catch (e) {
-    console.warn("[DB][getMessagesAfter] read failed:", e.message);
-    return [];
-  }
-}
-
-
-async summarizeSince(cutoffMs, customPrompt = null) {
-  if (!this.persistent) {
-    return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
-  }
-  if (this.isSummarizing) {
-    return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
-  }
-  this.isSummarizing = true;
-
-  const DEFAULT_EXTRACTIVE_PROMPT = `...` .trim();
-
-  try {
-    const db = await getPool();
-    const [lastSum] = await db.execute(
-      `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
-      [this.channelId]
-    );
-    const lastCursor = lastSum?.[0]?.last_context_id ?? null;
-    const cutoff = toMySQLDateTime(new Date(cutoffMs));
-
-    let rows = [];
-    if (lastCursor != null) {
-      const [r] = await db.execute(
-        `SELECT id, timestamp, role, sender, content
-           FROM context_log
-          WHERE channel_id=? AND id > ? AND timestamp <= ?
-          ORDER BY id ASC`,
-        [this.channelId, lastCursor, cutoff]
-      );
-      rows = r || [];
-    } else {
-      const [r] = await db.execute(
-        `SELECT id, timestamp, role, sender, content
-           FROM context_log
-          WHERE channel_id=? AND timestamp <= ?
-          ORDER BY id ASC`,
-        [this.channelId, cutoff]
-      );
-      rows = r || [];
-    }
-
-    let maxId = rows.length ? rows[rows.length - 1].id : lastCursor;
-    let insertedSummaryId = null;
-
-    if (rows.length) {
-      const text = rows.map(r => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`).join("\n");
-      const prompt =
-        (customPrompt && customPrompt.trim()) ||
-        (this.summaryPrompt && this.summaryPrompt.trim()) ||
-        DEFAULT_EXTRACTIVE_PROMPT;
-
-      // Summarizer-Context ausdrücklich Memory-only
-      const sumCtx = new Context(
-        "You are a channel summary generator.",
-        prompt,
-        [],
-        {},
-        null,
-        { skipInitialSummaries: true, persistToDB: false }
-      );
-      sumCtx.messages.push({ role: "user", name: "system", content: text });
-
-      const summary = (await getAI(sumCtx, 900, "gpt-4-turbo", { temperature: 0.1 }))?.trim() || "";
-      if (summary) {
-        const [res] = await db.execute(
-          `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
-           VALUES (?, ?, ?, ?)`,
-          [toMySQLDateTime(new Date()), this.channelId, summary, maxId]
+    if (this.persistent) {
+      try {
+        const db = await getPool();
+        const ts = toMySQLDateTime(timestampMs ? new Date(timestampMs) : new Date());
+        await db.execute(
+          `INSERT INTO context_log (timestamp, channel_id, role, sender, content)
+           VALUES (?, ?, ?, ?, ?)`,
+          [ts, this.channelId, safeRole, safeName, safeContent]
         );
-        insertedSummaryId = res?.insertId ?? null;
+      } catch (e) {
+        console.warn("[DB][add] write failed (non-fatal):", e.message);
       }
     }
 
-    let lastSummary = null;
-    if (insertedSummaryId) {
-      const [rowsOne] = await db.execute(`SELECT summary FROM summaries WHERE id=?`, [insertedSummaryId]);
-      lastSummary = rowsOne?.[0]?.summary || null;
+    if (alsoMemory) this._afterAddTrim(safeRole);
+    return { role: safeRole, name: safeName, content: safeContent };
+  }
+
+  /** Fetch messages from DB at or after a UTC ms cutoff. */
+  async getMessagesAfter(cutoffMs) {
+    if (!this.persistent) return [];
+    try {
+      const db = await getPool();
+      const [rows] = await db.execute(
+        `SELECT timestamp, role, sender, content
+           FROM context_log
+          WHERE channel_id=? AND timestamp >= ?
+          ORDER BY id ASC`,
+        [this.channelId, toMySQLDateTime(new Date(cutoffMs))]
+      );
+      return rows || [];
+    } catch (e) {
+      console.warn("[DB][getMessagesAfter] read failed:", e.message);
+      return [];
     }
-
-    return { messages: this.messages, lastSummary, insertedSummaryId, usedMaxContextId: maxId };
-  } catch (e) {
-    console.error("[SUMMARIZE] failed:", e);
-    return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
-  } finally {
-    this.isSummarizing = false;
   }
-}
 
-async getLastSummaries(limit = 1) {
-  if (!this.persistent) return [];
-  const db = await getPool();
-  const [rows] = await db.execute(
-    `SELECT id, timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
-    [this.channelId, Number(limit)]
-  );
-  return rows || [];
-}
+  /** Summarize all logs up to a cutoff and store a new summary with cursor. */
+  async summarizeSince(cutoffMs, customPrompt = null) {
+    if (!this.persistent || this.isSummarizing) {
+      return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
+    }
+    this.isSummarizing = true;
 
-async getMaxContextId() {
-  if (!this.persistent) return null;
-  const db = await getPool();
-  const [rows] = await db.execute(
-    `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
-    [this.channelId]
-  );
-  return rows?.[0]?.maxId ?? null;
-}
+    const DEFAULT_EXTRACTIVE_PROMPT = `
+Summarize the provided chat logs concisely. Capture key points, decisions, follow-ups, references, and open questions. Use bullet points, preserve dates/times, and include brief quotes only when necessary. Avoid speculation and omit trivial chit-chat.
+`.trim();
 
-async bumpCursorToCurrentMax() {
-  if (!this.persistent) return null;
-  try {
+    try {
+      const db = await getPool();
+      const [lastSum] = await db.execute(
+        `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        [this.channelId]
+      );
+      const lastCursor = lastSum?.[0]?.last_context_id ?? null;
+      const cutoff = toMySQLDateTime(new Date(cutoffMs));
+
+      let rows = [];
+      if (lastCursor != null) {
+        const [r] = await db.execute(
+          `SELECT id, timestamp, role, sender, content
+             FROM context_log
+            WHERE channel_id=? AND id > ? AND timestamp <= ?
+            ORDER BY id ASC`,
+          [this.channelId, lastCursor, cutoff]
+        );
+        rows = r || [];
+      } else {
+        const [r] = await db.execute(
+          `SELECT id, timestamp, role, sender, content
+             FROM context_log
+            WHERE channel_id=? AND timestamp <= ?
+            ORDER BY id ASC`,
+          [this.channelId, cutoff]
+        );
+        rows = r || [];
+      }
+
+      const maxId = rows.length ? rows[rows.length - 1].id : lastCursor;
+      let insertedSummaryId = null;
+
+      if (rows.length) {
+        const text = rows.map(r => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`).join("\n");
+        const prompt =
+          (customPrompt && customPrompt.trim()) ||
+          (this.summaryPrompt && this.summaryPrompt.trim()) ||
+          DEFAULT_EXTRACTIVE_PROMPT;
+
+        const sumCtx = new Context(
+          "You are a channel summary generator.",
+          prompt,
+          [],
+          {},
+          null,
+          { skipInitialSummaries: true, persistToDB: false }
+        );
+        sumCtx.messages.push({ role: "user", name: "system", content: text });
+
+        const summary = (await getAI(sumCtx, 900, "gpt-4-turbo", { temperature: 0.1 }))?.trim() || "";
+        if (summary) {
+          const [res] = await db.execute(
+            `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
+             VALUES (?, ?, ?, ?)`,
+            [toMySQLDateTime(new Date()), this.channelId, summary, maxId]
+          );
+          insertedSummaryId = res?.insertId ?? null;
+        }
+      }
+
+      let lastSummary = null;
+      if (insertedSummaryId) {
+        const [rowsOne] = await db.execute(`SELECT summary FROM summaries WHERE id=?`, [insertedSummaryId]);
+        lastSummary = rowsOne?.[0]?.summary || null;
+      }
+
+      return { messages: this.messages, lastSummary, insertedSummaryId, usedMaxContextId: maxId };
+    } catch (e) {
+      console.error("[SUMMARIZE] failed:", e);
+      return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
+    } finally {
+      this.isSummarizing = false;
+    }
+  }
+
+  /** Get newest N summaries. */
+  async getLastSummaries(limit = 1) {
+    if (!this.persistent) return [];
     const db = await getPool();
-    const maxId = await this.getMaxContextId();
-    if (maxId == null) return null;
-    await db.execute(
-      `UPDATE summaries SET last_context_id=? WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
-      [maxId, this.channelId]
+    const [rows] = await db.execute(
+      `SELECT id, timestamp, summary FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT ?`,
+      [this.channelId, Number(limit)]
     );
-    return maxId;
-  } catch (e) {
-    console.error("[SUMMARY] bumpCursorToCurrentMax failed:", e.message);
-    return null;
+    return rows || [];
   }
-}
 
+  /** Get current max context_log.id for this channel. */
+  async getMaxContextId() {
+    if (!this.persistent) return null;
+    const db = await getPool();
+    const [rows] = await db.execute(
+      `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
+      [this.channelId]
+    );
+    return rows?.[0]?.maxId ?? null;
+  }
+
+  /** Advance the summary cursor to the current max context id. */
   async bumpCursorToCurrentMax() {
+    if (!this.persistent) return null;
     try {
       const db = await getPool();
       const maxId = await this.getMaxContextId();
@@ -572,7 +399,6 @@ async bumpCursorToCurrentMax() {
         `UPDATE summaries SET last_context_id=? WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [maxId, this.channelId]
       );
-      console.debug(`[SUMMARY][DEBUG] Cursor bumped to max context_log.id = ${maxId}`);
       return maxId;
     } catch (e) {
       console.error("[SUMMARY] bumpCursorToCurrentMax failed:", e.message);
@@ -580,25 +406,26 @@ async bumpCursorToCurrentMax() {
     }
   }
 
-async purgeChannelData() {
-  if (!this.persistent) {
-    this._rebuildSystemOnly();
-    return { contextDeleted: 0, summariesDeleted: 0 };
+  /** Delete all channel data and reset memory to system only. */
+  async purgeChannelData() {
+    if (!this.persistent) {
+      this._rebuildSystemOnly();
+      return { contextDeleted: 0, summariesDeleted: 0 };
+    }
+    try {
+      const db = await getPool();
+      const [r1] = await db.execute(`DELETE FROM context_log WHERE channel_id=?`, [this.channelId]);
+      const [r2] = await db.execute(`DELETE FROM summaries WHERE channel_id=?`, [this.channelId]);
+      this._rebuildSystemOnly();
+      return { contextDeleted: r1?.affectedRows ?? 0, summariesDeleted: r2?.affectedRows ?? 0 };
+    } catch (e) {
+      console.error("[PURGE] failed:", e.message);
+      this._rebuildSystemOnly();
+      return { contextDeleted: 0, summariesDeleted: 0 };
+    }
   }
-  try {
-    const db = await getPool();
-    const [r1] = await db.execute(`DELETE FROM context_log WHERE channel_id=?`, [this.channelId]);
-    const [r2] = await db.execute(`DELETE FROM summaries WHERE channel_id=?`, [this.channelId]);
-    this._rebuildSystemOnly();
-    return { contextDeleted: r1?.affectedRows ?? 0, summariesDeleted: r2?.affectedRows ?? 0 };
-  } catch (e) {
-    console.error("[PURGE] failed:", e.message);
-    this._rebuildSystemOnly();
-    return { contextDeleted: 0, summariesDeleted: 0 };
-  }
-}
 
-
+  /** Return the in-memory context as ~1900-char chunks for display. */
   async getContextAsChunks() {
     const max = 1900;
     const full = JSON.stringify(

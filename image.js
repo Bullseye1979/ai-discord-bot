@@ -1,5 +1,5 @@
-// image.js — v1.2 (robust)
-// Improve the prompt for an image and generate it. Return it as an URL
+// image.js — clean v1.3
+// Generate an improved image prompt and return a generated image URL (optionally shortened).
 
 const { getAI, getAIImage } = require("./aiService.js");
 const { getShortURL } = require("./helper.js");
@@ -8,52 +8,49 @@ const { IMAGEPROMPT } = require("./config.js");
 
 const VALID_SIZES = new Set(["1024x1024", "1792x1024", "1024x1792"]);
 
-async function getImage(toolFunction /*, handoverContext, getAIResponse, runtime */) {
+/** Tool entry: refine a concise visual prompt and generate an image URL. */
+async function getImage(toolFunction) {
   try {
-    const args = JSON.parse(toolFunction.arguments || "{}");
-    const userId = args.user_id || "user";
+    const args =
+      typeof toolFunction.arguments === "string"
+        ? JSON.parse(toolFunction.arguments || "{}")
+        : (toolFunction.arguments || {});
+    const userId = String(args.user_id || "user");
     const rawPrompt = String(args.prompt || "").trim();
-    if (!rawPrompt) throw new Error("[ERROR]: Missing 'prompt'");
+    if (!rawPrompt) return "[ERROR]: IMG_INPUT — Missing 'prompt'.";
 
-    const size = VALID_SIZES.has(args.size) ? args.size : "1024x1024";
+    const requestedSize = String(args.size || "").trim();
+    const size = VALID_SIZES.has(requestedSize) ? requestedSize : "1024x1024";
 
-    // 1) Prompt verbessern – robust & mit Fallback
     let improvedPrompt = rawPrompt;
     try {
       const ctx = new Context();
-      if (IMAGEPROMPT && IMAGEPROMPT.trim()) {
-        ctx.add("system", userId, IMAGEPROMPT.trim());
-      } else {
-        ctx.add(
-          "system",
-          userId,
-          "You refine concise, visual-only prompts for image generation. Keep it under ~60 words, avoid text/logos/brands/UI."
-        );
-      }
-      ctx.add("user", userId, `Original image description: "${rawPrompt}"`);
-
-      // 3.5 ist oft abgeschaltet → nimm was stabiles/schnelles
-      const gptResponse = await getAI(ctx, 400, "gpt-3.5-turbo");
-      const candidate = (gptResponse || "").trim();
-      if (candidate) improvedPrompt = candidate;
+      const sys = (IMAGEPROMPT && IMAGEPROMPT.trim())
+        ? IMAGEPROMPT.trim()
+        : "You refine concise, purely visual prompts for image generation. ~60 words max. Avoid text, logos, brands, UI, watermarks.";
+      await ctx.add("system", userId, sys);
+      await ctx.add("user", userId, `Original image description:\n${rawPrompt}`);
+      const refined = (await getAI(ctx, 300, "gpt-4o-mini"))?.trim();
+      if (refined) improvedPrompt = refined;
     } catch {
-      // fallback: rawPrompt
+      /* keep rawPrompt as fallback */
     }
 
-    // 2) Bild generieren
     const imageUrl = await getAIImage(improvedPrompt, size);
-    if (!imageUrl) throw new Error("[ERROR]: No image URL received");
+    if (!imageUrl) return "[ERROR]: IMG_EMPTY — No image URL received from generator.";
 
-    // 3) Shortener optional – Fehler egal
     let finalUrl = imageUrl;
     try {
       const shortUrl = await getShortURL(imageUrl);
       if (shortUrl && typeof shortUrl === "string") finalUrl = shortUrl;
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore shortener errors */
+    }
 
     return `${finalUrl}\n\nPrompt: ${improvedPrompt}`;
-  } catch (error) {
-    return `[ERROR]: Image could not be generated (${error?.message || "unknown error"})`;
+  } catch (err) {
+    const msg = err?.message || "unexpected error";
+    return `[ERROR]: IMG_UNEXPECTED — ${msg}`;
   }
 }
 

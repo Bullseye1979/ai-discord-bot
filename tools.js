@@ -1,233 +1,218 @@
-// Version 1.1 (bereinigt)
-// Manages the tools that are available to the AI
+// tools.js — clean v1.2
 
-// Requirements
-const { getWebpage } = require('./webpage.js');
-const { getImage } = require('./image.js');
-const { getGoogle } = require('./google');
-const { getYoutube } = require('./youtube');
-const { getImageDescription } = require('./vision.js');
-const { getLocation } = require('./location');
-const { getPDF } = require('./pdf.js');
-const { getHistory } = require('./history.js');
+const { getWebpage } = require("./webpage.js");
+const { getImage } = require("./image.js");
+const { getGoogle } = require("./google.js");
+const { getYoutube } = require("./youtube.js");
+const { getImageDescription } = require("./vision.js");
+const { getLocation } = require("./location.js");
+const { getPDF } = require("./pdf.js");
+const { getHistory } = require("./history.js");
 
-// Tool Definitions
 const tools = [
-    {
-        type: "function",
-        function: {
-            name: "getWebpage",
-            description: "Fetches a webpages, removes menus, ads, scripts, and HTML, and returns the cleaned text.",
-            parameters: {
-                type: "object",
-                properties: {
-                    url: { type: "string", description: "Full URL of the webpage to be cleaned." },
-                    user_id: { type: "string", description: "User ID or name who triggered the request." },
-                },
-                required: ["url", "user_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "getImage",
-            description: "Generates a high-quality image based on a detailed description. Default size is 1024x1024 if not specified. Don't run this, when the same document is created by another tool_call. Only use it, when you intend to show the image or use it otherwise.",
-            parameters: {
-                type: "object",
-                properties: {
-                    prompt: { 
-                        type: "string", 
-                        description: "Prompt, that contains the basic required visual information about the image. Please note, that the function itself adds artistic choices." 
-                    },
-                    size: { 
-                        type: "string", 
-                        description: "Desired image size. If not specified, this field should not be set.", 
-                        enum: ["1024x1024", "1792x1024", "1024x1792"] 
-                    },
-                    user_id: { 
-                        type: "string", 
-                        description: "User ID or name requesting the image." 
-                    }
-                },
-                required: ["prompt", "user_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "getGoogle",
-            description: "Performs a Google search and returns relevant results. Use it whenever you are asked for things you do not know, or current topics.",
-            parameters: {
-                type: "object",
-                properties: {
-                    query: { type: "string", description: "Search term for Google search." },
-                    user_id: { type: "string", description: "User ID who initiated the search." }
-                },
-                required: ["query", "user_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "getYoutube",
-            description: "Analyzes YouTube Subtitles. Summarizes. Returns a list of blocks with timestamps and applies the prompt for each block indivicually.",
-            parameters: {
-                type: "object",
-                properties: {
-                    video_url: { type: "string", description: "URL of the YouTube video to be summarized." },
-                    user_id: { type: "string", description: "User ID or name requesting the summary." },
-                    user_prompt: { type: "string", description: "The original user prompt" }
-                },
-                required: ["video_url", "user_id", "user_prompt"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "getImageDescription",
-            description: "Analyzes an image and provides a detailed description. Supports external URLs and Discord-uploaded images. This tool is required, when you want to recreate images.",
-            parameters: {
-                type: "object",
-                properties: {
-                    image_url: { 
-                        type: "string", 
-                        description: "The URL of the image to analyze. Supports direct links and Discord CDN image URLs (e.g., images uploaded in chat)." 
-                    },
-                    user_id: { 
-                        type: "string", 
-                        description: "The ID of the user requesting the image analysis."
-                    },
-                },
-                required: ["image_url", "user_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "getLocation",
-            description: "Use it, whenever you're asked for a location. Handles location-based tasks, including generating a route between multiple locations or setting location pins without a route. Returns 2 URLs one to the map and one to the streetview picture, as well as the textual description. Always show both links in your answer.",
-            parameters: {
-                type: "object",
-                properties: {
-                    locations: { 
-                        type: "array", 
-                        description: "List of locations to process. Must have at least two locations if a route is requested, otherwise single locations are allowed for pin placement.",
-                        items: { type: "string" }
-                    },
-                    user_id: { 
-                        type: "string", 
-                        description: "User ID requesting the operation." 
-                    },
-                    route: {
-                        type: "boolean", 
-                        description: "Set to `true` to generate a step-by-step route between locations. Set to `false` to place location pins without a route."
-                    }
-                },
-                required: ["locations", "user_id", "route"]
-            }
-        }
-    },
-    {
-      type: "function",
-      function: {
-        name: "getHistory",
-        description:
-          "Run a flexible READ-ONLY MySQL SELECT over this channel’s history. The model should write the full SELECT itself. " +
-          "ALLOWED tables: context_log(id, timestamp, channel_id, role, sender, content), summaries(id, timestamp, channel_id, summary, last_context_id). " +
-          "ALWAYS include a WHERE with :channel_id (qualified if using aliases). Use WEEK(timestamp,3), DATE(timestamp), BETWEEN, LIKE, YEAR, etc. " +
-          "Return is JSON with rowCount and rows (truncated strings).",
-        parameters: {
-          type: "object",
-          properties: {
-            channel_id: {
-              type: "string",
-              description: "Discord channel ID to scope the query. REQUIRED."
-            },
-            sql: {
-              type: "string",
-              description:
-                "A single SELECT statement using MySQL + named placeholders (e.g. :channel_id, :day, :from, :to, :who, :kw, :year). " +
-                "Examples:\n" +
-                "1) Top topic in a week: SELECT timestamp, summary FROM summaries WHERE channel_id = :channel_id AND YEAR(timestamp)=:year AND WEEK(timestamp,3)=:kw ORDER BY timestamp ASC LIMIT 50;\n" +
-                "2) Exact utterances by a speaker on a day: SELECT id, timestamp, sender, content FROM context_log WHERE channel_id=:channel_id AND DATE(timestamp)=:day AND sender LIKE :who ORDER BY timestamp ASC LIMIT 200;\n" +
-                "3) Raw logs in a time window: SELECT id, timestamp, role, sender, content FROM context_log WHERE channel_id=:channel_id AND timestamp BETWEEN :from AND :to ORDER BY id ASC LIMIT 200;"
-            },
-            bindings: {
-              type: "object",
-              description:
-                "Named parameters for placeholders (except channel_id if passed at top-level). " +
-                "E.g. {\"year\":2025, \"kw\":2} or {\"day\":\"2025-07-20\", \"who\":\"Bullseye%\"} or {\"from\":\"2025-07-20 00:00:00\",\"to\":\"2025-07-20 23:59:59\"}.",
-              additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }] }
-            }
-          },
-          required: ["sql", "channel_id"]
-        }
+  {
+    type: "function",
+    function: {
+      name: "getWebpage",
+      description:
+        "Fetch a webpage, remove menus/ads/scripts/HTML, and return cleaned text.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Full URL to fetch and clean." },
+          user_id: { type: "string", description: "User ID or display name." }
+        },
+        required: ["url", "user_id"]
       }
-    },
-
-    {
-        type: "function",
-        function: {
-            name: "getPDF",
-            description: "Generates a fully formatted PDF document based on a given original user prompt. Immediately create a PDF based on the user's prompt. This must be the first and only tool_call for PDF generation. Do not generate or run any other tool_calls before this one. It internally manages image generation and content rendering.",
-            parameters: {
-                type: "object",
-                properties: {
-                    prompt: {
-                        type: "string",
-                        description: "Full prompt/instructions for the PDF content."
-                    },
-                    original_prompt: {
-                        type: "string",
-                        description: "The user's original natural-language request."
-                    },
-                    user_id: {
-                        type: "string",
-                        description: "The ID of the user requesting the document."
-                    }
-                },
-                required: ["prompt", "original_prompt", "user_id"]
-            },
-        }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getImage",
+      description:
+        "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description:
+              "Core visual description. The tool will add artistic choices."
+          },
+          size: {
+            type: "string",
+            description:
+              "Optional output size; omit if not needed.",
+            enum: ["1024x1024", "1792x1024", "1024x1792"]
+          },
+          user_id: {
+            type: "string",
+            description: "User ID or display name."
+          }
+        },
+        required: ["prompt", "user_id"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getGoogle",
+      description:
+        "Run a Google search and return relevant results. Use for unknown facts or current topics.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query." },
+          user_id: { type: "string", description: "User ID or display name." }
+        },
+        required: ["query", "user_id"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getYoutube",
+      description:
+        "Parse YouTube subtitles, summarize, and return timestamped blocks. Applies the user prompt per block.",
+      parameters: {
+        type: "object",
+        properties: {
+          video_url: { type: "string", description: "YouTube video URL." },
+          user_id: { type: "string", description: "User ID or display name." },
+          user_prompt: { type: "string", description: "Original user prompt." }
+        },
+        required: ["video_url", "user_id", "user_prompt"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getImageDescription",
+      description:
+        "Analyze an image (URL or Discord CDN) and return a detailed description. Required before recreating images.",
+      parameters: {
+        type: "object",
+        properties: {
+          image_url: {
+            type: "string",
+            description:
+              "Direct image URL or Discord CDN URL of an uploaded image."
+          },
+          user_id: {
+            type: "string",
+            description: "User ID or display name."
+          }
+        },
+        required: ["image_url", "user_id"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getLocation",
+      description:
+        "Handle location tasks: route between locations or place pins without a route. Returns map URL, street-view URL, and text description. Always show both links in the answer.",
+      parameters: {
+        type: "object",
+        properties: {
+          locations: {
+            type: "array",
+            description:
+              "List of locations. For routes, provide at least two; for pins, a single location is allowed.",
+            items: { type: "string" }
+          },
+          user_id: {
+            type: "string",
+            description: "User ID or display name."
+          },
+          route: {
+            type: "boolean",
+            description:
+              "true = step-by-step route, false = pins only."
+          }
+        },
+        required: ["locations", "user_id", "route"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getHistory",
+      description:
+        "Run a READ-ONLY MySQL SELECT over this channel’s history. The model must write the full SELECT. Allowed tables: context_log(id,timestamp,channel_id,role,sender,content) and summaries(id,timestamp,channel_id,summary,last_context_id). Always include a WHERE with :channel_id.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel_id: {
+            type: "string",
+            description: "Discord channel ID scope."
+          },
+          sql: {
+            type: "string",
+            description:
+              "Single SELECT statement using MySQL + named placeholders (e.g., :channel_id, :day, :from, :to, :who, :kw, :year)."
+          },
+          bindings: {
+            type: "object",
+            description:
+              "Values for named placeholders (except channel_id if given top-level).",
+            additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }] }
+          }
+        },
+        required: ["sql", "channel_id"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getPDF",
+      description:
+        "Create a fully formatted PDF directly from the user's request. This must be the first and only tool call for PDF generation; it manages image generation and rendering internally.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Full instructions for the PDF." },
+          original_prompt: {
+            type: "string",
+            description: "Original natural-language user request."
+          },
+          user_id: { type: "string", description: "User ID or display name." }
+        },
+        required: ["prompt", "original_prompt", "user_id"]
+      }
+    }
+  }
 ];
 
-// Tool Registry
 const fullToolRegistry = {
-    getWebpage,
-    getImage,
-    getGoogle,
-    getYoutube,
-    getImageDescription,
-    getLocation,
-    getPDF,
-    getHistory
+  getWebpage,
+  getImage,
+  getGoogle,
+  getYoutube,
+  getImageDescription,
+  getLocation,
+  getPDF,
+  getHistory
 };
 
+/** Build a filtered tool list and callable registry for a given allowlist */
 function getToolRegistry(toolNames = []) {
-    if (!Array.isArray(toolNames)) {
-        throw new Error("getToolRegistry erwartet ein Array von Toolnamen.");
-    }
-
-    const filteredTools = tools.filter(t => toolNames.includes(t.function.name));
-    const registry = {};
-
-    for (const name of toolNames) {
-        if (fullToolRegistry[name]) {
-            registry[name] = fullToolRegistry[name];
-        }
-    }
-
-    return {
-        tools: filteredTools,
-        registry
-    };
+  if (!Array.isArray(toolNames)) {
+    throw new Error("getToolRegistry expects an array of tool names.");
+  }
+  const filteredTools = tools.filter((t) => toolNames.includes(t.function.name));
+  const registry = {};
+  for (const name of toolNames) {
+    if (fullToolRegistry[name]) registry[name] = fullToolRegistry[name];
+  }
+  return { tools: filteredTools, registry };
 }
 
-// Exports
 module.exports = { tools, getToolRegistry };

@@ -1,12 +1,11 @@
-// bot.js — v3.4
-// Commands: !context (nur anzeigen, nicht loggen), !summarize (Cutoff + Statusmeldung),
-// !purge-db (DB wipe für Channel), !joinvc / !leavevc (Voice),
-// TTS für AI-Antworten, Transcripts-Thread-Mirroring in discord-handler
+// bot.js — clean v3.5
+// Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { getAIResponse } = require("./aiCore.js");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
@@ -16,7 +15,6 @@ const {
   getSpeech,
   getChannelConfig,
   setReplyAsWebhookEmbed,
-  setReplyAsWebhook,
   setStartListening,
   setAddUserMessage,
   setBotPresence,
@@ -25,8 +23,7 @@ const {
   resetRecordingFlag,
   postSummariesIndividually,
 } = require("./discord-helper.js");
-
-const { getProcessAIRequest, setVoiceChannel, setTTS } = require("./discord-handler.js");
+const { getProcessAIRequest } = require("./discord-handler.js");
 
 const client = new Client({
   intents: [
@@ -38,20 +35,14 @@ const client = new Client({
   ],
 });
 
-
 const contextStorage = new Map();
-const guildTextChannels = new Map();       // guildId -> textChannelId (für TTS/Transcripts)
-const activeRecordings = new Map();        // Platzhalter falls Recording reaktiviert wird
-const ttsGate = new Map(); // channelId -> boolean
-const voiceBusy = new Map(); // key = channelId -> boolean
+const guildTextChannels = new Map(); // guildId -> textChannelId (for TTS/transcripts)
+const voiceBusy = new Map(); // channelId -> boolean
 
-
-
-const crypto = require("crypto");
-
-function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
+/** Ensure a Context instance for a channel, rebuilding when config signature changes */
+function ensureChatContextForChannel(channelId, storage, channelMeta) {
   const key = `channel:${channelId}`;
-  const signature = require("crypto").createHash("sha1").update(JSON.stringify({
+  const signature = crypto.createHash("sha1").update(JSON.stringify({
     persona: channelMeta.persona || "",
     instructions: channelMeta.instructions || "",
     tools: (channelMeta.tools || []).map(t => t?.function?.name || t?.name || "").sort(),
@@ -60,8 +51,7 @@ function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
     summaryPrompt: channelMeta.summaryPrompt || ""
   })).digest("hex");
 
-  if (!contextStorage.has(key)) {
-    const Context = require("./context.js");
+  if (!storage.has(key)) {
     const ctx = new Context(
       channelMeta.persona,
       channelMeta.instructions,
@@ -69,11 +59,10 @@ function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
       channelMeta.toolRegistry,
       channelId
     );
-    contextStorage.set(key, { ctx, sig: signature });
+    storage.set(key, { ctx, sig: signature });
   } else {
-    const entry = contextStorage.get(key);
+    const entry = storage.get(key);
     if (entry.sig !== signature) {
-      const Context = require("./context.js");
       entry.ctx = new Context(
         channelMeta.persona,
         channelMeta.instructions,
@@ -84,126 +73,27 @@ function ensureChatContextForChannel(channelId, contextStorage, channelMeta) {
       entry.sig = signature;
     }
   }
-  return contextStorage.get(key).ctx;
+  return storage.get(key).ctx;
 }
 
+/** Check if the first “word” equals a given trigger name (case-insensitive) */
 function firstWordEqualsName(text, triggerName) {
   if (!triggerName) return false;
   const t = String(triggerName).trim().toLowerCase();
-
-  // Erstes „Wort“ extrahieren, Satzzeichen am Rand ignorieren (Jenny, Jenny? "Jenny" etc.)
-  const m = String(text || "")
-    .trim()
-    .match(/^([^\s.,:;!?'"„“‚’«»()[\]{}<>—–-]+)/u);
-
+  const m = String(text || "").trim().match(/^([^\s.,:;!?'"„“‚’«»()[\]{}<>—–-]+)/u);
   const first = (m?.[1] || "").toLowerCase();
   return first === t;
 }
 
+/** Strip a leading trigger name (with optional punctuation) from text */
 function stripLeadingName(text, triggerName) {
   if (!triggerName) return String(text || "").trim();
   const esc = triggerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // Entfernt: <Spaces> + Name + optionales Satzzeichen + Spaces
   const re = new RegExp(`^\\s*${esc}\\s*[.,:;!?'"„“‚’«»()\\[\\]{}<>—–-]*\\s*`, "i");
   return String(text || "").replace(re, "").trim();
 }
 
-
-async function handleVoiceTranscriptDirect(evt, client, contextStorage) {
-  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
-  if (!ch) { console.warn("[voice] channel missing", evt.channelId); return; }
-
-  // WICHTIG: Busy-Gate blockiert NUR KI & TTS – Transkripte/Logging werden vorher schon erledigt.
-  if (voiceBusy.get(evt.channelId)) {
-    try { await ch.send("⏳ Ich antworte gerade – bitte kurz warten."); } catch {}
-    return;
-  }
-
-  const channelMeta = getChannelConfig(evt.channelId);
-  const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
-
-  // Window anwenden (robust für null/number)
-  if (typeof chatContext.setUserWindow === "function") {
-    chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
-  }
-
-  // Tokenlimit (Speaker) robust & geklemmt
-  const tokenlimit = (() => {
-    const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
-    const v = Number(raw);
-    const def = 1024;
-    return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
-  })();
-
-  // Für Voice: KEINE Auto-Continue-Kette
-  const sequenceLimit = 1;
-
-  // NEU: Speech-Append temporär an die Instructions hängen
-  const instrBackup = chatContext.instructions;
-  try {
-    const add = (channelMeta.speechAppend || "").trim();
-    if (add) {
-      chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
-    }
-  } catch {}
-
-  voiceBusy.set(evt.channelId, true);
-  try {
-    let replyText = "";
-    try {
-      replyText = await getAIResponse(
-        chatContext,
-        tokenlimit,
-        sequenceLimit,
-        channelMeta.model || undefined,
-        channelMeta.apikey || null
-      );
-      replyText = (replyText || "").trim();
-    } catch (e) {
-      console.error("[voice] getAIResponse failed:", e?.message || e);
-      return;
-    }
-    if (!replyText) return;
-
-    // Bot-Antwort in den Kontext
-    try {
-      await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
-    } catch {}
-
-    // Senden als Webhook (Avatar/Name aus Channel-Meta)
-    try {
-      // const msgShim = { channel: ch };
-// await setReplyAsWebhook(msgShim, replyText, { botname: channelMeta.botname || "AI" });
-
-const msgShim = { channel: ch };
-await setReplyAsWebhookEmbed(msgShim, replyText, {
-  botname: channelMeta.botname || "AI"
-});
-
-    } catch (e) {
-      console.warn("[voice] setReplyAsWebhook failed, fallback send:", e?.message || e);
-      try { await ch.send(replyText); } catch {}
-    }
-
-    // TTS (wartet dank Queue/Promise, damit voiceBusy korrekt gehalten wird)
-    try {
-      const conn = getVoiceConnection(evt.guildId);
-      if (conn) {
-        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
-      } else {
-        console.warn("[voice] no connection for guild", evt.guildId);
-      }
-    } catch (e) {
-      console.warn("[voice] TTS failed:", e?.message || e);
-    }
-  } finally {
-    // Instructions zurücksetzen + Busy öffnen
-    try { chatContext.instructions = instrBackup; } catch {}
-    voiceBusy.set(evt.channelId, false);
-  }
-}
-
-
+/** Compute a stable signature for a channel meta object */
 function metaSig(m) {
   return crypto.createHash("sha1").update(JSON.stringify({
     persona: m.persona || "",
@@ -215,32 +105,13 @@ function metaSig(m) {
   })).digest("hex");
 }
 
-// erkennt, ob diese Nachricht von DEM AI-Webhook (botname) stammt
-async function isAIWebhookMessage(message, channelMeta) {
-  if (!message?.webhookId) return false;
-  try {
-    const hooks = await message.channel.fetchWebhooks();
-    const w = hooks.find(x => x.id === message.webhookId);
-    const expected = (channelMeta?.botname || "AI");
-    return !!w && w.name === expected;
-  } catch {
-    return false;
-  }
-}
-
-
+/** Check if a user is an admin for the current channel */
 function isChannelAdmin(channelMeta, userId) {
   const ids = Array.isArray(channelMeta.admins) ? channelMeta.admins.map(String) : [];
   return ids.includes(String(userId));
 }
 
-function parseTranscriptLine(raw) {
-  // Matches: **Speaker Name:** message text
-  const m = (raw || "").match(/^\s*\*\*([^*]+)\*\*:\s*(.+)$/s);
-  if (!m) return null;
-  return { speaker: m[1].trim(), text: m[2].trim() };
-}
-
+/** Delete all non-pinned messages in a channel (requires permissions) */
 async function deleteAllMessages(channel) {
   const me = channel.guild.members.me;
   const perms = channel.permissionsFor(me);
@@ -263,33 +134,90 @@ async function deleteAllMessages(channel) {
   }
 }
 
+/** Handle one voice transcript event → AI reply → webhook post → optional TTS */
+async function handleVoiceTranscriptDirect(evt, client, storage) {
+  const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+  if (!ch) { console.warn("[voice] channel missing", evt.channelId); return; }
 
-// bot.js
- function buildProxyMessageForVoice(channel, text, userId, username) {
-   return {
-     channel,
-     guild: channel.guild,
-     content: text,
-     webhookId: "voice-proxy",    // ← wichtig: als „Transkript/Webhook“ markieren
-     author: { id: String(userId), bot: false, username: username || "user" },
-     member: channel.guild?.members?.cache?.get(String(userId)) || null
-   };
- }
+  if (voiceBusy.get(evt.channelId)) {
+    try { await ch.send("⏳ I’m answering already — please wait a moment."); } catch {}
+    return;
+  }
 
+  const channelMeta = getChannelConfig(evt.channelId);
+  const chatContext = ensureChatContextForChannel(evt.channelId, storage, channelMeta);
 
+  if (typeof chatContext.setUserWindow === "function") {
+    chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
+  }
+
+  const tokenlimit = (() => {
+    const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
+    const v = Number(raw);
+    const def = 1024;
+    return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+  })();
+
+  const sequenceLimit = 1;
+  const instrBackup = chatContext.instructions;
+  try {
+    const add = (channelMeta.speechAppend || "").trim();
+    if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
+  } catch {}
+
+  voiceBusy.set(evt.channelId, true);
+  try {
+    let replyText = "";
+    try {
+      replyText = await getAIResponse(
+        chatContext,
+        tokenlimit,
+        sequenceLimit,
+        channelMeta.model || undefined,
+        channelMeta.apikey || null
+      );
+      replyText = (replyText || "").trim();
+    } catch (e) {
+      console.error("[voice] getAIResponse failed:", e?.message || e);
+      return;
+    }
+    if (!replyText) return;
+
+    try {
+      await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
+    } catch {}
+
+    try {
+      const msgShim = { channel: ch };
+      await setReplyAsWebhookEmbed(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+    } catch (e) {
+      console.warn("[voice] webhook send failed, fallback:", e?.message || e);
+      try { await ch.send(replyText); } catch {}
+    }
+
+    try {
+      const conn = getVoiceConnection(evt.guildId);
+      if (conn) {
+        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
+      } else {
+        console.warn("[voice] no connection for guild", evt.guildId);
+      }
+    } catch (e) {
+      console.warn("[voice] TTS failed:", e?.message || e);
+    }
+  } finally {
+    try { chatContext.instructions = instrBackup; } catch {}
+    voiceBusy.set(evt.channelId, false);
+  }
+}
 
 client.on("messageCreate", async (message) => {
-
   if (!message.guild) return;
 
-
-
-  // -------- Channel-Config laden (keine Threads / direkt Channel-ID) --------
   const baseChannelId = message.channelId;
   const channelMeta = getChannelConfig(baseChannelId);
   if (!channelMeta) return;
 
-  // Context pro Channel cachen; bei Config-Änderung neu aufbauen
   const key = `channel:${baseChannelId}`;
   const signature = metaSig(channelMeta);
 
@@ -317,122 +245,100 @@ client.on("messageCreate", async (message) => {
   }
   const chatContext = contextStorage.get(key).ctx;
 
+  const rawWindow = (channelMeta.max_user_messages ?? channelMeta.maxUserMessages ?? null);
+  const parsedWindow =
+    (rawWindow === null || rawWindow === undefined || rawWindow === "")
+      ? null
+      : (Number.isFinite(Number(rawWindow)) ? Number(rawWindow) : null);
 
-// robustes Lesen (snake_case ODER camelCase, Zahl oder String)
-const rawWindow =
-  (channelMeta.max_user_messages ?? channelMeta.maxUserMessages ?? null);
+  if (typeof chatContext.setUserWindow === "function") {
+    chatContext.setUserWindow(parsedWindow, { prunePerTwoNonUser: true });
+    console.log("[CTX] setUserWindow", {
+      channel: baseChannelId,
+      rawWindow,
+      effective: chatContext._maxUserMessages
+    });
+  }
 
-const parsedWindow =
-  (rawWindow === null || rawWindow === undefined || rawWindow === "")
-    ? null
-    : (Number.isFinite(Number(rawWindow)) ? Number(rawWindow) : null);
+  const rawText = (message.content || "").trim();
+  const isCommand = rawText.startsWith("!");
+  const selfIssued = message.author?.id === client.user?.id;
 
-if (typeof chatContext.setUserWindow === "function") {
-  chatContext.setUserWindow(parsedWindow, { prunePerTwoNonUser: true });
-  console.log("[CTX] setUserWindow", {
-    channel: baseChannelId,
-    rawWindow,
-    effective: chatContext._maxUserMessages
-  });
-}
+  if (isCommand) {
+    if (!channelMeta.hasConfig) {
+      await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
+      return;
+    }
+    if (!selfIssued && !isChannelAdmin(channelMeta, message.author.id)) {
+      await message.channel.send("⛔ You are not authorized to run commands in this channel.");
+      return;
+    }
+  }
 
+  if (!message.author?.bot && !message.webhookId) {
+    await setAddUserMessage(message, chatContext);
+  }
 
-  // ---- Zentrale Command-Gates ----
- // ---- Zentrale Command-Gates ----
-const rawText = (message.content || "").trim();
-const isCommand = rawText.startsWith("!");
+  // Consent quick-commands
+  {
+    const authorId = String(message.author?.id || "");
+    const lower = rawText.toLowerCase();
 
-// Bot selbst soll Cron-Kommandos immer ausführen dürfen:
-const selfIssued = message.author?.id === client.user?.id;
+    if (lower.startsWith("+consent_chat")) {
+      await setChatConsent(authorId, baseChannelId, true);
+      await message.channel.send("✅ Chat consent saved for this channel.");
+      return;
+    }
+    if (lower.startsWith("+withdrawl_chat")) {
+      await setChatConsent(authorId, baseChannelId, false);
+      await message.channel.send("✅ Chat consent withdrawn for this channel.");
+      return;
+    }
+    if (lower.startsWith("+consent_voice")) {
+      await setVoiceConsent(authorId, baseChannelId, true);
+      await message.channel.send("✅ Voice consent saved for this channel.");
+      return;
+    }
+    if (lower.startsWith("+withdrawl_voice")) {
+      await setVoiceConsent(authorId, baseChannelId, false);
+      await message.channel.send("✅ Voice consent withdrawn for this channel.");
+      return;
+    }
+  }
 
-if (isCommand) {
-  // 1) Commands nur, wenn es für diesen Channel eine explizite Config-Datei gibt
-  if (!channelMeta.hasConfig) {
-    await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
+  // !clear-channel / !purge-channel
+  if (rawText.startsWith("!clear-channel") || rawText.startsWith("!purge-channel")) {
+    try {
+      await deleteAllMessages(message.channel);
+      await message.channel.send("🧹 Channel cleared.");
+    } catch (e) {
+      console.error("[!clear-channel] deleteAllMessages error:", e?.message || e);
+      await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
+    }
     return;
   }
-  // 2) Admin-Check: Bot selbst darf immer; alle anderen nur wenn in admins
-  if (!selfIssued && !isChannelAdmin(channelMeta, message.author.id)) {
-    await message.channel.send("⛔ You are not authorized to run commands in this channel.");
-    return;
-  }
-}
 
-if (!message.author?.bot && !message.webhookId) {
-  await setAddUserMessage(message, chatContext);
-}
-
-// ab hier läuft die Funktion ganz normal weiter
-
-
-// ---------------- Consent Short-Commands (+consent_…) ----------------
-{
-  const authorId = String(message.author?.id || "");
-  const lower = rawText.toLowerCase();
-  
-  if (lower.startsWith("+consent_chat")) {
-    await setChatConsent(authorId, baseChannelId, true);
-    await message.channel.send("✅ Chat consent saved for this channel.");
-    return;
-  }
-  if (lower.startsWith("+withdrawl_chat")) {
-    await setChatConsent(authorId, baseChannelId, false);
-    await message.channel.send("✅ Chat consent withdrawn for this channel.");
-    return;
-  }
-  if (lower.startsWith("+consent_voice")) {
-    await setVoiceConsent(authorId, baseChannelId, true);
-    await message.channel.send("✅ Voice consent saved for this channel.");
-    return;
-  }
-  if (lower.startsWith("+withdrawl_voice")) {
-    await setVoiceConsent(authorId, baseChannelId, false);
-    await message.channel.send("✅ Voice consent withdrawn for this channel.");
-    return;
-  }
-}
-
-
-  // ---------------- Commands (vor Logging!) ----------------
-
-
-// !clear-channel / !purge-channel: löscht alle NICHT gepinnten Nachrichten im aktuellen Channel
-if (rawText.startsWith("!clear-channel") || rawText.startsWith("!purge-channel")) {
-  try {
-    await deleteAllMessages(message.channel);
-    // Bestätigung NACH dem Leeren posten (bleibt als einzige Nachricht stehen)
-    await message.channel.send("🧹 Channel cleared.");
-  } catch (e) {
-    console.error("[!clear-channel] deleteAllMessages error:", e?.message || e);
-    await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
-  }
-  return;
-}
-
-
-
-  // !context: nur anzeigen, NICHT loggen
-  if ((message.content || "").startsWith("!context")) {
+  // !context (view only)
+  if (rawText.startsWith("!context")) {
     const chunks = await chatContext.getContextAsChunks();
     for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
     return;
   }
 
-  // !reload-cron: Crontab dieses Channels neu laden
-if ((message.content || "").startsWith("!reload-cron")) {
-  try {
-    const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
-    await message.channel.send(ok ? "🔁 Cron reloaded for this channel." : "⚠️ No crontab defined for this channel.");
-  } catch (e) {
-    console.error("[!reload-cron] failed:", e?.message || e);
-    await message.channel.send("❌ Failed to reload cron for this channel.");
+  // !reload-cron
+  if (rawText.startsWith("!reload-cron")) {
+    try {
+      const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
+      await message.channel.send(ok ? "🔁 Cron reloaded for this channel." : "⚠️ No crontab defined for this channel.");
+    } catch (e) {
+      console.error("[!reload-cron] failed:", e?.message || e);
+      await message.channel.send("❌ Failed to reload cron for this channel.");
+    }
+    return;
   }
-  return;
-}
 
-
-  // !purge-db: Channel-Einträge in beiden Tabellen löschen (Admin / ManageGuild)
-  if ((message.content || "").startsWith("!purge-db")) {
+  // !purge-db
+  if (rawText.startsWith("!purge-db")) {
     try {
       const res = await chatContext.purgeChannelData();
       await message.channel.send(
@@ -445,100 +351,78 @@ if ((message.content || "").startsWith("!reload-cron")) {
     return;
   }
 
- // !joinvc: Voice beitreten + Transcripts/TTS an DIESEN Textkanal binden
-if ((message.content || "").startsWith("!joinvc")) {
-  try {
-    // User-VC holen
-    let gm = null;
-    try { gm = await message.guild.members.fetch(message.author.id); } catch {}
-    const vc = gm?.voice?.channel || message.member?.voice?.channel;
-    if (!vc) { await message.reply("Join a voice channel first."); return; }
-
-    // Alte Voice-Verbindung (falls vorhanden) sauber schließen
-    const old = getVoiceConnection(message.guild.id);
-    if (old) {
-      try { old.destroy(); } catch {}
-    }
-    // Recorder- und TTS-Player-Status zurücksetzen
-    resetRecordingFlag(message.guild.id);
-    resetTTSPlayer(message.guild.id);
-
-    // Neue Verbindung herstellen
-    const conn = joinVoiceChannel({
-      channelId: vc.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-      selfDeaf: false,
-    });
-
-    // Diesen Textkanal als Ziel (Transkripte & TTS) setzen
-    guildTextChannels.set(message.guild.id, message.channel.id);
-
-    // (Re)Start Listening – Transkripte posten ab jetzt in den aktuellen Textkanal
-   // bot.js — im !joinvc-Handler:
-// bot.js — im !joinvr:
-setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
-  // evt: { guildId, channelId, userId, speaker, text, startedAtMs }
-
-  const channelMeta = getChannelConfig(evt.channelId);
-  const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
-
-  if (typeof chatContext.setUserWindow === "function") {
-    chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
-  }
-
-  // ---- Invocation per Name am Satzanfang ----
-  const TRIGGER = (channelMeta.name || "").trim();
-  const invoked = firstWordEqualsName(evt.text, TRIGGER);
-
-  // --- IMMER LOGGEN (auch wenn nicht invoked) ---
-  const textForLog = invoked ? stripLeadingName(evt.text, TRIGGER) : evt.text;
-  try {
-    await chatContext.add("user", evt.speaker, (textForLog || "").trim(), evt.startedAtMs);
-  } catch (e) {
-    console.warn("[voice->DB] failed:", e?.message || e);
-  }
-
-  // Wenn nicht invoked -> nur loggen, keine KI-Antwort
-  if (!invoked) return;
-
-  // --- WICHTIG: Busy-Check NACH dem Loggen ---
-  if (voiceBusy.get(evt.channelId)) {
+  // !joinvc
+  if (rawText.startsWith("!joinvc")) {
     try {
-      const ch = await client.channels.fetch(evt.channelId).catch(() => null);
-      await ch?.send("⏳ ...");
-    } catch {}
-    return; // Keine KI-Anfrage starten, aber Transkript blieb erhalten
+      let gm = null;
+      try { gm = await message.guild.members.fetch(message.author.id); } catch {}
+      const vc = gm?.voice?.channel || message.member?.voice?.channel;
+      if (!vc) { await message.reply("Join a voice channel first."); return; }
+
+      const old = getVoiceConnection(message.guild.id);
+      if (old) { try { old.destroy(); } catch {} }
+
+      resetRecordingFlag(message.guild.id);
+      resetTTSPlayer(message.guild.id);
+
+      const conn = joinVoiceChannel({
+        channelId: vc.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+        selfDeaf: false,
+      });
+
+      guildTextChannels.set(message.guild.id, message.channel.id);
+
+      setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
+        const channelMeta = getChannelConfig(evt.channelId);
+        const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
+
+        if (typeof chatContext.setUserWindow === "function") {
+          chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
+        }
+
+        const TRIGGER = (channelMeta.name || "").trim();
+        const invoked = firstWordEqualsName(evt.text, TRIGGER);
+
+        const textForLog = invoked ? stripLeadingName(evt.text, TRIGGER) : evt.text;
+        try {
+          await chatContext.add("user", evt.speaker, (textForLog || "").trim(), evt.startedAtMs);
+        } catch (e) {
+          console.warn("[voice->DB] failed:", e?.message || e);
+        }
+
+        if (!invoked) return;
+
+        if (voiceBusy.get(evt.channelId)) {
+          try {
+            const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+            await ch?.send("⏳ ...");
+          } catch {}
+          return;
+        }
+
+        try {
+          await handleVoiceTranscriptDirect(
+            { ...evt, text: textForLog },
+            client,
+            contextStorage
+          );
+        } catch (e) {
+          console.error("[voice->direct] failed:", e?.message || e);
+        }
+      });
+
+      await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`);
+    } catch (e) {
+      console.error("[!joinvc] failed:", e?.message || e);
+      await message.channel.send("❌ Failed to join/move. Check my permissions (Connect/Speak) and try again.");
+    }
+    return;
   }
 
-  // KI-Antwort + TTS (setzt/cleart voiceBusy intern)
-  try {
-    await handleVoiceTranscriptDirect(
-      { ...evt, text: textForLog }, // bereinigter Text
-      client,
-      contextStorage
-    );
-  } catch (e) {
-    console.error("[voice->direct] failed:", e?.message || e);
-  }
-});
-
-
-
-
-    await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`);
-  } catch (e) {
-    console.error("[!joinvc] failed:", e?.message || e);
-    await message.channel.send("❌ Failed to join/move. Check my permissions (Connect/Speak) and try again.");
-  }
-  return;
-}
-
-
-
-
-  // !leavevc: Voice verlassen
-  if ((message.content || "").startsWith("!leavevc")) {
+  // !leavevc
+  if (rawText.startsWith("!leavevc")) {
     const conn = getVoiceConnection(message.guild.id);
     if (conn) {
       try { conn.destroy(); } catch {}
@@ -550,22 +434,19 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
     return;
   }
 
-    // !summarize: Statusmeldung (EN), Cutoff, Summary, Channel leeren, 5 Summaries, Cursor bump, Abschluss
-  if ((message.content || "").startsWith("!summarize")) {
+  // !summarize
+  if (rawText.startsWith("!summarize")) {
     if (!channelMeta.summariesEnabled) {
       await message.channel.send("⚠️ Summaries are disabled in this channel.");
       return;
     }
 
     let progress = null;
-    try {
-      progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered.");
-    } catch {}
+    try { progress = await message.channel.send("⏳ **Summary in progress…** New messages won’t be considered."); } catch {}
 
     const cutoffMs = Date.now();
     const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
 
-    // 1) Zusammenfassen bis Cutoff
     try {
       const before = await chatContext.getLastSummaries(1).catch(() => []);
       await chatContext.summarizeSince(cutoffMs, customPrompt);
@@ -579,7 +460,6 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
         await message.channel.send("ℹ️ No messages to summarize yet.");
         return;
       }
-
     } catch (e) {
       console.error("[!summarize] summarizeSince error:", e?.message || e);
       try { if (progress?.deletable) await progress.delete(); } catch {}
@@ -587,10 +467,6 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
       return;
     }
 
-    // 2) (Optional) Channel-Nachrichten löschen — derzeit bewusst übersprungen
-    //    -> Wenn du hier den Channel leeren willst, baue deleteAllMessages(message.channel) ein.
-
-    // 3) 5 Summaries (älteste -> neueste) als einzelne Nachrichten posten (gechunked)
     try {
       const last5Desc = await chatContext.getLastSummaries(5);
       const summariesAsc =
@@ -608,14 +484,10 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
       console.error("[!summarize] posting summaries error:", e?.message || e);
     }
 
-    // 4) Cursor nach **allen** neu geposteten (Summary-)Nachrichten hochsetzen
-    try {
-      await chatContext.bumpCursorToCurrentMax();
-    } catch (e) {
+    try { await chatContext.bumpCursorToCurrentMax(); } catch (e) {
       console.error("[!summarize] bumpCursorToCurrentMax error:", e?.message || e);
     }
 
-    // 5) **Memory reduzieren**: nur System + letzte Summary im RAM behalten
     try {
       await chatContext.collapseToSystemAndLastSummary();
       await message.channel.send("🧠 RAM context collapsed to: **System + last summary**.");
@@ -624,123 +496,44 @@ setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt)
       await message.channel.send("⚠️ RAM context collapse failed (kept full memory).");
     }
 
-    // 6) Abschluss
-    try {
-      await message.channel.send("✅ **Summary completed.**");
-    } catch {}
-    try {
-      if (progress?.deletable) await progress.delete();
-    } catch {}
-
+    try { await message.channel.send("✅ **Summary completed.**"); } catch {}
+    try { if (progress?.deletable) await progress.delete(); } catch {}
     return;
   }
 
+  // Normal flow: gated by explicit trigger name
+  if (message.author?.bot || message.webhookId) return;
+  const authorId = String(message.author?.id || "");
+  const hasConsent = await hasChatConsent(authorId, baseChannelId);
+  if (!hasConsent) return;
 
+  const contentRaw = rawText;
+  const norm = contentRaw.toLowerCase();
+  const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
+  const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
+  if (!isTrigger) return;
 
-// ---------------- Normaler Flow ----------------
+  const state = { isAIProcessing: 0 };
+  return getProcessAIRequest(
+    message,
+    chatContext,
+    client,
+    state,
+    channelMeta.model,
+    channelMeta.apikey
+  );
+});
 
-// 1) Erkennen, ob dies ein Transkript-Webhook ist (Webhooks ≠ AI-Webhook)
-
-/*
-const isWebhook = !!message.webhookId;
-let isAIWebhook = false;
-if (isWebhook) {
-  try {
-    const ws = await message.channel.fetchWebhooks();
-    const w = ws.find(x => x.id === message.webhookId);
-    isAIWebhook = !!w && w.name === (channelMeta?.botname || "AI");
-  } catch {}
-}
-const isTranscriptPost = isWebhook && !isAIWebhook; // alles andere als unser AI-Webhook
-
-// 2) In den Kontext schreiben
-if (isTranscriptPost) {
-  // (Webhooks = Voice; Logging steuert discord-helper via Voice-Consent)
-  const speaker = message.author?.username || "Unknown";
-  const text = (message.content || "").trim();
-  if (text) await chatContext.add("user", speaker, text);
-} else if (!message.author?.bot && !message.webhookId) {
-  // echte User-Texte nur mit Chat-Consent loggen
-  const ok = await hasChatConsent(message.author.id, baseChannelId);
-  if (ok) {
-    await setAddUserMessage(message, chatContext);
-  } else {
-    // keine Speicherung, kein Reply-Trigger
-  }
-} else {
-  // sonst ignorieren
-}
-
-*/
-
-// 3) TTS für Bot-ODER-AI-Webhook-Antworten – nur wenn Voice das Gate gesetzt hat
-try {
-  const looksLikeSummary =
-    /\*\*Summary\b/i.test(message.content || "") ||
-    /\bSummary (in progress|completed)/i.test(message.content || "");
-
-  const isFromBot = message.author?.id === client.user?.id;
-  const isFromAIWebhook = await isAIWebhookMessage(message, channelMeta);
-
-  if ((isFromBot || isFromAIWebhook) && !looksLikeSummary) {
-    if (ttsGate.get(message.channel.id) === true) {
-      await setTTS(message, client, guildTextChannels);
-      ttsGate.set(message.channel.id, false); // nach erster Antwort schließen
-    }
-  }
-} catch (e) {
-  console.warn("[TTS] call failed:", e?.message || e);
-}
-
-
-
-
-
-// 4) Trigger-Check (nur getippte User-Messages; Voice triggert via Callback in !joinvc)
-if (message.author?.bot || message.webhookId) return; // keine Bots/Webhooks
-
-const authorId = String(message.author?.id || "");
-const hasConsent = await hasChatConsent(authorId, baseChannelId);
-if (!hasConsent) return;
-
-const contentRaw = (message.content || "").trim();
-const norm = contentRaw.toLowerCase();
-
-const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
-const isTrigger =
-  norm.startsWith(triggerName) ||
-  norm.startsWith(`!${triggerName}`);
-
-if (!isTrigger) return;
-
-
-
-
-// KI aufrufen (Typed Flow; kein Proxy nötig)
-const state = { isAIProcessing: 0 };
-return getProcessAIRequest(
-  message,
-  chatContext,
-  client,
-  state,
-  channelMeta.model,
-  channelMeta.apikey
-);
-
-
-}); // ✅ FIX 1: Handler schließen!
-
-// Start
+// Startup
 (async () => {
   client.login(process.env.DISCORD_TOKEN);
 })();
 client.once("ready", () => {
   setBotPresence(client, "✅ Started", "online");
-  // Client mitgeben!
   initCron(client, contextStorage);
 });
 
-// HTTP /documents (optional)
+// Static /documents
 const expressApp = express();
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(

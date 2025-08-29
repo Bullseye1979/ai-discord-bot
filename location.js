@@ -1,43 +1,47 @@
-// location.js — v1.2 robust
-// Returns a link to a route or a location on Google Maps + optional directions text
-// Needs: GOOGLE_MAPS_API_KEY in env
+// location.js — clean v1.3
+// Build Google Maps (route/pins) and optional Street View + human-readable directions.
 
 const axios = require("axios");
 const { getShortURL } = require("./helper.js");
+
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
-// -------- helpers --------
-function getIsLatLon(input) {
+/** Detect "lat,lon" input. */
+function isLatLon(input) {
   return /^\s*-?\d{1,2}\.\d+\s*,\s*-?\d{1,3}\.\d+\s*$/.test(String(input || ""));
 }
-function norm(s) {
+
+/** Normalize free-text address. */
+function normalize(s) {
   return String(s || "")
     .trim()
-    .replace(/^[,;]+|[,;]+$/g, "")   // führende/nachgestellte Kommas/Strichpunkte weg
-    .replace(/\s{2,}/g, " ");        // doppelte Spaces
-}
-function safeJoinForMaps(parts) {
-  // Für Maps-URL dürfen Freitext-Adressen stehenbleiben
-  return parts.map(p => encodeURIComponent(p)).join("/");
+    .replace(/^[,;]+|[,;]+$/g, "")
+    .replace(/\s{2,}/g, " ");
 }
 
-async function geocodeOne(query, { language = "de", region = "de" } = {}) {
-  const q = norm(query);
+/** URL-encode path segments for Maps. */
+function joinForMaps(parts) {
+  return parts.map((p) => encodeURIComponent(p)).join("/");
+}
+
+/** Geocode one query into { coord, address } or null. */
+async function geocodeOne(query, { language = "en", region = "de" } = {}) {
+  const q = normalize(query);
   if (!q) return null;
-  if (getIsLatLon(q)) {
-    const [lat, lng] = q.split(",").map(x => x.trim());
+  if (isLatLon(q)) {
+    const [lat, lng] = q.split(",").map((x) => x.trim());
     return { coord: `${lat},${lng}`, address: q };
   }
   try {
     const resp = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
-      params: { address: q, key: GOOGLE_MAPS_API_KEY, language, region }
+      params: { address: q, key: GOOGLE_MAPS_API_KEY, language, region },
+      timeout: 20000,
     });
     const { status, results, error_message } = resp.data || {};
-    if (status !== "OK") {
-      console.error(`[getLocation][geocode] status=${status} msg=${error_message || "-" } for "${q}"`);
+    if (status !== "OK" || !Array.isArray(results) || !results.length) {
+      console.error("[getLocation][geocode] status:", status, "msg:", error_message, "q:", q);
       return null;
     }
-    if (!Array.isArray(results) || !results.length) return null;
     const { geometry, formatted_address } = results[0];
     const lat = geometry?.location?.lat;
     const lng = geometry?.location?.lng;
@@ -49,32 +53,38 @@ async function geocodeOne(query, { language = "de", region = "de" } = {}) {
   }
 }
 
-async function getGoogleMapsURL(points, isRoute) {
+/** Build Maps URL (route or search). */
+function buildMapsURL(points, isRoute) {
   const base = isRoute ? "https://www.google.com/maps/dir/" : "https://www.google.com/maps/search/";
-  return base + safeJoinForMaps(points);
+  return base + joinForMaps(points);
 }
 
-async function getStreetViewURL(latLon) {
+/** Build Street View image URL for a coordinate. */
+function buildStreetViewURL(latLon) {
   return `https://maps.googleapis.com/maps/api/streetview?size=600x400&location=${latLon}&key=${GOOGLE_MAPS_API_KEY}`;
 }
 
-async function getDirectionsText(origin, destination, waypoints = []) {
+/** Get human-readable driving directions text (EN by default). */
+async function getDirectionsText(origin, destination, waypoints = [], language = "en") {
   try {
     const params = {
-      origin, destination,
+      origin,
+      destination,
       mode: "driving",
       key: GOOGLE_MAPS_API_KEY,
-      language: "de"
+      language,
     };
     if (waypoints.length) params.waypoints = waypoints.join("|");
-    const resp = await axios.get("https://maps.googleapis.com/maps/api/directions/json", { params });
+    const resp = await axios.get("https://maps.googleapis.com/maps/api/directions/json", {
+      params,
+      timeout: 20000,
+    });
     const { status, routes, error_message } = resp.data || {};
-    if (status !== "OK") {
-      console.error("[getLocation][directions] status=", status, "msg=", error_message);
+    if (status !== "OK" || !routes?.length) {
+      console.error("[getLocation][directions] status:", status, "msg:", error_message);
       return "No directions found.";
     }
-    if (!routes?.length) return "No directions found.";
-    const steps = routes[0].legs.flatMap(leg => leg.steps.map(s => s.html_instructions));
+    const steps = routes[0].legs.flatMap((leg) => leg.steps.map((s) => s.html_instructions));
     const textSteps = steps.map((s, i) => `${i + 1}. ${String(s || "").replace(/<[^>]+>/g, "")}`);
     return textSteps.join("\n");
   } catch (e) {
@@ -83,63 +93,64 @@ async function getDirectionsText(origin, destination, waypoints = []) {
   }
 }
 
-// -------- main tool --------
+/** Tool entry: return Street View (if available), Maps link, and directions (if route). */
 async function getLocation(toolFunction) {
   try {
     if (!GOOGLE_MAPS_API_KEY) {
-      console.error("❌ getLocation: Missing GOOGLE_MAPS_API_KEY");
-      return "Google Maps API key missing on server.";
+      console.error("getLocation: Missing GOOGLE_MAPS_API_KEY");
+      return "[ERROR]: MAPS_CONFIG — Missing GOOGLE_MAPS_API_KEY on server.";
     }
 
-    const args = typeof toolFunction.arguments === "string"
-      ? JSON.parse(toolFunction.arguments || "{}")
-      : (toolFunction.arguments || {});
+    const args =
+      typeof toolFunction.arguments === "string"
+        ? JSON.parse(toolFunction.arguments || "{}")
+        : toolFunction.arguments || {};
+
     const isRoute = !!args.route;
     const inputLocations = Array.isArray(args.locations) ? args.locations : [];
-    const language = args.language || "de";
+    const language = args.language || "en";
     const region = args.region || "de";
 
-    if (!inputLocations.length) throw new Error("No locations provided.");
+    if (!inputLocations.length) {
+      return "[ERROR]: MAPS_INPUT — No locations provided.";
+    }
 
-    // 1) normalisieren
-    const normalized = inputLocations.map(norm).filter(Boolean);
+    const normalized = inputLocations.map(normalize).filter(Boolean);
+    if (!normalized.length) {
+      return "[ERROR]: MAPS_INPUT — Locations are empty after normalization.";
+    }
 
-    // 2) geokodieren (best effort)
-    const geo = await Promise.all(normalized.map(s => geocodeOne(s, { language, region })));
+    const geo = await Promise.all(normalized.map((s) => geocodeOne(s, { language, region })));
+    const points = normalized.map((txt, i) => geo[i]?.coord || txt);
 
-    // 3) Für Maps/Directions Punkte bauen: Koordinate wenn vorhanden, sonst Freitext
-    const points = normalized.map((txt, i) => (geo[i]?.coord || txt));
-
-    // Mindestanzahl prüfen (aber *nicht* nur auf Koordinaten beschränken)
     const minNeeded = isRoute ? 2 : 1;
-    if (points.length < minNeeded) throw new Error("Not enough valid locations.");
+    if (points.length < minNeeded) {
+      return "[ERROR]: MAPS_INPUT — Not enough valid locations for the requested mode.";
+    }
 
-    // 4) URLs bauen
-    const longMapUrl = await getGoogleMapsURL(points, isRoute);
+    const longMapUrl = buildMapsURL(points, isRoute);
     const shortMapUrl = await getShortURL(longMapUrl).catch(() => longMapUrl);
 
-    // 5) StreetView (nur wenn Ziel Koordinaten hat)
     let street = "";
     const lastCoord = geo[geo.length - 1]?.coord;
     if (lastCoord) {
-      const longSV = await getStreetViewURL(lastCoord);
+      const longSV = buildStreetViewURL(lastCoord);
       const shortSV = await getShortURL(longSV).catch(() => longSV);
-      street = `Streetview: ${shortSV}\n`;
+      street = `Street View: ${shortSV}\n`;
     }
 
-    // 6) Directions (Strings sind erlaubt – Google geokodiert intern)
     let directionsText = "";
     if (isRoute) {
       const origin = points[0];
       const destination = points[points.length - 1];
       const waypoints = points.slice(1, -1);
-      directionsText = await getDirectionsText(origin, destination, waypoints);
+      directionsText = await getDirectionsText(origin, destination, waypoints, language);
     }
 
     return `${street}${isRoute ? "Route" : "Location"}: ${shortMapUrl}\n\n${directionsText}`.trim();
   } catch (error) {
-    console.error("❌ getLocation Error:", error?.message || error);
-    return "An error occurred while generating the map links.";
+    console.error("getLocation error:", error?.message || error);
+    return "[ERROR]: MAPS_UNEXPECTED — An unexpected error occurred while generating the map links.";
   }
 }
 
