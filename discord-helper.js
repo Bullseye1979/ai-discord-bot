@@ -1,11 +1,11 @@
-// discord-helper.js — v1.8
-// Voice (TTS + optional Transcripts-Thread), Chunking, Webhook-Replies, Channel-Config (inkl. summaryPrompt)
+// discord-helper.js — clean v2
+// Minimal helper set for Discord bot: config loading, webhook replies (with chunked embeds), TTS, voice capture, and small utilities.
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { tools, getToolRegistry } = require("./tools.js");
-const { EndBehaviorType, createAudioResource, StreamType } = require("@discordjs/voice");
+const { getToolRegistry } = require("./tools.js");
+const { EndBehaviorType } = require("@discordjs/voice");
 const { PassThrough } = require("stream");
 const { hasVoiceConsent } = require("./consent.js");
 const prism = require("prism-media");
@@ -16,37 +16,23 @@ require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
+// State for voice & TTS
 const activeRecordings = new Map();
-const _avatarInFlight = new Map(); // ⬅️ verhindert parallele Generierungen
-const transcriptWebhookCache = new Map(); // key: parentChannelId -> webhook
+const _avatarInFlight = new Map();
+const queueMap = new Map();
+const playerMap = new Map();
 
-// --- Dedup/Locks für Voice ---
-const capturingUsers = new Set();              // key = `${guildId}:${userId}` -> vermeidet parallele Captures
-const lastUtteranceMap = new Map();            // key -> { norm, ts }
-const DUP_WINDOW_MS = 5000;                    // 5s Fenster für 1:1-Dubletten
-
-function normText(s = "") {
-  return String(s)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, "") // Satzzeichen raus
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// --- Persona → Visual-Prompt (per GPT) ---
+/* Build a concise visual prompt from persona text */
 async function buildVisualPromptFromPersona(personaText) {
-  // local require avoids rare binding issues
   const { getAI } = require("./aiService.js");
-
   const ctx = {
     messages: [
       {
         role: "system",
         content:
-          "You convert assistant persona descriptions into ONE concise visual prompt for a clean square avatar illustration. " +
-          "Only output the final prompt text. Be concrete: age vibe, outfit, color palette, expression, background. " +
-          "Avoid any mention of text, logos, UI, frames, watermarks, brands. " +
-          "End with: 'square portrait, centered, neutral background, soft lighting'. Max ~80 words."
+          "Convert an assistant persona into ONE concise visual prompt for a square avatar. " +
+          "Be concrete: vibe/age, outfit, colors, expression, background. No text/logos/frames/brands. " +
+          "End with 'square portrait, centered, neutral background, soft lighting'. ~80 words max."
       },
       {
         role: "user",
@@ -54,11 +40,11 @@ async function buildVisualPromptFromPersona(personaText) {
       }
     ]
   };
-
   const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
   return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
 }
 
+/* Stop and dispose the TTS player for a guild */
 function resetTTSPlayer(guildId) {
   try {
     const p = playerMap.get(guildId);
@@ -69,30 +55,21 @@ function resetTTSPlayer(guildId) {
   } catch {}
 }
 
+/* Clear internal recording flag to arm capture on next join */
 function resetRecordingFlag(guildId) {
-  // Aufnahme-Flag löschen, damit setStartListening beim nächsten Join neu scharf geschaltet wird
   try { activeRecordings.delete(guildId); } catch {}
 }
 
-
-// --- Avatar sicherstellen (nur Persona verwenden) ---
+/* Ensure a channel avatar image exists (generated from persona) and return its URL */
 async function ensureChannelAvatar(channelId, channelMeta) {
   try {
     const dir = path.join(__dirname, "documents", "avatars");
     const file = path.join(dir, `${channelId}.png`);
+    if (fs.existsSync(file)) return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
 
-    // Bereits vorhanden? -> URL zurück
-    if (fs.existsSync(file)) {
-      return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
-    }
-
-    // Ohne Persona -> Default
     const persona = (channelMeta?.persona || "").trim();
-    if (!persona) {
-      return `https://ralfreschke.de/documents/avatars/default.png`;
-    }
+    if (!persona) return `https://ralfreschke.de/documents/avatars/default.png`;
 
-    // Parallel-Läufe verhindern
     if (_avatarInFlight.has(channelId)) {
       await _avatarInFlight.get(channelId);
       return fs.existsSync(file)
@@ -102,14 +79,8 @@ async function ensureChannelAvatar(channelId, channelMeta) {
 
     const p = (async () => {
       await fs.promises.mkdir(dir, { recursive: true });
-
-      // 1) Persona → kompakten Bild-Prompt bauen
       const visualPrompt = await buildVisualPromptFromPersona(persona);
-
-      // 2) Bild generieren
       const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
-
-      // 3) Download & speichern
       const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
       await fs.promises.writeFile(file, Buffer.from(res.data));
     })();
@@ -126,143 +97,7 @@ async function ensureChannelAvatar(channelId, channelMeta) {
   }
 }
 
-// WAV auf max. Bytes kürzen (48 kHz, 16-bit, mono ≈ 96,000 B/s)
-async function trimWavToMaxBytes(file, { rate = 48000, channels = 1, maxBytes = 23 * 1024 * 1024 } = {}) {
-  try {
-    const st = await fs.promises.stat(file).catch(() => null);
-    if (!st || st.size <= maxBytes) return file;
-
-    const BYTES_PER_SEC = rate * channels * 2; // 16-bit PCM
-    let maxSec = Math.floor((maxBytes - 44) / BYTES_PER_SEC) - 1; // Header abziehen + Puffer
-    if (maxSec < 1) return null;
-
-    const out = path.join(path.dirname(file), `trim_${Date.now()}.wav`);
-    await new Promise((resolve, reject) => {
-      ffmpeg(file)
-        .audioCodec("pcm_s16le")
-        .format("wav")
-        .outputOptions([`-t ${maxSec}`])
-        .save(out)
-        .on("end", resolve)
-        .on("error", reject);
-    });
-    return out;
-  } catch {
-    return file;
-  }
-}
-
-// WAV auf eine feste Dauer (Sekunden) trimmen
-async function trimWavToSeconds(file, seconds) {
-  try {
-    if (!Number.isFinite(seconds) || seconds <= 0) return file;
-    const out = path.join(path.dirname(file), `crop_${Date.now()}.wav`);
-    await new Promise((resolve, reject) => {
-      ffmpeg(file)
-        .audioCodec("pcm_s16le")
-        .format("wav")
-        .outputOptions([`-t ${seconds}`])
-        .save(out)
-        .on("end", resolve)
-        .on("error", reject);
-    });
-    return out;
-  } catch {
-    return file;
-  }
-}
-
-// Bestimme, wie viele Sekunden vom Anfang wir behalten, um höchstens maxVoiceSeconds "voiced" zu enthalten
-// (Frame-basiert, 20 ms Frames @ 48 kHz; wir summieren voiced-Frames und stoppen, wenn Limit erreicht)
-async function computeVoiceCropSeconds(file, {
-  rate = 48000,
-  frameSamples = 960,         // 20 ms
-  maxVoiceSeconds = 12,       // z.B. 12s verwertbare Sprache
-  padLeadSec = 0.20,          // kleiner Vorlauf
-  padTailSec = 0.35           // kleiner Nachlauf
-} = {}) {
-  try {
-    const buf = await fs.promises.readFile(file);
-    if (!buf || buf.length <= 44) return null;
-
-    const pcm = buf.subarray(44);
-    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
-    const totalFrames = Math.floor(samples.length / frameSamples);
-    if (totalFrames <= 0) return null;
-
-    // einfache voiced-Heuristik wie unten in analyzeWav
-    const rmsList = new Array(totalFrames);
-    const zcrList = new Array(totalFrames);
-
-    for (let f = 0; f < totalFrames; f++) {
-      const start = f * frameSamples;
-      let sumSq = 0, zc = 0, prev = samples[start];
-      for (let i = 1; i < frameSamples; i++) {
-        const s = samples[start + i];
-        sumSq += s * s;
-        if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) zc++;
-        prev = s;
-      }
-      const rms = Math.sqrt(sumSq / frameSamples) / 32768;
-      const zcr = zc / (frameSamples - 1);
-      rmsList[f] = rms;
-      zcrList[f] = zcr;
-    }
-
-    // Noise-Floor grob
-    const sortedRms = rmsList.slice().sort((a, b) => a - b);
-    const p = (arr, q) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor((arr.length - 1) * q)))];
-    const noise = Math.max(1e-6, p(sortedRms, 0.2));
-
-    const voicedMask = rmsList.map((r, i) => (r > noise * 2 && zcrList[i] < 0.25) ? 1 : 0);
-
-    const frameDur = frameSamples / rate; // sek/Frame = 0.02 s
-    const maxVoiceFrames = Math.floor(maxVoiceSeconds / frameDur);
-
-    // kumulativ "voiced"-Frames zählen bis Limit erreicht ist → dort abschneiden (+ kleinen Puffer)
-    let cumVoiced = 0;
-    let cutFrame = totalFrames - 1;
-    for (let f = 0; f < totalFrames; f++) {
-      if (voicedMask[f]) cumVoiced++;
-      if (cumVoiced >= maxVoiceFrames) { cutFrame = f; break; }
-    }
-
-    // Wenn sowieso unterhalb des Limits → nichts croppen
-    if (cumVoiced < maxVoiceFrames) return null;
-
-    // Sekunden berechnen + Pads
-    const leadFrames = Math.floor(padLeadSec / frameDur);
-    const tailFrames = Math.floor(padTailSec / frameDur);
-    const endFrameIncl = Math.min(totalFrames - 1, cutFrame + tailFrames);
-    // Start lassen wir bei 0 (wir wollen nicht mitten im Satz beginnen); wer will, könnte hier zum
-    // letzten Unvoiced vor der ersten Voice springen und dann padLeadSec addieren.
-
-    const seconds = (endFrameIncl + 1) * frameDur + 0; // ab 0 bis inkl. endFrame
-    return Math.max(0.5, seconds); // nie < 0.5s
-  } catch {
-    return null;
-  }
-}
-
-
-
-// ---------- Tools für User/Blocks ----------
-function getUserTools(nameOrDisplayName) {
-  const configPath = path.join(__dirname, "permissions.json");
-  const raw = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "{}";
-  const parsed = JSON.parse(raw || "{}");
-
-  const defaultTools = parsed.default?.tools || [];
-  const userTools = parsed.users?.[nameOrDisplayName]?.tools;
-
-  const toolNames = Array.isArray(userTools) ? userTools : defaultTools;
-  const activeTools = tools.filter((t) => toolNames.includes(t.function.name));
-  const { registry: toolRegistry } = getToolRegistry(toolNames);
-
-  return { tools: activeTools, toolRegistry };
-}
-
-// ---------- Default Persona ----------
+/* Load default persona/config from channel-config/default.json */
 function getDefaultPersona() {
   const defaultPath = path.join(__dirname, "channel-config", "default.json");
   try {
@@ -278,10 +113,8 @@ function getDefaultPersona() {
       blocks: Array.isArray(json.blocks) ? json.blocks : [],
       summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
       admins: Array.isArray(json.admins) ? json.admins : [],
-      // NEU: Zusatzprompts (Default)
       chatAppend: json.chatAppend || json.chatPrompt || json.chat_prompt || json.prompt_chat || "",
       speechAppend: json.speechAppend || json.speechPrompt || json.speech_prompt || json.prompt_speech || "",
-      // optionale Limits
       max_user_messages: json.max_user_messages ?? json.maxUserMessages ?? null,
       max_tokens_chat: json.max_tokens_chat ?? json.maxTokensChat,
       max_tokens_speaker: json.max_tokens_speaker ?? json.maxTokensSpeaker,
@@ -296,36 +129,33 @@ function getDefaultPersona() {
   }
 }
 
-
-// ---------- Channel-Config ----------
+/* Load merged channel config (default + per-channel JSON) */
 function getChannelConfig(channelId) {
   const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
   const def = getDefaultPersona();
 
-  // Defaults
-  let persona       = def.persona || "";
-  let instructions  = def.instructions || "";
-  let voice         = def.voice || "";
-  let name          = def.name || "";
-  let botname       = def.botname || "AI";
+  let persona = def.persona || "";
+  let instructions = def.instructions || "";
+  let voice = def.voice || "";
+  let name = def.name || "";
+  let botname = def.botname || "AI";
   let selectedTools = def.selectedTools || def.tools || [];
-  let blocks        = Array.isArray(def.blocks) ? def.blocks : [];
+  let blocks = Array.isArray(def.blocks) ? def.blocks : [];
   let summaryPrompt = def.summaryPrompt || def.summary_prompt || "";
   let max_user_messages = (Number.isFinite(Number(def.max_user_messages)) && Number(def.max_user_messages) >= 0)
     ? Number(def.max_user_messages)
     : null;
-  let admins        = Array.isArray(def.admins) ? def.admins.map(String) : [];
+  let admins = Array.isArray(def.admins) ? def.admins.map(String) : [];
 
-  // Tokenlimits (Defaults)
-  let max_tokens_chat    = (Number.isFinite(Number(def.max_tokens_chat))    && Number(def.max_tokens_chat)    > 0) ? Math.floor(Number(def.max_tokens_chat))    : 4096;
-  let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0) ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
+  let max_tokens_chat = (Number.isFinite(Number(def.max_tokens_chat)) && Number(def.max_tokens_chat) > 0)
+    ? Math.floor(Number(def.max_tokens_chat)) : 4096;
+  let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0)
+    ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
 
-  // NEU: Zusatzprompts (Defaults)
-  let chatAppend   = typeof def.chatAppend   === "string" ? def.chatAppend.trim()   : "";
+  let chatAppend = typeof def.chatAppend === "string" ? def.chatAppend.trim() : "";
   let speechAppend = typeof def.speechAppend === "string" ? def.speechAppend.trim() : "";
 
   const hasConfigFile = fs.existsSync(configPath);
-
   if (hasConfigFile) {
     try {
       const raw = fs.readFileSync(configPath, "utf8");
@@ -342,16 +172,14 @@ function getChannelConfig(channelId) {
       if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
       else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
 
-      // max_user_messages: snake_case oder camelCase, Zahl oder numerischer String
       const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
       if (rawMax === null || rawMax === undefined || rawMax === "") {
-        max_user_messages = null; // AUS
+        max_user_messages = null;
       } else {
         const n = Number(rawMax);
         max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
       }
 
-      // Tokenlimits snake+camel lesen
       const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
       if (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "") {
         const n = Number(rawTokChat);
@@ -363,18 +191,13 @@ function getChannelConfig(channelId) {
         if (Number.isFinite(n) && n > 0) max_tokens_speaker = Math.floor(n);
       }
 
-      // Admins
       if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
 
-      // NEU: Zusatzprompts aus Channel-Config (beliebte Schlüsselvarianten)
-      const cfgChatAppend =
-        cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
-      const cfgSpeechAppend =
-        cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
+      const cfgChatAppend = cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
+      const cfgSpeechAppend = cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
 
-      if (typeof cfgChatAppend === "string")   chatAppend   = cfgChatAppend.trim();
+      if (typeof cfgChatAppend === "string") chatAppend = cfgChatAppend.trim();
       if (typeof cfgSpeechAppend === "string") speechAppend = cfgSpeechAppend.trim();
-
     } catch (e) {
       console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
@@ -406,15 +229,12 @@ function getChannelConfig(channelId) {
     admins,
     max_tokens_chat,
     max_tokens_speaker,
-
-    // NEU: für Aufrufer verfügbar
     chatAppend,
     speechAppend,
   };
 }
 
-
-// ---------- Chunking & Senden ----------
+/* Split plain text into safe Discord message chunks (<=2000 chars) */
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -443,6 +263,7 @@ function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   return chunks.flatMap(hardSplit);
 }
 
+/* Send long content to a channel using chunking */
 async function sendChunked(channel, content) {
   const parts = splitIntoChunks(content);
   for (const p of parts) {
@@ -450,7 +271,7 @@ async function sendChunked(channel, content) {
   }
 }
 
-// Nach sendChunked(...)
+/* Post a list of summaries as separate messages (with optional header) */
 async function postSummariesIndividually(channel, summaries, headerPrefix = null) {
   for (let i = 0; i < summaries.length; i++) {
     const header =
@@ -461,24 +282,91 @@ async function postSummariesIndividually(channel, summaries, headerPrefix = null
   }
 }
 
+/* Set or update the bot's Discord presence */
+async function setBotPresence(client, activityText = "✅ Ready", status = "online", activityType = 0) {
+  try {
+    if (!client?.user) return;
+    await client.user.setPresence({
+      activities: [{ name: activityText, type: activityType }],
+      status,
+    });
+  } catch (e) {
+    console.warn("[presence] setBotPresence failed:", e?.message || e);
+  }
+}
 
-// discord-helper.js
+/* Add the user message (and any attachments) into the chat context */
+async function setAddUserMessage(message, chatContext) {
+  try {
+    const raw = (message?.content || "").trim();
+    if (raw.startsWith("!")) return;
+
+    let content = raw;
+    if (message.attachments?.size > 0) {
+      const links = [...message.attachments.values()].map(a => a.url).join("\n");
+      content = `${links}\n${content}`.trim();
+    }
+
+    const senderName =
+      message.member?.displayName ||
+      message.author?.username ||
+      "user";
+
+    await chatContext.add("user", senderName, content);
+  } catch (e) {
+    console.warn("[setAddUserMessage] failed:", e?.message || e);
+  }
+}
+
+/* Create a temp file path */
+async function makeTmpFile(ext = ".wav") {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
+  const file = path.join(dir, `${Date.now()}${ext}`);
+  return { dir, file };
+}
+
+/* Convert PCM stream to WAV using ffmpeg */
+function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const { dir, file } = await makeTmpFile(".wav");
+      ffmpeg()
+        .input(pcmReadable)
+        .inputOptions([`-f s16le`, `-ar ${rate}`, `-ac ${channels}`])
+        .audioCodec("pcm_s16le")
+        .format("wav")
+        .save(file)
+        .on("end", () => resolve({ dir, file }))
+        .on("error", reject);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+/* Resolve a member's display name for a guild */
+async function resolveSpeakerName(client, guildId, userId) {
+  try {
+    const g = await client.guilds.fetch(guildId);
+    const m = await g.members.fetch(userId).catch(() => null);
+    return m?.displayName || m?.user?.username || "Unknown";
+  } catch {
+    return "Unknown";
+  }
+}
+
+/* Add or replace a simple status reaction on a message (⏳/✅/❌) */
 async function setMessageReaction(message, emoji) {
   const STATUS = ["⏳", "✅", "❌"];
   try {
     const me = message.client?.user;
     if (!me) return;
 
-    // Alle bisherigen Status-Reaktionen des BOTS entfernen
     const toRemove = message.reactions?.cache?.filter(r => STATUS.includes(r.emoji?.name)) || [];
     for (const r of toRemove.values()) {
-      try {
-        // Nur unsere eigene Reaktion entfernen – dafür braucht der Bot keine ManageMessages
-        await r.users.remove(me.id);
-      } catch {}
+      try { await r.users.remove(me.id); } catch {}
     }
 
-    // Neue gewünschte Reaktion setzen (falls angegeben)
     if (emoji && STATUS.includes(emoji)) {
       await message.react(emoji).catch(() => {});
     }
@@ -487,20 +375,14 @@ async function setMessageReaction(message, emoji) {
   }
 }
 
-
-// ---------- Webhook Reply ----------
-// ---------- Webhook Reply (Avatar = aus Persona generiert) ----------
-async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignorieren */ }) {
+/* Reply via webhook with text only (chunked as plain content) */
+async function setReplyAsWebhook(message, content, { botname } = {}) {
   try {
-    // Falls Thread: Webhook immer am Parent erstellen
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
     const hookChannel = isThread ? message.channel.parent : message.channel;
 
-    // ChannelMeta laden (Parent wenn Thread)
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-
-    // Avatar sicherstellen (nur Persona)
     const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
@@ -524,212 +406,95 @@ async function setReplyAsWebhook(message, content, { botname /* avatarUrl ignori
     }
   } catch (e) {
     console.error("[Webhook Reply] failed:", e);
-    // Fallback ohne Webhook
     await sendChunked(message.channel, content);
   }
 }
 
+/* Build a list of URLs (with optional labels) from text */
+function collectUrlsWithLabels(text) {
+  const out = [];
+  const seen = new Set();
 
-// ---------- Transcripts-Thread ----------
+  const pushOnce = (url, label, kind, isImageExt) => {
+    const clean = cleanUrl(url);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
+  };
 
-
-// ---------- Voice: TTS ----------
-const queueMap = new Map();
-const playerMap = new Map();
-
-// NEU: liefert ein Promise zurück, das erst RESOLVEd, wenn die TTS-Task komplett fertig ist
-function setEnqueueTTS(guildId, task) {
-  return new Promise((resolve, reject) => {
-    if (!queueMap.has(guildId)) queueMap.set(guildId, []);
-    const q = queueMap.get(guildId);
-    q.push({ task, resolve, reject });
-    if (q.length === 1) setProcessTTSQueue(guildId);
+  String(text || "").replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url));
+    return "";
   });
+
+  String(text || "").replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => {
+    pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url));
+    return "";
+  });
+
+  String(text || "").replace(/https?:\/\/[^\s)]+/g, (url) => {
+    pushOnce(url, null, "plain", looksLikeImage(url));
+    return "";
+  });
+
+  return out;
 }
 
-async function setProcessTTSQueue(guildId) {
-  const q = queueMap.get(guildId);
-  if (!q?.length) return;
-  const { task, resolve, reject } = q[0];
-  try {
-    await task();
-    resolve();
-  } catch (e) {
-    reject(e);
-  } finally {
-    q.shift();
-    if (q.length > 0) setProcessTTSQueue(guildId);
-  }
-}
+/* Choose the best image candidate from a URL list */
+async function pickFirstImageCandidate(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const mdImg = list.find(l => l.kind === "md_image");
+  if (mdImg) return mdImg;
+  const withExt = list.find(l => l.isImageExt);
+  if (withExt) return withExt;
 
-
-function getSplitTextToChunks(text, maxChars = 500) {
-  const sentences = text.match(/[^.!?\n]+[.!?\n]?/g) || [text];
-  const chunks = [];
-  let current = "";
-  for (const s of sentences) {
-    if ((current + s).length > maxChars) {
-      chunks.push(current.trim());
-      current = s;
-    } else current += s;
-  }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks;
-}
-
-// ---------- Presence ----------
-
-async function setBotPresence(client, activityText = "✅ Ready", status = "online", activityType = 0) {
-  try {
-    if (!client?.user) return;
-    await client.user.setPresence({
-      activities: [{ name: activityText, type: activityType }], // 0 = Playing
-      status, // "online" | "idle" | "dnd" | "invisible"
-    });
-  } catch (e) {
-    console.warn("[presence] setBotPresence failed:", e?.message || e);
-  }
-}
-
-
-async function setAddUserMessage(message, chatContext) {
-  try {
-    const raw = (message?.content || "").trim();
-    // Keine Commands ins Log schreiben
-    if (raw.startsWith("!")) return;
-
-    // Anhänge sammeln
-    let content = raw;
-    if (message.attachments?.size > 0) {
-      const links = [...message.attachments.values()].map(a => a.url).join("\n");
-      content = `${links}\n${content}`.trim();
-    }
-
-    const senderName =
-      message.member?.displayName ||
-      message.author?.username ||
-      "user";
-
-    await chatContext.add("user", senderName, content);
-  } catch (e) {
-    console.warn("[setAddUserMessage] failed:", e?.message || e);
-  }
-}
-
-
-
-// temp-Datei anlegen
-async function makeTmpFile(ext = ".wav") {
-  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
-  const file = path.join(dir, `${Date.now()}${ext}`);
-  return { dir, file };
-}
-
-// PCM → WAV (über ffmpeg aus einem Readable-Stream)
-function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
-  return new Promise(async (resolve, reject) => {
+  for (const l of list) {
     try {
-      const { dir, file } = await makeTmpFile(".wav");
-      ffmpeg()
-        .input(pcmReadable)
-        .inputOptions([`-f s16le`, `-ar ${rate}`, `-ac ${channels}`]) // Roh-PCM-Format
-        .audioCodec("pcm_s16le")
-        .format("wav")
-        .save(file)
-        .on("end", () => resolve({ dir, file }))
-        .on("error", reject);
-    } catch (e) {
-      reject(e);
-    }
-  });
+      const ct = await headContentType(l.url);
+      if (ct && /^image\//i.test(ct)) return l;
+    } catch {}
+  }
+  return null;
 }
 
-// Discord-ID → Anzeigename
-async function resolveSpeakerName(client, guildId, userId) {
+/* Get Content-Type using HEAD (fallback GET stream) */
+async function headContentType(url) {
   try {
-    const g = await client.guilds.fetch(guildId);
-    const m = await g.members.fetch(userId).catch(() => null);
-    return m?.displayName || m?.user?.username || "Unknown";
-  } catch {
-    return "Unknown";
-  }
+    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
+    if (ct) return String(ct);
+  } catch {}
+  try {
+    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
+    try { res.data?.destroy?.(); } catch {}
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
+    if (ct) return String(ct);
+  } catch {}
+  return null;
 }
 
-
-
-// --- Quick SNR + Voicing Gate für 48kHz/mono WAV ---
-async function quickSNR(wavPath) {
-  const buf = await fs.promises.readFile(wavPath);
-
-  // sehr einfache RIFF/WAV-Parsing-Logik: "data"-Chunk finden
-  function findDataChunk(b) {
-    // RIFF Header: 12 bytes, dann Chunks
-    let p = 12;
-    while (p + 8 <= b.length) {
-      const id = b.toString('ascii', p, p + 4);
-      const size = b.readUInt32LE(p + 4);
-      if (id === 'data') return { offset: p + 8, size };
-      p += 8 + size;
-    }
-    return null;
-  }
-
-  const data = findDataChunk(buf);
-  if (!data || data.size < 960 * 2) { // < 20ms
-    return { snrDb: 0, voicedRatio: 0, frames: 0 };
-  }
-
-  // PCM16 mono
-  const pcm = new Int16Array(
-    buf.buffer,
-    buf.byteOffset + data.offset,
-    data.size / 2
-  );
-
-  const frameSize = 960; // 20ms @ 48kHz
-  const energies = [];
-  const zcrs = [];
-
-  for (let i = 0; i + frameSize <= pcm.length; i += frameSize) {
-    let e = 0;
-    let z = 0;
-    let prev = pcm[i];
-    for (let j = i; j < i + frameSize; j++) {
-      const s = pcm[j] / 32768; // normiert [-1..1]
-      e += s * s;
-      const cur = pcm[j];
-      if ((cur >= 0 && prev < 0) || (cur < 0 && prev >= 0)) z++;
-      prev = cur;
-    }
-    e /= frameSize;                         // mittlere Energie
-    const zcr = z / frameSize;              // Zero-Crossing-Rate
-    energies.push(e);
-    zcrs.push(zcr);
-  }
-
-  if (energies.length < 3) {
-    return { snrDb: 0, voicedRatio: 0, frames: energies.length };
-  }
-
-  const sorted = [...energies].sort((a, b) => a - b);
-  const idx20 = Math.max(0, Math.floor(sorted.length * 0.20) - 1);
-  const idx80 = Math.max(0, Math.floor(sorted.length * 0.80) - 1);
-  const noise = Math.max(sorted[idx20], 1e-9);
-  const signal = Math.max(sorted[idx80], noise + 1e-9);
-  const snrDb = 10 * Math.log10(signal / noise);
-
-  // voiced-Frames: Energie deutlich über Noise + ZCR im Sprachbereich (nicht zu flach)
-  const energyThresh = noise * 3.0;
-  let voiced = 0;
-  for (let k = 0; k < energies.length; k++) {
-    if (energies[k] > energyThresh && zcrs[k] < 0.25) voiced++;
-  }
-  const voicedRatio = voiced / energies.length;
-
-  return { snrDb, voicedRatio, frames: energies.length };
+/* Normalize text for embed: turn markdown images into ordinary links, reduce spacing */
+function prepareTextForEmbed(text) {
+  let s = String(text || "");
+  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    const a = String(alt || "").trim();
+    return a ? `[${a}](${url})` : `<${url}>`;
+  });
+  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+  return s;
 }
 
-// ---- NEU: hübsches Embed-Reply (1 Embed, 1 großes Bild, Bullet-Liste weiterer Links) ----
+/* Heuristic: URL looks like an image by extension */
+function looksLikeImage(u) {
+  return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
+}
+
+/* Light URL cleanup (strip trailing bracket/commas) */
+function cleanUrl(u) {
+  try { return u.replace(/[),.]+$/g, ""); } catch { return u; }
+}
+
+/* Send AI reply as chunked embeds; first embed may include a large image */
 async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) {
   try {
     if (!aiText || !String(aiText).trim()) return;
@@ -750,19 +515,13 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       });
     }
 
-    // 1) Links (inkl. Labels/Alt-Text) sammeln – Reihenfolge beibehalten
-    const links = collectUrlsWithLabels(aiText); // [{url,label,kind,isImageExt}]
-    // 2) Ersten Bild-Kandidaten finden (Markdown-Image bevorzugt, sonst via Content-Type-Check)
+    const links = collectUrlsWithLabels(aiText);
     const firstImage = await pickFirstImageCandidate(links);
-
-    // 3) Text für die Beschreibung: Markdown-Bilder in normale Links umwandeln,
-    //    sonst original belassen (keine Maskierung/Entfernung)
     const bodyText = prepareTextForEmbed(aiText);
 
-    // 4) Weitere Links als Bulletliste (mit Label, wenn vorhanden), ersten Bildlink auslassen
     const rest = links.filter(l => !(firstImage && l.url === firstImage.url));
-    const bullets = rest.length
-      ? "\n\n**Weitere Links**\n" + rest.map(l => {
+    const bulletsBlock = rest.length
+      ? "\n\n**More links**\n" + rest.map(l => {
           const label = (l.label && l.label.trim()) ? l.label.trim() : null;
           return label ? `• ${label} — <${l.url}>` : `• <${l.url}>`;
         }).join("\n")
@@ -770,223 +529,114 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
 
     const themeColor = Number.isInteger(color) ? color : 0x5865F2;
     const MAX_EMBED = 4096;
-    const roomForBody = Math.max(0, MAX_EMBED - bullets.length - 2);
-    const description = truncateForEmbed(bodyText, roomForBody) + bullets;
 
-    const embed = {
-      color: themeColor,
-      author: {
-        name: botname || meta?.botname || "AI",
-        icon_url: personaAvatarUrl || undefined
-      },
-      description,
-      timestamp: new Date().toISOString(),
-      footer: { text: meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI") }
+    const fullDesc = (bodyText + bulletsBlock).trim();
+    const descChunks = [];
+    let remaining = fullDesc;
+
+    const smartSlice = (s, limit) => {
+      if (s.length <= limit) return s;
+      const cut1 = s.lastIndexOf("\n\n", limit);
+      const cut2 = s.lastIndexOf("\n", limit);
+      const cut3 = s.lastIndexOf(" ", limit);
+      const cut = Math.max(cut1, cut2, cut3, limit);
+      return s.slice(0, cut).trim();
     };
 
-    if (firstImage && firstImage.url) {
-      embed.image = { url: firstImage.url };
+    while (remaining.length > 0) {
+      const part = smartSlice(remaining, MAX_EMBED);
+      descChunks.push(part);
+      remaining = remaining.slice(part.length).trimStart();
+      if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    await hook.send({
-      content: "", // kein Content -> keine Auto-Unfurls im Text
-      username: botname || meta?.botname || "AI",
-      avatarURL: personaAvatarUrl || undefined,
-      embeds: [embed],
-      allowedMentions: { parse: [] },
-      threadId: isThread ? message.channel.id : undefined
+    const makeEmbed = (desc, i, n) => ({
+      color: themeColor,
+      author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
+      description: desc,
+      timestamp: new Date().toISOString(),
+      footer: { text: (meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI")) + (n > 1 ? ` — Part ${i}/${n}` : "") }
     });
 
+    const embeds = descChunks.map((d, idx) => makeEmbed(d, idx + 1, descChunks.length));
+    if (firstImage?.url && embeds.length) {
+      embeds[0].image = { url: firstImage.url };
+    }
+
+    for (let i = 0; i < embeds.length; i += 10) {
+      const slice = embeds.slice(i, i + 10);
+      await hook.send({
+        content: "",
+        username: botname || meta?.botname || "AI",
+        avatarURL: personaAvatarUrl || undefined,
+        embeds: slice,
+        allowedMentions: { parse: [] },
+        threadId: isThread ? message.channel.id : undefined
+      });
+    }
   } catch (e) {
     console.error("[Webhook Embed Reply] failed:", e);
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
 
-/* ----------------- Helfer ----------------- */
-
-// Sammle alle Links in Reihenfolge und halte Label/Alt fest
-function collectUrlsWithLabels(text) {
-  const out = [];
-  const seen = new Set();
-
-  const pushOnce = (url, label, kind, isImageExt) => {
-    const clean = cleanUrl(url);
-    if (!clean || seen.has(clean)) return;
-    seen.add(clean);
-    out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
-  };
-
-  // Markdown-Image: ![alt](url)
-  text.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url));
-    return "";
+/* Enqueue a TTS task to be played sequentially per guild (returns when finished) */
+function setEnqueueTTS(guildId, task) {
+  return new Promise((resolve, reject) => {
+    if (!queueMap.has(guildId)) queueMap.set(guildId, []);
+    const q = queueMap.get(guildId);
+    q.push({ task, resolve, reject });
+    if (q.length === 1) setProcessTTSQueue(guildId);
   });
-
-  // Markdown-Link: [label](url)  (Achtung: negative Lookbehind ist nicht überall sicher -> wir filtern md_image vorher)
-  text.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => {
-    pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url));
-    return "";
-  });
-
-  // nackte URLs
-  text.replace(/https?:\/\/[^\s)]+/g, (url) => {
-    pushOnce(url, null, "plain", looksLikeImage(url));
-    return "";
-  });
-
-  return out;
 }
 
-// Besten Bildkandidaten wählen: 1) md_image 2) URL mit Bild-Endung 3) Content-Type probe
-async function pickFirstImageCandidate(list) {
-  if (!Array.isArray(list) || list.length === 0) return null;
-
-  // Priorität 1: Markdown-Image
-  const mdImg = list.find(l => l.kind === "md_image");
-  if (mdImg) {
-    // Wenn Alt der md_image im Text vorkommt, ist es sicher ein Bild; kein Netz-Check nötig
-    return mdImg;
+/* Process the TTS queue for a guild */
+async function setProcessTTSQueue(guildId) {
+  const q = queueMap.get(guildId);
+  if (!q?.length) return;
+  const { task, resolve, reject } = q[0];
+  try {
+    await task();
+    resolve();
+  } catch (e) {
+    reject(e);
+  } finally {
+    q.shift();
+    if (q.length > 0) setProcessTTSQueue(guildId);
   }
+}
 
-  // Priorität 2: bekannte Bildendung
-  const withExt = list.find(l => l.isImageExt);
-  if (withExt) return withExt;
-
-  // Priorität 3: Content-Type-Check der Reihe nach
-  for (const l of list) {
-    try {
-      const ct = await headContentType(l.url);
-      if (ct && /^image\//i.test(ct)) return l;
-    } catch {}
+/* Split text into smaller parts for TTS playback */
+function getSplitTextToChunks(text, maxChars = 500) {
+  const sentences = String(text || "").match(/[^.!?\n]+[.!?\n]?/g) || [String(text || "")];
+  const chunks = [];
+  let current = "";
+  for (const s of sentences) {
+    if ((current + s).length > maxChars) {
+      if (current.trim()) chunks.push(current.trim());
+      current = s;
+    } else current += s;
   }
-  return null;
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
 }
 
-// HEAD (Fallback auf GET stream) um Content-Type herauszufinden
-async function headContentType(url) {
-  try {
-    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
-    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
-    if (ct) return String(ct);
-  } catch {}
-  // Fallback GET (nur Header)
-  try {
-    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
-    try { res.data?.destroy?.(); } catch {}
-    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
-    if (ct) return String(ct);
-  } catch {}
-  return null;
-}
-
-// Bild-Markdown zu normalem Link machen (damit es im Text nicht „als Bild“ erscheint)
-function prepareTextForEmbed(text) {
-  let s = String(text || "");
-  // ![alt](url) -> [alt](url) bzw. <url> wenn alt leer
-  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    const a = String(alt || "").trim();
-    return a ? `[${a}](${url})` : `<${url}>`;
-  });
-  // Kosmetik
-  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
-  return s;
-}
-
-// ---- Helfer: alle URLs (Markdownde/Plain) sammeln & deduplizieren ----
-function collectAllUrls(text) {
-  const urls = [];
-  const seen = new Set();
-
-  const add = (u) => {
-    if (!u) return;
-    const clean = cleanUrl(u);
-    if (!seen.has(clean)) { seen.add(clean); urls.push(clean); }
-  };
-
-  // 1) Markdown-Bild: ![alt](url)
-  text.replace(/!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/g, (_m, u) => { add(u); return ""; });
-  // 2) Markdown-Link: [label](url)
-  text.replace(/\[[^\]]+]\((https?:\/\/[^\s)]+)\)/g, (_m, u) => { add(u); return ""; });
-  // 3) nackte URLs
-  text.replace(/https?:\/\/[^\s)]+/g, (u) => { add(u); return ""; });
-
-  return urls;
-}
-
-// ---- Helfer: Bild-Markdown in normalen Link wandeln, sonst Original belassen ----
-function prepareTextForEmbed(text) {
-  let s = String(text || "");
-
-  // ![alt](url) -> [alt](url)  (bei leerem alt: <url>)
-  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    const a = String(alt || "").trim();
-    return a ? `[${a}](${url})` : `<${url}>`;
-  });
-
-  // Ansonsten belassen wir normale Links & nackte URLs – im Embed gibt es sowieso kein Auto-Unfurl
-  // Kosmetik
-  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
-  return s;
-}
-
-// (deine Helpers looksLikeImage / cleanUrl / truncateForEmbed bleiben wie sie sind)
-
-
-function looksLikeImage(u) {
-  return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
-}
-function cleanUrl(u) {
-  try {
-    // kleine Säuberung (abschließende Klammern/Kommas etc. entfernen)
-    return u.replace(/[),.]+$/g, "");
-  } catch { return u; }
-}
-
-// Links maskieren + Markdown-Image rauswerfen
-function maskLinksAndStripImageSyntax(text) {
-  let s = String(text || "");
-
-  // Bild-Markdown komplett entfernen
-  s = s.replace(/!\[[^\]]*]\((https?:\/\/[^\s)]+)\)/g, "");
-
-  // Normale Markdown-Links in "[Text] [Link]" umwandeln (ohne nackte URL)
-  s = s.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label) => `${label} [Link]`);
-
-  // nackte URLs maskieren -> [Link]
-  s = s.replace(/https?:\/\/[^\s)]+/g, "[Link]");
-
-  // Doppelte Spaces trimmen
-  return s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
-}
-
-// Embed-Hardlimit
-function truncateForEmbed(s, max = 4096) {
-  if (!s) return "";
-  if (s.length <= max) return s;
-  return s.slice(0, max - 1) + "…";
-}
-
-
-
-async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript /* callback */) {
+/* Capture and transcribe users speaking in a voice channel, then callback with transcript */
+async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript) {
   try {
     if (!connection || !guildId) return;
 
-    // Persistente Strukturen pro Prozesslauf
-    if (!setStartListening.__captures) setStartListening.__captures = new Map(); // Map<`${guildId}:${userId}`, { opus }>
+    if (!setStartListening.__captures) setStartListening.__captures = new Map();
     const captures = setStartListening.__captures;
 
-    // Tuning per ENV, sinnvolle Defaults
-    const SILENCE_MS        = Number(process.env.VOICE_SILENCE_MS || 1200);   // schneller Cut nach Stille
+    const SILENCE_MS        = Number(process.env.VOICE_SILENCE_MS || 1200);
     const MAX_UTTERANCE_MS  = Number(process.env.VOICE_MAX_UTTERANCE_MS || 15000);
-    const MIN_WAV_BYTES     = 96000;  // ~1s @ 48k/16bit/mono
+    const MIN_WAV_BYTES     = 96000;
     const MIN_SNR_DB        = 8;
     const MIN_VOICED_RATIO  = 0.40;
     const MIN_VOICED_FRAMES = 15;
     const DUP_WINDOW_MS     = Number(process.env.VOICE_DUP_WINDOW_MS || 1500);
 
-    // Normierung nur für (leichte) Dubletten-Erkennung
     const normText = (s) =>
       String(s || "")
         .toLowerCase()
@@ -994,7 +644,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         .replace(/\s+/g, " ")
         .trim();
 
-    // Receiver neu armieren, wenn Connection gewechselt hat
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
       try { prev.receiver?.speaking?.removeAllListeners("start"); } catch {}
@@ -1011,7 +660,6 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       return ch || null;
     };
 
-    // Lightweight-Analyse für SNR/Voicing
     async function analyzeWav(filePath) {
       try {
         const buf = await fs.promises.readFile(filePath);
@@ -1068,11 +716,9 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
     receiver.speaking.on("start", (userId) => {
       const key = `${guildId}:${userId}`;
 
-      // PREEMPTION: Falls noch ein alter Capture läuft → beenden und durch neuen ersetzen
       const existing = captures.get(key);
       if (existing?.opus) {
         try { existing.opus.destroy(); } catch {}
-        // dessen finishOnce läuft asynchron; wir starten sofort neu
       }
 
       let killTimer = null;
@@ -1094,13 +740,11 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
           try { opus.destroy(); } catch {}
         }, MAX_UTTERANCE_MS);
 
-        // IDEMPOTENZ: finish nur einmal ausführen, egal welcher Event zuerst feuert
         let finished = false;
-        const finishOnce = async (tag) => {
+        const finishOnce = async () => {
           if (finished) return;
           finished = true;
 
-          // nur „aktuellen“ Capture freigeben, falls noch identisch
           const cur = captures.get(key);
           if (cur?.opus === opus) captures.delete(key);
 
@@ -1116,26 +760,23 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
             const latestTarget = await getLatestTarget();
             if (!latestTarget) return;
 
-            // DSGVO: Voice-Consent pro User x Channel
             let consentOk = true;
             try { consentOk = await hasVoiceConsent(userId, latestTarget.id); } catch {}
             if (!consentOk) return;
 
             const { snrDb, voicedRatio, voicedFrames } = await analyzeWav(file);
-            if (snrDb < MIN_SNR_DB || voicedRatio < MIN_VOICED_RATIO || voicedFrames < MIN_VOICED_FRAMES) {
-              return;
-            }
+            if (snrDb < MIN_SNR_DB || voicedRatio < MIN_VOICED_RATIO || voicedFrames < MIN_VOICED_FRAMES) return;
 
             const text  = await getTranscription(file, "whisper-1", "auto");
             const clean = (text || "").trim();
             if (!clean) return;
 
-            // leichte Dubletten-Bremse
             const norm = normText(clean);
             const now  = Date.now();
-            const last = lastUtteranceMap.get(key);
+            if (!setStartListening.__dups) setStartListening.__dups = new Map();
+            const last = setStartListening.__dups.get(key);
             if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) return;
-            lastUtteranceMap.set(key, { norm, ts: now });
+            setStartListening.__dups.set(key, { norm, ts: now });
 
             const speaker = await resolveSpeakerName(client, guildId, userId);
 
@@ -1156,18 +797,16 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
               const { dir } = await wavPromise;
               await fs.promises.rm(dir, { recursive: true, force: true });
             } catch {}
-            // Hygiene: Listener lösen
             try { opus.removeAllListeners(); } catch {}
             try { pcm.removeAllListeners(); } catch {}
           }
         };
 
-        // Mehrere mögliche Abschlussereignisse → finishOnce sichert 1x-Execution
-        opus.once("end",   () => finishOnce("opus:end"));
-        opus.once("close", () => finishOnce("opus:close"));
-        opus.once("error", () => finishOnce("opus:error"));
-        pcm.once("end",    () => finishOnce("pcm:end"));
-        pcm.once("error",  () => finishOnce("pcm:error"));
+        opus.once("end",   () => finishOnce());
+        opus.once("close", () => finishOnce());
+        opus.once("error", () => finishOnce());
+        pcm.once("end",    () => finishOnce());
+        pcm.once("error",  () => finishOnce());
 
       } catch (e) {
         console.warn("[Voice subscribe] failed:", e?.message || e);
@@ -1192,13 +831,12 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
   }
 }
 
-
-
+/* Generate speech from text and play it in sequence on a guild connection */
 async function getSpeech(connection, guildId, text, client, voice) {
   if (!connection || !text?.trim()) return;
   const chunks = getSplitTextToChunks(text);
 
-  return setEnqueueTTS(guildId, async () => {   // ⟵ NEU: Promise an Aufrufer zurückgeben
+  return setEnqueueTTS(guildId, async () => {
     let player = playerMap.get(guildId);
     if (!player) {
       const { createAudioPlayer } = require("@discordjs/voice");
@@ -1216,7 +854,6 @@ async function getSpeech(connection, guildId, text, client, voice) {
         const pass = new (require("stream").PassThrough)();
         response.pipe(pass);
 
-        const prism = require("prism-media");
         const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
         const pcmStream = pass.pipe(decoder);
         const { createAudioResource, StreamType } = require("@discordjs/voice");
@@ -1234,7 +871,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
           player.play(resource);
         });
 
-        await new Promise(r => setTimeout(r, 100)); // kleiner Puffer
+        await new Promise(r => setTimeout(r, 100));
       } catch (e) {
         console.error("[TTS ERROR]:", e);
       }
@@ -1242,63 +879,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
   });
 }
 
-
-
-
-async function getOrCreateRelayWebhookFor(parentChannel) {
-  try {
-    if (!parentChannel) return null;
-    const key = parentChannel.id;
-    if (transcriptWebhookCache.has(key)) return transcriptWebhookCache.get(key);
-
-    // Webhook am PARENT-Textkanal anlegen oder wiederverwenden
-    const hooks = await parentChannel.fetchWebhooks();
-    let hook = hooks.find(w => w.name === "Transcripts Relay");
-    if (!hook) {
-      hook = await parentChannel.createWebhook({
-        name: "Transcripts Relay",
-      });
-    }
-    transcriptWebhookCache.set(key, hook);
-    return hook;
-  } catch (e) {
-    console.error("[Transcripts Relay] webhook create/fetch failed:", e?.message || e);
-    return null;
-  }
-}
-
-async function sendTranscriptViaWebhook(targetChannelOrThread, content, username, avatarURL) {
-  try {
-    if (!targetChannelOrThread || !content?.trim()) return;
-
-    // Threads besitzen keine eigenen Webhooks -> am Parent-Kanal anlegen, aber mit threadId senden
-    const isThread = !!targetChannelOrThread?.isThread?.();
-    const parent = isThread ? targetChannelOrThread.parent : targetChannelOrThread;
-    const hook = await getOrCreateRelayWebhookFor(parent);
-    if (!hook) {
-      // Fallback ohne Webhook
-      return await sendChunked(targetChannelOrThread, `**${username}:** ${content}`);
-    }
-
-    const parts = splitIntoChunks(content);
-    for (const p of parts) {
-      await hook.send({
-        content: p,
-        username: username || "Speaker",
-        avatarURL: avatarURL || undefined,
-        allowedMentions: { parse: [] },
-        threadId: isThread ? targetChannelOrThread.id : undefined,
-      });
-    }
-  } catch (e) {
-    console.error("[Transcripts Relay] send failed:", e?.message || e);
-    // Fallback
-    try { await sendChunked(targetChannelOrThread, `**${username}:** ${content}`); } catch {}
-  }
-}
-
 module.exports = {
-  getUserTools,
   getDefaultPersona,
   getChannelConfig,
   setMessageReaction,
@@ -1307,13 +888,10 @@ module.exports = {
   setAddUserMessage,
   sendChunked,
   setBotPresence,
-  getOrCreateRelayWebhookFor,
   setStartListening,
   getSpeech,
   resetTTSPlayer,
-  resetRecordingFlag, 
+  resetRecordingFlag,
   postSummariesIndividually,
-  sendTranscriptViaWebhook,
   setReplyAsWebhookEmbed,
-
 };
