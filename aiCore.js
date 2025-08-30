@@ -1,4 +1,4 @@
-// aiCore.js — refactored v1.9
+// aiCore.js — refactored v2.0 (getHistory first-try fix: inject :channel_id, ORDER BY, LIMIT)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 
 require("dotenv").config();
@@ -24,6 +24,51 @@ function cleanOpenAIName(role, name) {
   const reserved = new Set(["assistant", "user", "system", "tool"]);
   if (reserved.has(s.toLowerCase())) return undefined;
   return s;
+}
+
+/** Best-effort fixups for getHistory tool calls (so the first attempt works). */
+function fixupGetHistoryArgs(toolFn) {
+  try {
+    const argsObj =
+      typeof toolFn.arguments === "string"
+        ? JSON.parse(toolFn.arguments || "{}")
+        : (toolFn.arguments || {});
+    let sql = String(argsObj.sql || "").trim();
+    if (!sql) return toolFn; // nothing to do
+
+    // Ensure :channel_id is present in the WHERE
+    if (!/:channel_id\b/i.test(sql)) {
+      if (/\bwhere\b/i.test(sql)) {
+        // has WHERE -> append AND
+        sql = sql.replace(/\s*;+\s*$/g, "");
+        sql += " AND channel_id = :channel_id";
+      } else {
+        // no WHERE -> add one
+        sql = sql.replace(/\s*;+\s*$/g, "");
+        sql += " WHERE channel_id = :channel_id";
+      }
+    }
+
+    // Ensure ORDER BY timestamp (if none exists)
+    if (!/\border\s+by\b/i.test(sql)) {
+      sql += " ORDER BY timestamp ASC";
+    }
+
+    // Ensure LIMIT (tool also adds a default, but we enforce here so the LLM's first try passes)
+    if (!/\blimit\s+\d+/i.test(sql)) {
+      sql += " LIMIT 200";
+    }
+
+    argsObj.sql = sql;
+    // Make sure we keep bindings object around (tool will fill channel_id value itself)
+    if (!argsObj.bindings || typeof argsObj.bindings !== "object") {
+      argsObj.bindings = {};
+    }
+
+    return { ...toolFn, arguments: JSON.stringify(argsObj) };
+  } catch {
+    return toolFn; // don't break if parsing fails
+  }
 }
 
 /**
@@ -166,14 +211,26 @@ async function getAIResponse(
           }
 
           try {
-            // *** HIER WICHTIG: runtime mit channel_id an das Tool geben ***
+            // *** RUNTIME mit channel_id an das Tool geben ***
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
+
+            // *** getHistory First-Try Fix: fehlende :channel_id / ORDER BY / LIMIT automatisch ergänzen
+            let toolFnToCall = toolCall.function;
+            if (fnName === "getHistory") {
+              toolFnToCall = fixupGetHistoryArgs(toolFnToCall);
+            } else {
+              // defensive: sorge dafür, dass arguments mindestens "{}" ist
+              if (toolFnToCall && typeof toolFnToCall.arguments === "undefined") {
+                toolFnToCall = { ...toolFnToCall, arguments: "{}" };
+              }
+            }
+
+            const toolResult = await toolFunction(toolFnToCall, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
-            await reportError(toolError, null, `TOOL_${fnName.toUpperCase()}`);
-            replyTool({ error: emsg, tool: fnName });
+            await reportError(toolError, null, `TOOL_${fnName?.toUpperCase?.() || "UNKNOWN"}`);
+            replyTool({ error: emsg, tool: fnName || "unknown" });
           }
         }
       }
