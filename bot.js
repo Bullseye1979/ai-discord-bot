@@ -586,7 +586,7 @@ client.on("messageCreate", async (message) => {
     reportError(err, null, "LOGIN", { emit: "console" });
   }
 })();
-client.once("ready", () => {
+client.once("clientReady", () => {
   try {
     setBotPresence(client, "✅ Started", "online");
     initCron(client, contextStorage);

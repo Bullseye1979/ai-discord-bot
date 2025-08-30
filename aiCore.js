@@ -1,5 +1,6 @@
-// aiCore.js — refactored v2.0 (getHistory first-try fix: inject :channel_id, ORDER BY, LIMIT)
+// aiCore.js — refactored v2.1
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
+// Fixes first-try getHistory over voice by injecting :channel_id into SQL AND bindings.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -26,49 +27,48 @@ function cleanOpenAIName(role, name) {
   return s;
 }
 
-/** Best-effort fixups for getHistory tool calls (so the first attempt works). */
-function fixupGetHistoryArgs(toolFn) {
-  try {
-    const argsObj =
-      typeof toolFn.arguments === "string"
-        ? JSON.parse(toolFn.arguments || "{}")
-        : (toolFn.arguments || {});
-    let sql = String(argsObj.sql || "").trim();
-    if (!sql) return toolFn; // nothing to do
+/** getHistory: ensure :channel_id in SQL + ORDER BY + LIMIT */
+function fixupGetHistorySql(sql) {
+  let out = String(sql || "").trim().replace(/\s*;+\s*$/g, "");
+  if (!out) return out;
 
-    // Ensure :channel_id is present in the WHERE
-    if (!/:channel_id\b/i.test(sql)) {
-      if (/\bwhere\b/i.test(sql)) {
-        // has WHERE -> append AND
-        sql = sql.replace(/\s*;+\s*$/g, "");
-        sql += " AND channel_id = :channel_id";
-      } else {
-        // no WHERE -> add one
-        sql = sql.replace(/\s*;+\s*$/g, "");
-        sql += " WHERE channel_id = :channel_id";
-      }
-    }
-
-    // Ensure ORDER BY timestamp (if none exists)
-    if (!/\border\s+by\b/i.test(sql)) {
-      sql += " ORDER BY timestamp ASC";
-    }
-
-    // Ensure LIMIT (tool also adds a default, but we enforce here so the LLM's first try passes)
-    if (!/\blimit\s+\d+/i.test(sql)) {
-      sql += " LIMIT 200";
-    }
-
-    argsObj.sql = sql;
-    // Make sure we keep bindings object around (tool will fill channel_id value itself)
-    if (!argsObj.bindings || typeof argsObj.bindings !== "object") {
-      argsObj.bindings = {};
-    }
-
-    return { ...toolFn, arguments: JSON.stringify(argsObj) };
-  } catch {
-    return toolFn; // don't break if parsing fails
+  if (!/:channel_id\b/i.test(out)) {
+    // add WHERE/AND channel_id filter
+    out += /\bwhere\b/i.test(out)
+      ? " AND channel_id = :channel_id"
+      : " WHERE channel_id = :channel_id";
   }
+  if (!/\border\s+by\b/i.test(out)) {
+    out += " ORDER BY timestamp ASC";
+  }
+  if (!/\blimit\s+\d+/i.test(out)) {
+    out += " LIMIT 200";
+  }
+  return out;
+}
+
+/** getHistory: ensure args.arguments JSON has sql+bindings.channel_id */
+function fixupGetHistoryArgs(toolFn, runtime, ctxChannelId) {
+  const safeChannelId =
+    (runtime && runtime.channel_id) ||
+    ctxChannelId ||
+    null;
+
+  const argsObj =
+    typeof toolFn.arguments === "string"
+      ? (toolFn.arguments ? JSON.parse(toolFn.arguments) : {})
+      : (toolFn.arguments || {});
+
+  argsObj.sql = fixupGetHistorySql(argsObj.sql || "");
+  if (!argsObj.bindings || typeof argsObj.bindings !== "object") {
+    argsObj.bindings = {};
+  }
+  // Hard inject binding so the tool never complains on first try
+  if (safeChannelId && !argsObj.bindings.channel_id) {
+    argsObj.bindings.channel_id = String(safeChannelId);
+  }
+
+  return { ...toolFn, arguments: JSON.stringify(argsObj) };
 }
 
 /**
@@ -90,8 +90,7 @@ async function getAIResponse(
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
-    // Arbeitskopien des Kontexts (Antwort-Kontext + Handover für Tools)
-    // WICHTIG: channelId mitgeben, damit Tools (getHistory) die :channel_id erkennen
+    // Arbeitskopien (channelId mitgeben!)
     const context = new Context(
       "",
       "",
@@ -139,7 +138,7 @@ async function getAIResponse(
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
     do {
-      // Nachrichten für API aufbereiten
+      // Nachrichten für API
       const messagesToSend = context.messages.map((m) => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
@@ -205,31 +204,33 @@ async function getAIResponse(
           };
 
           if (!toolFunction) {
-            const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
-            replyTool(msg);
+            replyTool(`[ERROR]: Tool '${fnName}' not available or arguments invalid.`);
             continue;
           }
 
           try {
-            // *** RUNTIME mit channel_id an das Tool geben ***
-            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            // Robust channel_id best-effort
+            const runtime = {
+              channel_id:
+                context_orig.channelId ??
+                context.channelId ??
+                handoverContext.channelId ??
+                null
+            };
 
-            // *** getHistory First-Try Fix: fehlende :channel_id / ORDER BY / LIMIT automatisch ergänzen
-            let toolFnToCall = toolCall.function;
+            // Fixups speziell für getHistory
+            let toolFnToCall = toolCall.function || { name: fnName, arguments: "{}" };
             if (fnName === "getHistory") {
-              toolFnToCall = fixupGetHistoryArgs(toolFnToCall);
-            } else {
-              // defensive: sorge dafür, dass arguments mindestens "{}" ist
-              if (toolFnToCall && typeof toolFnToCall.arguments === "undefined") {
-                toolFnToCall = { ...toolFnToCall, arguments: "{}" };
-              }
+              toolFnToCall = fixupGetHistoryArgs(toolFnToCall, runtime, runtime.channel_id);
+            } else if (typeof toolFnToCall.arguments === "undefined") {
+              toolFnToCall = { ...toolFnToCall, arguments: "{}" };
             }
 
             const toolResult = await toolFunction(toolFnToCall, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
-            await reportError(toolError, null, `TOOL_${fnName?.toUpperCase?.() || "UNKNOWN"}`);
+            await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
             replyTool({ error: emsg, tool: fnName || "unknown" });
           }
         }
