@@ -672,7 +672,6 @@ client.on("messageCreate", async (message) => {
 
       try {
         await chatContext.collapseToSystemAndLastSummary();
-        await reportInfo(message.channel, "RAM context collapsed to: **System + last summary**.", "SUMMARY");
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE", { emit: "channel" });
         await reportInfo(message.channel, "RAM context collapse failed (kept full memory).", "SUMMARY");
@@ -681,7 +680,6 @@ client.on("messageCreate", async (message) => {
       try { await reportInfo(message.channel, "**Summary completed.**", "SUMMARY"); } catch {}
       return;
     }
-
 
     // Normal flow: explicit trigger
     if (message.author?.bot || message.webhookId) return;
@@ -694,6 +692,36 @@ client.on("messageCreate", async (message) => {
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
     if (!isTrigger) return;
 
+    // ---- block-based overrides for TYPING (matches voice behavior) ----
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const userId = String(message.author?.id || "").trim();
+
+    function pickBlockForUser() {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
+        if (!us.length) continue;
+        if (us.includes("*") && !wildcard) wildcard = b;
+        if (userId && us.includes(userId) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    }
+
+    const matchingBlock = pickBlockForUser();
+
+    let effectiveModel  = matchingBlock?.model  || channelMeta.model || "gpt-4o";
+    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
+
+    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
+    } else {
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+    // ---- /overrides ----
+
     const tokenlimit = (() => {
       const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
       const v = Number(raw);
@@ -703,13 +731,62 @@ client.on("messageCreate", async (message) => {
         : def;
     })();
 
+    // Optional strict hint if no summaries exist (parity with handler ergonomics)
+    try {
+      const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
+      if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
+        chatContext.__instr_backup = chatContext.instructions;
+        chatContext.instructions = (chatContext.instructions || "") +
+          "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
+          "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
+      }
+    } catch {}
+
+    // Apply chatAppend (like speechAppend in voice)
+    const instrBackup = chatContext.instructions;
+    try {
+      const add = (channelMeta.chatAppend || "").trim();
+      if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
+    } catch {}
+
+    // (Optional) nudge if images attached
+    try {
+      const imageUrls = [];
+      if (message.attachments?.size > 0) {
+        for (const att of message.attachments.values()) {
+          const ct = (att.contentType || att.content_type || "").toLowerCase();
+          const isImageCT  = ct.startsWith("image/");
+          const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
+          if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
+        }
+      }
+      if (imageUrls.length) {
+        const hasGetImageTool =
+          Array.isArray(chatContext.tools) &&
+          chatContext.tools.some(t => (t.function?.name || t.name) === "getImage");
+        const hint =
+          "\n\n[IMAGE UPLOAD]\n" +
+          imageUrls.map(u => `- ${u}`).join("\n") +
+          "\nTask: Describe what is shown in these images." +
+          (hasGetImageTool ? " You may use the `getImage` tool." : "");
+        chatContext.instructions = (chatContext.instructions || "") + hint;
+      }
+    } catch {}
+
     const output = await getAIResponse(
       chatContext,
       tokenlimit,
       1000,
-      channelMeta.model || "gpt-4o",
-      channelMeta.apikey || null
+      effectiveModel,
+      effectiveApiKey
     );
+
+    // restore instructions if we touched them
+    try { chatContext.instructions = instrBackup ?? chatContext.instructions; } catch {}
+    try { if (typeof chatContext.__instr_backup === "string") {
+      chatContext.instructions = chatContext.__instr_backup;
+      delete chatContext.__instr_backup;
+    }} catch {}
 
     if (output && String(output).trim()) {
       await setReplyAsWebhookEmbed(message, output, {
