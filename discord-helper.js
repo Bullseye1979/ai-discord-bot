@@ -1,4 +1,6 @@
-// discord-helper.js — refactored v3.1 (avatar cache-busting, strict channel-only config, safe URLs)
+// discord-helper.js — refactored v3.3
+// Avatar aus Channel-Config-Prompt (+ Persona/Name-Addendum), Cache-Busting, strict channel-only config, safe URLs
+
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -43,39 +45,38 @@ function buildPublicAvatarUrl(channelId, withVersion = true) {
   return withVersion ? `${base}?v=${v}` : base;
 }
 
-/** Avatar-Prompt speziell für Bot-Icons */
-async function buildVisualPromptFromPersona(personaText, channelMeta = {}) {
+/** Endgültigen Avatar-Prompt aufbauen:
+ *  1) Primär: channelMeta.avatarPrompt / imagePrompt (wie in der Config)
+ *  2) Zusatzinfos: Botname, Persona (kurz), und harte Discord-Avatar-Constraints
+ *  3) Fallback: sehr kurzer generischer Prompt
+ */
+async function buildAvatarPrompt(channelMeta = {}) {
   try {
-    const { getAI } = require("./aiService.js");
-    const botname = (channelMeta?.botname || channelMeta?.name || "bot").toString().trim();
+    const botname = String(channelMeta?.botname || channelMeta?.name || "bot").trim();
+    const persona = String(channelMeta?.persona || "").trim();
 
-    const sys = [
-      "You convert assistant persona + bot context into ONE concise visual prompt for a DISCORD BOT AVATAR / ICON.",
-      "- style: flat vector illustration, clean lines, iconic silhouette",
-      "- composition: square, head-and-shoulders, centered, neutral background",
-      "- mood: friendly, trustworthy; readable at 64–128 px",
-      "- color: cohesive limited palette; subtle soft lighting OK",
-      "- FORBID: text, letters, numbers, watermarks, logos, brand marks, frames, UI mockups",
-      "- output ≤ 80 words, English",
-      "End with: 'square avatar, centered, flat vector, high contrast, no text, neutral background'."
-    ].join("\n");
+    const baseFromConfig =
+      (typeof channelMeta?.avatarPrompt === "string" && channelMeta.avatarPrompt.trim()) ||
+      (typeof channelMeta?.imagePrompt === "string" && channelMeta.imagePrompt.trim()) ||
+      "";
 
-    const user = [
-      `Bot name: ${botname}`,
-      personaText ? `Persona:\n${personaText.trim()}` : "Persona: (not provided)",
-      "Create the final avatar prompt now."
-    ].join("\n\n");
+    const constraints =
+      "Discord BOT avatar / icon; square avatar, centered, readable at 64–128 px; " +
+      "flat or minimal vector style; cohesive limited palette; high contrast; neutral/solid background; " +
+      "no letters; no numbers; no logos; no UI; no watermark";
 
-    const ctx = { messages: [{ role: "system", content: sys }, { role: "user", content: user }] };
-    const prompt = (await getAI(ctx, 220, "gpt-4o-mini"))?.trim();
-    return (
-      prompt ||
-      `Minimal, friendly ${botname} mascot (head-and-shoulders), cohesive limited colors, clean vector lines; ` +
-      `square avatar, centered, flat vector, high contrast, no text, neutral background`
-    );
+    if (baseFromConfig) {
+      const personaLine = persona ? ` (inspired by persona: ${persona.slice(0, 160)})` : "";
+      return `${baseFromConfig} — for ${botname}; ${constraints}${personaLine ? "; " + personaLine : ""}`;
+    }
+
+    // Minimaler Fallback, falls keine Vorgabe in der Config steht
+    const personaHint = persona ? `, subtle hints from persona: ${persona.slice(0, 120)}` : "";
+    return `Minimal, friendly ${botname} mascot head-and-shoulders; clean vector lines${personaHint}; ${constraints}`;
   } catch (err) {
     await reportError(err, null, "BUILD_AVATAR_PROMPT");
-    return `Minimal, friendly bot mascot head-and-shoulders, cohesive limited colors, clean vector lines; square avatar, centered, flat vector, high contrast, no text, neutral background`;
+    return "Minimal, friendly bot mascot; clean vector lines; " +
+           "Discord BOT avatar / icon; square, centered, high contrast, neutral background; no text, no logos";
   }
 }
 
@@ -90,14 +91,12 @@ async function ensureChannelAvatar(channelId, channelMeta) {
     if (fs.existsSync(file)) return buildPublicAvatarUrl(channelId, true);
 
     if (_avatarInFlight.has(channelId)) {
-      // parallel wartend
       await _avatarInFlight.get(channelId).catch(() => {});
       return buildPublicAvatarUrl(fs.existsSync(file) ? channelId : "default", true);
     }
 
     const p = (async () => {
-      const persona = (channelMeta?.persona || "").trim();
-      const visualPrompt = await buildVisualPromptFromPersona(persona, channelMeta);
+      const visualPrompt = await buildAvatarPrompt(channelMeta || {});
       try { await fs.promises.writeFile(sidecar, visualPrompt, "utf8"); } catch {}
       const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
       const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
@@ -128,6 +127,7 @@ function getChannelConfig(channelId) {
         instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
         max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
+        avatarPrompt: "", imagePrompt: ""
       };
     }
 
@@ -169,6 +169,10 @@ function getChannelConfig(channelId) {
     const chatAppend = typeof cfgChatAppend === "string" ? cfgChatAppend.trim() : "";
     const speechAppend = typeof cfgSpeechAppend === "string" ? cfgSpeechAppend.trim() : "";
 
+    // Avatar-Prompt aus Config mitgeben (für ensureChannelAvatar → buildAvatarPrompt)
+    const avatarPrompt = typeof cfg.avatarPrompt === "string" ? cfg.avatarPrompt : "";
+    const imagePrompt = typeof cfg.imagePrompt === "string" ? cfg.imagePrompt : "";
+
     const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
 
     const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
@@ -181,6 +185,7 @@ function getChannelConfig(channelId) {
       tools: ctxTools, toolRegistry, blocks, summaryPrompt,
       max_user_messages, hasConfig: true, summariesEnabled, admins,
       max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
+      avatarPrompt, imagePrompt
     };
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
@@ -189,6 +194,7 @@ function getChannelConfig(channelId) {
       instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
+      avatarPrompt: "", imagePrompt: ""
     };
   }
 }
@@ -366,14 +372,13 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta); // bereits versioniert
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || "AI"));
     if (!hook) {
       hook = await hookChannel.createWebhook({ name: botname || "AI", avatar: personaAvatarUrl || undefined });
     } else {
-      // Default-Avatar des Hooks aktualisieren (hilft bei späteren Sends ohne avatarURL)
       try { await hook.edit({ avatar: personaAvatarUrl }); } catch {}
     }
 
@@ -382,7 +387,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
       await hook.send({
         content: p,
         username: botname || "AI",
-        avatarURL: personaAvatarUrl || undefined, // per-Message override (versioned URL!)
+        avatarURL: personaAvatarUrl || undefined,
         allowedMentions: { parse: [] },
         threadId: isThread ? message.channel.id : undefined
       });
@@ -403,7 +408,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta); // versioned
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
@@ -414,19 +419,17 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
     }
 
     const links = collectUrlsWithLabels(aiText);
-    const firstImage = await (async () => {
-      const c = collectUrlsWithLabels(aiText);
-      return await (async (list) => {
-        if (!Array.isArray(list) || list.length === 0) return null;
-        const mdImg = list.find(l => l.kind === "md_image"); if (mdImg) return mdImg;
-        const withExt = list.find(l => l.isImageExt); if (withExt) return withExt;
-        for (const l of list) { try { const ct = await headContentType(l.url); if (ct && /^image\//i.test(ct)) return l; } catch {} }
-        return null;
-      })(c);
-    })();
+
+    // bestes Bild (falls vorhanden)
+    const firstImage = await (async (list) => {
+      if (!Array.isArray(list) || list.length === 0) return null;
+      const mdImg = list.find(l => l.kind === "md_image"); if (mdImg) return mdImg;
+      const withExt = list.find(l => l.isImageExt); if (withExt) return withExt;
+      for (const l of list) { try { const ct = await headContentType(l.url); if (ct && /^image\//i.test(ct)) return l; } catch {} }
+      return null;
+    })(links);
 
     const bodyText = prepareTextForEmbed(aiText);
-
     const rest = links.filter(l => !(firstImage && l.url === firstImage.url));
     const bulletsBlock = rest.length
       ? "\n\n**More links**\n" + rest.map(l => {
