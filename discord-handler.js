@@ -1,4 +1,4 @@
-// discord-handler.js — refactored v2.9 + TOOLS_ACTIVE hack
+// discord-handler.js — refactored v3.0 (voice-tools fix)
 // Discord AI flow: routing to AI, token limits, tool setup, voice join, and gated TTS playback.
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
@@ -148,15 +148,6 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
     }
 
-    // --- TOOLS_ACTIVE hack (INFO): zeige aktive Tool-Namen vor dem OpenAI-Call
-    const activeToolNames = (chatContext.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean);
-    await reportError(
-      new Error(`Active tools: ${activeToolNames.join(", ") || "(none)"}`),
-      message?.channel,
-      "TOOLS_ACTIVE",
-      "INFO"
-    );
-
     // AI call
     const output = await getAIResponse(
       chatContext,
@@ -184,6 +175,108 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       if (typeof _instrBackup === "string") chatContext.instructions = _instrBackup;
     } catch {}
     state.isAIProcessing--;
+  }
+}
+
+/** Handle one voice transcript event → AI reply → webhook post → optional TTS */
+async function handleVoiceTranscriptDirect(evt, client, storage) {
+  let ch = null;
+  let chatContext = null;
+  try {
+    ch = await client.channels.fetch(evt.channelId).catch(() => null);
+    if (!ch) return;
+
+    if (voiceBusy.get(evt.channelId)) {
+      try { await ch.send("⏳ I’m answering already — please wait a moment."); } catch {}
+      return;
+    }
+
+    const channelMeta = getChannelConfig(evt.channelId);
+    chatContext = ensureChatContextForChannel(evt.channelId, storage, channelMeta);
+
+    if (typeof chatContext.setUserWindow === "function") {
+      chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
+    }
+
+    // --- Block-/Tool-Selection für Voice (vorher fehlte das) ---
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const speakerName = String(evt.speaker || "").trim().toLowerCase();
+
+    function pickBlockForSpeaker() {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const sp = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).trim().toLowerCase()) : [];
+        if (!sp.length) continue;
+        if (sp.includes("*") && !wildcard) wildcard = b;
+        if (speakerName && sp.includes(speakerName) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    }
+
+    const matchingBlock = pickBlockForSpeaker();
+
+    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
+    } else {
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+
+    const tokenlimit = (() => {
+      const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
+      const v = Number(raw);
+      const def = 1024;
+      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+    })();
+
+    const sequenceLimit = 1;
+    const instrBackup = chatContext.instructions;
+    try {
+      const add = (channelMeta.speechAppend || "").trim();
+      if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
+    } catch {}
+
+    voiceBusy.set(evt.channelId, true);
+
+    let replyText = "";
+    replyText = await getAIResponse(
+      chatContext,
+      tokenlimit,
+      sequenceLimit,
+      (matchingBlock && matchingBlock.model) || channelMeta.model || undefined,
+      (matchingBlock && matchingBlock.apikey) || channelMeta.apikey || null
+    );
+    replyText = (replyText || "").trim();
+    if (!replyText) return;
+
+    try {
+      await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
+    } catch {}
+
+    try {
+      const msgShim = { channel: ch };
+      await setReplyAsWebhookEmbed(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+    } catch (e) {
+      await reportError(e, ch, "VOICE_WEBHOOK_SEND");
+      try { await ch.send(replyText); } catch {}
+    }
+
+    try {
+      const conn = getVoiceConnection(evt.guildId);
+      if (conn) {
+        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
+      }
+    } catch (e) {
+      await reportError(e, ch, "VOICE_TTS");
+    } finally {
+      try { chatContext.instructions = instrBackup; } catch {}
+    }
+  } catch (err) {
+    await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT");
+  } finally {
+    voiceBusy.set(evt.channelId, false);
   }
 }
 
@@ -268,4 +361,6 @@ module.exports = {
   getProcessAIRequest,
   setVoiceChannel,
   setTTS,
+  // exportiert, weil vom Bot benutzt:
+  handleVoiceTranscriptDirect,
 };
