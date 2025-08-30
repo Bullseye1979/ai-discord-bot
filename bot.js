@@ -1,4 +1,4 @@
-// bot.js — refactored v3.8 (Info-Ausgaben über error.js)
+// bot.js — refactored v3.9 (chat path uses unified handler; info via error.js)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -25,6 +25,7 @@ const {
 } = require("./discord-helper.js");
 const { reportError, reportInfo } = require("./error.js");
 const { getToolRegistry } = require("./tools.js"); // voice block toolset
+const { getProcessAIRequest } = require("./discord-handler.js"); // unified handler (chat & voice blocks/tools)
 
 const client = new Client({
   intents: [
@@ -552,7 +553,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Normal flow: gated by explicit trigger name
+    // Normal flow: gated by explicit trigger name (use unified handler so chat gets block tools/model/apikey like voice)
     if (message.author?.bot || message.webhookId) return;
     const authorId = String(message.author?.id || "");
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
@@ -563,25 +564,15 @@ client.on("messageCreate", async (message) => {
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
     if (!isTrigger) return;
 
-    const tokenlimit = (() => {
-      const raw = (channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat);
-      const v = Number(raw);
-      const def = 4096;
-      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
-    })();
-
-    const output = await getAIResponse(
+    const state = { isAIProcessing: 0 };
+    await getProcessAIRequest(
+      message,
       chatContext,
-      tokenlimit,
-      1000,
+      client,
+      state,
       channelMeta.model || "gpt-4o",
       channelMeta.apikey || null
     );
-
-    if (output && String(output).trim()) {
-      await setReplyAsWebhookEmbed(message, output, { botname: channelMeta.botname, color: 0x00b3ff });
-      await chatContext.add("assistant", channelMeta?.botname || "AI", output);
-    }
   } catch (err) {
     await reportError(err, message?.channel, "ON_MESSAGE_CREATE", { emit: "channel" });
   }

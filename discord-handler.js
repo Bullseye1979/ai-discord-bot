@@ -1,4 +1,4 @@
-// discord-handler.js — refactored v3.3 (info via error.js, voice tools kept)
+// discord-handler.js — refactored v3.4 (chat tools fixed: unified block match + fallback, info via error.js)
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const {
   setMessageReaction,
@@ -62,7 +62,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     if (isSpeakerMsg) markTTSAllowedForChannel(effectiveChannelId);
 
-    // Block matching
+    // --- Unified block matching: try user → speaker → wildcard, else fallback to channel tools/model
     const speakerName = (message.member?.displayName || message.author?.username || "").trim().toLowerCase();
     const userId = String(message.author?.id || "").trim();
 
@@ -88,13 +88,21 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       return exact || wildcard || null;
     }
 
-    const matchingBlock = isSpeakerMsg ? pickBlockForSpeaker() : pickBlockForUser();
-    if (!matchingBlock) { await setMessageReaction(message, "❌"); await reportInfo(message.channel, "No matching block for this user/speaker.", "BLOCKS"); return; }
+    const byUser = pickBlockForUser();
+    const bySpeaker = pickBlockForSpeaker();
+    const wildcard = blocks.find(b =>
+      (Array.isArray(b.user) && b.user.includes("*")) ||
+      (Array.isArray(b.speaker) && b.speaker.includes("*"))
+    ) || null;
 
-    const effectiveModel  = matchingBlock.model  || model;
-    const effectiveApiKey = matchingBlock.apikey || apiKey;
+    // If this is a text message, prefer user match; if voice/webhook, prefer speaker match.
+    const matchingBlock = (isSpeakerMsg ? (bySpeaker || byUser || wildcard) : (byUser || bySpeaker || wildcard)) || null;
 
-    if (Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+    // Effective model/apikey; tools come from block if present, else from channel config.
+    const effectiveModel  = (matchingBlock?.model  || model);
+    const effectiveApiKey = (matchingBlock?.apikey || apiKey);
+
+    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
       chatContext.toolRegistry = blockRegistry;
@@ -102,6 +110,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.tools = channelMeta.tools;
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
+    // --- /Unified block matching
 
     const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
     if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
