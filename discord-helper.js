@@ -1,7 +1,4 @@
-// discord-helper.js — refactored v3.0
-// Helfer für Discord-Bot: Channel-Config laden (nur per-channel JSON),
-// Webhook-Replies (chunked/Embeds), TTS, Voice-Capture, kleine Utilities.
-
+// discord-helper.js — refactored v3.1 (avatar cache-busting, strict channel-only config, safe URLs)
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -18,39 +15,48 @@ require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
-// State for voice & TTS
+// State
 const activeRecordings = new Map();
 const _avatarInFlight = new Map();
 const queueMap = new Map();
 const playerMap = new Map();
 
-/** HTTP/HTTPS Basis für öffentliche Links (Dokumente/Avatare) */
+/** Base-URL für öffentliche Dateien */
 function publicBase() {
   const base = (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/$/, "");
   return base || "https://ralfreschke.de";
 }
 
-/** Avatar-URL konstruieren (immer http/https; nie relative Pfade) */
-function buildPublicAvatarUrl(channelId) {
-  return `${publicBase()}/documents/avatars/${channelId}.png`;
+/** mtime der Avatar-Datei (ms) oder 0 */
+function avatarMtimeMs(channelId) {
+  try {
+    const p = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
+    const st = fs.statSync(p);
+    return Math.floor(st.mtimeMs || 0);
+  } catch { return 0; }
 }
 
-/* Avatar-Prompt aus Persona/Context erzeugen – gezielt als Discord-Bot-Icon */
+/** Public-URL für Avatar; withVersion => ?v=mtime als Cache-Buster */
+function buildPublicAvatarUrl(channelId, withVersion = true) {
+  const v = withVersion ? avatarMtimeMs(channelId) : 0;
+  const base = `${publicBase()}/documents/avatars/${channelId}.png`;
+  return withVersion ? `${base}?v=${v}` : base;
+}
+
+/** Avatar-Prompt speziell für Bot-Icons */
 async function buildVisualPromptFromPersona(personaText, channelMeta = {}) {
   try {
     const { getAI } = require("./aiService.js");
     const botname = (channelMeta?.botname || channelMeta?.name || "bot").toString().trim();
 
     const sys = [
-      "You convert an assistant persona + bot/channel context into ONE concise visual prompt",
-      "for a DISCORD BOT AVATAR / ICON.",
-      "Hard rules:",
-      "- style: flat vector illustration, clean lines, high contrast, iconic silhouette",
-      "- composition: square, head-and-shoulders (centered), neutral background",
+      "You convert assistant persona + bot context into ONE concise visual prompt for a DISCORD BOT AVATAR / ICON.",
+      "- style: flat vector illustration, clean lines, iconic silhouette",
+      "- composition: square, head-and-shoulders, centered, neutral background",
       "- mood: friendly, trustworthy; readable at 64–128 px",
-      "- color: cohesive limited palette; avoid harsh gradients",
-      "- NO: text, letters, numbers, watermarks, logos, brand marks, frames, UI mockups",
-      "- output ~80 words max, in English",
+      "- color: cohesive limited palette; subtle soft lighting OK",
+      "- FORBID: text, letters, numbers, watermarks, logos, brand marks, frames, UI mockups",
+      "- output ≤ 80 words, English",
       "End with: 'square avatar, centered, flat vector, high contrast, no text, neutral background'."
     ].join("\n");
 
@@ -64,7 +70,7 @@ async function buildVisualPromptFromPersona(personaText, channelMeta = {}) {
     const prompt = (await getAI(ctx, 220, "gpt-4o-mini"))?.trim();
     return (
       prompt ||
-      `Minimal, friendly ${botname} mascot head-and-shoulders, cohesive limited colors, clean vector lines; ` +
+      `Minimal, friendly ${botname} mascot (head-and-shoulders), cohesive limited colors, clean vector lines; ` +
       `square avatar, centered, flat vector, high contrast, no text, neutral background`
     );
   } catch (err) {
@@ -73,58 +79,44 @@ async function buildVisualPromptFromPersona(personaText, channelMeta = {}) {
   }
 }
 
-/* Stop and dispose the TTS player for a guild */
-function resetTTSPlayer(guildId) {
-  try {
-    const p = playerMap.get(guildId);
-    if (p) {
-      try { p.stop(true); } catch {}
-      playerMap.delete(guildId);
-    }
-  } catch (err) {
-    reportError(err, null, "RESET_TTS_PLAYER");
-  }
-}
-
-/* Clear internal recording flag to arm capture on next join */
-function resetRecordingFlag(guildId) {
-  try {
-    activeRecordings.delete(guildId);
-  } catch (err) {
-    reportError(err, null, "RESET_RECORDING_FLAG");
-  }
-}
-
-/* Ensure a channel avatar image exists (generated from persona) and return its URL */
+/** Avatar sicherstellen (einmalig generieren) und versionierte URL zurückgeben */
 async function ensureChannelAvatar(channelId, channelMeta) {
   try {
     const dir = path.join(__dirname, "documents", "avatars");
     const file = path.join(dir, `${channelId}.png`);
     const sidecar = path.join(dir, `${channelId}.prompt.txt`);
-
     await fs.promises.mkdir(dir, { recursive: true });
 
-    if (fs.existsSync(file)) return buildPublicAvatarUrl(channelId);
+    if (fs.existsSync(file)) return buildPublicAvatarUrl(channelId, true);
 
-    const persona = (channelMeta?.persona || "").trim();
-    const visualPrompt = await buildVisualPromptFromPersona(persona, channelMeta);
+    if (_avatarInFlight.has(channelId)) {
+      // parallel wartend
+      await _avatarInFlight.get(channelId).catch(() => {});
+      return buildPublicAvatarUrl(fs.existsSync(file) ? channelId : "default", true);
+    }
 
-    // Prompt neben der PNG speichern (zur Nachvollziehbarkeit)
-    try { await fs.promises.writeFile(sidecar, visualPrompt, "utf8"); } catch {}
+    const p = (async () => {
+      const persona = (channelMeta?.persona || "").trim();
+      const visualPrompt = await buildVisualPromptFromPersona(persona, channelMeta);
+      try { await fs.promises.writeFile(sidecar, visualPrompt, "utf8"); } catch {}
+      const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
+      const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
+      await fs.promises.writeFile(file, Buffer.from(res.data));
+    })();
 
-    const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
-    const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
-    await fs.promises.writeFile(file, Buffer.from(res.data));
+    _avatarInFlight.set(channelId, p);
+    await p;
+    _avatarInFlight.delete(channelId);
 
-    return buildPublicAvatarUrl(channelId);
+    return buildPublicAvatarUrl(channelId, true);
   } catch (err) {
     _avatarInFlight.delete(channelId);
     await reportError(err, null, "ENSURE_CHANNEL_AVATAR");
-    return buildPublicAvatarUrl("default");
+    return buildPublicAvatarUrl("default", true);
   }
 }
 
-/* Channel-Config NUR aus channel-config/<channelId>.json laden (kein default.json) */
+/** Channel-Config ausschließlich aus channel-config/<channelId>.json */
 function getChannelConfig(channelId) {
   try {
     const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
@@ -132,7 +124,7 @@ function getChannelConfig(channelId) {
     if (!hasConfigFile) {
       return {
         name: "", botname: "AI", voice: "", persona: "",
-        avatarUrl: buildPublicAvatarUrl("default"),
+        avatarUrl: buildPublicAvatarUrl("default", true),
         instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
         max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
@@ -180,7 +172,7 @@ function getChannelConfig(channelId) {
     const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
 
     const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-    const avatarUrl = fs.existsSync(avatarPath) ? buildPublicAvatarUrl(channelId) : buildPublicAvatarUrl("default");
+    const avatarUrl = fs.existsSync(avatarPath) ? buildPublicAvatarUrl(channelId, true) : buildPublicAvatarUrl("default", true);
 
     const summariesEnabled = !!String(summaryPrompt || "").trim();
 
@@ -193,7 +185,7 @@ function getChannelConfig(channelId) {
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
     return {
-      name: "", botname: "AI", voice: "", persona: "", avatarUrl: buildPublicAvatarUrl("default"),
+      name: "", botname: "AI", voice: "", persona: "", avatarUrl: buildPublicAvatarUrl("default", true),
       instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
@@ -201,7 +193,7 @@ function getChannelConfig(channelId) {
   }
 }
 
-/* Split plain text into safe Discord message chunks (<=2000 chars) */
+/** Split long text into <=2000 char chunks for Discord */
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -230,26 +222,22 @@ function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   return chunks.flatMap(hardSplit);
 }
 
-/* Send long content to a channel using chunking */
+/** Send chunked message */
 async function sendChunked(channel, content) {
   try {
     const parts = splitIntoChunks(content);
-    for (const p of parts) {
-      await channel.send({ content: p });
-    }
+    for (const p of parts) await channel.send({ content: p });
   } catch (err) {
     await reportError(err, channel, "SEND_CHUNKED");
   }
 }
 
-/* Post a list of summaries as separate messages (with optional header) */
+/** Post summaries list */
 async function postSummariesIndividually(channel, summaries, headerPrefix = null) {
   try {
     for (let i = 0; i < summaries.length; i++) {
       const header =
-        headerPrefix
-          ? `${headerPrefix} ${i + 1}/${summaries.length}`
-          : `**Summary ${i + 1}/${summaries.length}**`;
+        headerPrefix ? `${headerPrefix} ${i + 1}/${summaries.length}` : `**Summary ${i + 1}/${summaries.length}**`;
       await sendChunked(channel, `${header}\n\n${summaries[i]}`);
     }
   } catch (err) {
@@ -257,20 +245,17 @@ async function postSummariesIndividually(channel, summaries, headerPrefix = null
   }
 }
 
-/* Set or update the bot's Discord presence */
+/** Presence */
 async function setBotPresence(client, activityText = "✅ Ready", status = "online", activityType = 0) {
   try {
     if (!client?.user) return;
-    await client.user.setPresence({
-      activities: [{ name: activityText, type: activityType }],
-      status,
-    });
+    await client.user.setPresence({ activities: [{ name: activityText, type: activityType }], status });
   } catch (err) {
     reportError(err, null, "SET_BOT_PRESENCE");
   }
 }
 
-/* Add the user message (and any attachments) into the chat context */
+/** Add user message (attachments included) to context */
 async function setAddUserMessage(message, chatContext) {
   try {
     const raw = (message?.content || "").trim();
@@ -282,25 +267,21 @@ async function setAddUserMessage(message, chatContext) {
       content = `${links}\n${content}`.trim();
     }
 
-    const senderName =
-      message.member?.displayName ||
-      message.author?.username ||
-      "user";
-
+    const senderName = message.member?.displayName || message.author?.username || "user";
     await chatContext.add("user", senderName, content);
   } catch (err) {
     await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE");
   }
 }
 
-/* Create a temp file path */
+/** Temp file */
 async function makeTmpFile(ext = ".wav") {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
   const file = path.join(dir, `${Date.now()}${ext}`);
   return { dir, file };
 }
 
-/* Convert PCM stream to WAV using ffmpeg */
+/** PCM → WAV via ffmpeg */
 function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
   return new Promise(async (resolve, reject) => {
     try {
@@ -313,24 +294,20 @@ function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
         .save(file)
         .on("end", () => resolve({ dir, file }))
         .on("error", reject);
-    } catch (err) {
-      reject(err);
-    }
+    } catch (err) { reject(err); }
   });
 }
 
-/* Resolve a member's display name for a guild */
+/** Resolve speaker display name */
 async function resolveSpeakerName(client, guildId, userId) {
   try {
     const g = await client.guilds.fetch(guildId);
     const m = await g.members.fetch(userId).catch(() => null);
     return m?.displayName || m?.user?.username || "Unknown";
-  } catch {
-    return "Unknown";
-  }
+  } catch { return "Unknown"; }
 }
 
-/* Add or replace a simple status reaction on a message (⏳/✅/❌) */
+/** Status reaction */
 async function setMessageReaction(message, emoji) {
   try {
     const STATUS = ["⏳", "✅", "❌"];
@@ -338,19 +315,50 @@ async function setMessageReaction(message, emoji) {
     if (!me) return;
 
     const toRemove = message.reactions?.cache?.filter(r => STATUS.includes(r.emoji?.name)) || [];
-    for (const r of toRemove.values()) {
-      try { await r.users.remove(me.id); } catch {}
-    }
+    for (const r of toRemove.values()) { try { await r.users.remove(me.id); } catch {} }
 
-    if (emoji && STATUS.includes(emoji)) {
-      await message.react(emoji).catch(() => {});
-    }
+    if (emoji && STATUS.includes(emoji)) { await message.react(emoji).catch(() => {}); }
   } catch (err) {
     await reportError(err, message?.channel, "SET_MESSAGE_REACTION");
   }
 }
 
-/* Reply via webhook mit Text (chunked) */
+/** Helpers for embeds */
+function collectUrlsWithLabels(text) {
+  const out = []; const seen = new Set();
+  const pushOnce = (url, label, kind, isImageExt) => {
+    const clean = cleanUrl(url); if (!clean || seen.has(clean)) return;
+    seen.add(clean); out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
+  };
+  String(text || "").replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => { pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url)); return ""; });
+  String(text || "").replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => { pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url)); return ""; });
+  String(text || "").replace(/https?:\/\/[^\s)]+/g, (url) => { pushOnce(url, null, "plain", looksLikeImage(url)); return ""; });
+  return out;
+}
+async function headContentType(url) {
+  try {
+    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"]; if (ct) return String(ct);
+  } catch {}
+  try {
+    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
+    try { res.data?.destroy?.(); } catch {}
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"]; if (ct) return String(ct);
+  } catch {}
+  return null;
+}
+function prepareTextForEmbed(text) {
+  let s = String(text || "");
+  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    const a = String(alt || "").trim(); return a ? `[${a}](${url})` : `<${url}>`;
+  });
+  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+  return s;
+}
+function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u); }
+function cleanUrl(u) { try { return u.replace(/[),.]+$/g, ""); } catch { return u; } }
+
+/** Reply via webhook plain text (chunked), mit Avatar-Update und Versioning */
 async function setReplyAsWebhook(message, content, { botname } = {}) {
   try {
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
@@ -358,15 +366,15 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta); // bereits versioniert
 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || "AI"));
     if (!hook) {
-      hook = await hookChannel.createWebhook({
-        name: botname || "AI",
-        avatar: personaAvatarUrl || undefined,
-      });
+      hook = await hookChannel.createWebhook({ name: botname || "AI", avatar: personaAvatarUrl || undefined });
+    } else {
+      // Default-Avatar des Hooks aktualisieren (hilft bei späteren Sends ohne avatarURL)
+      try { await hook.edit({ avatar: personaAvatarUrl }); } catch {}
     }
 
     const parts = splitIntoChunks(content);
@@ -374,7 +382,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
       await hook.send({
         content: p,
         username: botname || "AI",
-        avatarURL: personaAvatarUrl || undefined,
+        avatarURL: personaAvatarUrl || undefined, // per-Message override (versioned URL!)
         allowedMentions: { parse: [] },
         threadId: isThread ? message.channel.id : undefined
       });
@@ -385,86 +393,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
   }
 }
 
-/* Build a list of URLs (mit optional Labels) aus Text */
-function collectUrlsWithLabels(text) {
-  const out = [];
-  const seen = new Set();
-
-  const pushOnce = (url, label, kind, isImageExt) => {
-    const clean = cleanUrl(url);
-    if (!clean || seen.has(clean)) return;
-    seen.add(clean);
-    out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
-  };
-
-  String(text || "").replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url));
-    return "";
-  });
-
-  String(text || "").replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => {
-    pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url));
-    return "";
-  });
-
-  String(text || "").replace(/https?:\/\/[^\s)]+/g, (url) => {
-    pushOnce(url, null, "plain", looksLikeImage(url));
-    return "";
-  });
-
-  return out;
-}
-
-/* Choose the best image candidate from a URL list */
-async function pickFirstImageCandidate(list) {
-  if (!Array.isArray(list) || list.length === 0) return null;
-  const mdImg = list.find(l => l.kind === "md_image");
-  if (mdImg) return mdImg;
-  const withExt = list.find(l => l.isImageExt);
-  if (withExt) return withExt;
-
-  // Fallback: Content-Type prüfen
-  for (const l of list) {
-    try {
-      const ct = await headContentType(l.url);
-      if (ct && /^image\//i.test(ct)) return l;
-    } catch {}
-  }
-  return null;
-}
-
-/* Get Content-Type using HEAD (fallback GET stream) */
-async function headContentType(url) {
-  try {
-    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
-    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
-    if (ct) return String(ct);
-  } catch {}
-  try {
-    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
-    try { res.data?.destroy?.(); } catch {}
-    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
-    if (ct) return String(ct);
-  } catch {}
-  return null;
-}
-
-/* Normalize text for embed */
-function prepareTextForEmbed(text) {
-  let s = String(text || "");
-  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    const a = String(alt || "").trim();
-    return a ? `[${a}](${url})` : `<${url}>`;
-  });
-  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
-  return s;
-}
-
-/* URL-Heuristiken */
-function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u); }
-function cleanUrl(u) { try { return u.replace(/[),.]+$/g, ""); } catch { return u; } }
-
-/* Reply als Embeds (chunked) – erstes Embed mit großem Bild wenn passend */
+/** Reply via webhook as embeds (mit Avatar-Update und Versioning) */
 async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) {
   try {
     if (!aiText || !String(aiText).trim()) return;
@@ -474,19 +403,28 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta); // versioned
 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
     if (!hook) {
-      hook = await hookChannel.createWebhook({
-        name: botname || meta?.botname || "AI",
-        avatar: personaAvatarUrl || undefined,
-      });
+      hook = await hookChannel.createWebhook({ name: botname || meta?.botname || "AI", avatar: personaAvatarUrl || undefined });
+    } else {
+      try { await hook.edit({ avatar: personaAvatarUrl }); } catch {}
     }
 
     const links = collectUrlsWithLabels(aiText);
-    const firstImage = await pickFirstImageCandidate(links);
+    const firstImage = await (async () => {
+      const c = collectUrlsWithLabels(aiText);
+      return await (async (list) => {
+        if (!Array.isArray(list) || list.length === 0) return null;
+        const mdImg = list.find(l => l.kind === "md_image"); if (mdImg) return mdImg;
+        const withExt = list.find(l => l.isImageExt); if (withExt) return withExt;
+        for (const l of list) { try { const ct = await headContentType(l.url); if (ct && /^image\//i.test(ct)) return l; } catch {} }
+        return null;
+      })(c);
+    })();
+
     const bodyText = prepareTextForEmbed(aiText);
 
     const rest = links.filter(l => !(firstImage && l.url === firstImage.url));
@@ -529,9 +467,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
     });
 
     const embeds = descChunks.map((d, idx) => makeEmbed(d, idx + 1, descChunks.length));
-    if (firstImage?.url && embeds.length) {
-      embeds[0].image = { url: firstImage.url };
-    }
+    if (firstImage?.url && embeds.length) embeds[0].image = { url: firstImage.url };
 
     for (let i = 0; i < embeds.length; i += 10) {
       const slice = embeds.slice(i, i + 10);
@@ -550,7 +486,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
   }
 }
 
-/* Enqueue a TTS task to be played sequentially per guild (returns when finished) */
+/** TTS-Queueing */
 function setEnqueueTTS(guildId, task) {
   return new Promise((resolve, reject) => {
     if (!queueMap.has(guildId)) queueMap.set(guildId, []);
@@ -559,39 +495,27 @@ function setEnqueueTTS(guildId, task) {
     if (q.length === 1) setProcessTTSQueue(guildId);
   });
 }
-
-/* Process the TTS queue for a guild */
 async function setProcessTTSQueue(guildId) {
   const q = queueMap.get(guildId);
   if (!q?.length) return;
   const { task, resolve, reject } = q[0];
-  try {
-    await task();
-    resolve();
-  } catch (err) {
-    reject(err);
-  } finally {
-    q.shift();
-    if (q.length > 0) setProcessTTSQueue(guildId);
-  }
+  try { await task(); resolve(); } catch (err) { reject(err); }
+  finally { q.shift(); if (q.length > 0) setProcessTTSQueue(guildId); }
 }
 
-/* Split text into smaller parts for TTS playback  */
+/** TTS Hilfsfunktionen */
 function getSplitTextToChunks(text, maxChars = 500) {
   const sentences = String(text || "").match(/[^.!?\n]+[.!?\n]?/g) || [String(text || "")];
-  const chunks = [];
-  let current = "";
+  const chunks = []; let current = "";
   for (const s of sentences) {
-    if ((current + s).length > maxChars) {
-      if (current.trim()) chunks.push(current.trim());
-      current = s;
-    } else current += s;
+    if ((current + s).length > maxChars) { if (current.trim()) chunks.push(current.trim()); current = s; }
+    else current += s;
   }
   if (current.trim()) chunks.push(current.trim());
   return chunks;
 }
 
-/* Capture und Transkription aus Voice-Kanal – ruft Callback mit Transcript */
+/** Voice-Capture + Transkription */
 async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript) {
   try {
     if (!connection || !guildId) return;
@@ -607,12 +531,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
     const MIN_VOICED_FRAMES = 15;
     const DUP_WINDOW_MS     = Number(process.env.VOICE_DUP_WINDOW_MS || 1500);
 
-    const normText = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .replace(/[^\p{L}\p{N}]+/gu, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+    const normText = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim();
 
     const prev = activeRecordings.get(guildId);
     if (prev && prev !== connection) {
@@ -633,53 +552,32 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
     async function analyzeWav(filePath) {
       try {
         const buf = await fs.promises.readFile(filePath);
-        if (!buf || buf.length <= 44) {
-          return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
-        }
-        const pcm = buf.subarray(44);
-        const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
-
-        const sr = 48000, frame = 960; // 20ms
-        const totalFrames = Math.floor(samples.length / frame);
+        if (!buf || buf.length <= 44) return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
+        const pcm = buf.subarray(44); const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+        const sr = 48000, frame = 960; const totalFrames = Math.floor(samples.length / frame);
         if (totalFrames <= 0) return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
-
-        const rmsList = new Array(totalFrames);
-        const zcrList = new Array(totalFrames);
-
+        const rmsList = new Array(totalFrames); const zcrList = new Array(totalFrames);
         for (let f = 0; f < totalFrames; f++) {
-          const start = f * frame;
-          let sumSq = 0, zc = 0, prev = samples[start];
-          for (let i = 1; i < frame; i++) {
-            const s = samples[start + i];
-            sumSq += s * s;
-            if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) zc++;
-            prev = s;
-          }
-          const rms = Math.sqrt(sumSq / frame) / 32768;
-          const zcr = zc / (frame - 1);
+          const start = f * frame; let sumSq = 0, zc = 0, prev = samples[start];
+          for (let i = 1; i < frame; i++) { const s = samples[start + i]; sumSq += s * s; if ((s >= 0 && prev < 0) || (s < 0 && prev >= 0)) zc++; prev = s; }
+          const rms = Math.sqrt(sumSq / frame) / 32768; const zcr = zc / (frame - 1);
           rmsList[f] = rms; zcrList[f] = zcr;
         }
-
         const sortedRms = rmsList.slice().sort((a,b)=>a-b);
         const p = (arr, q) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor((arr.length - 1) * q)))];
         const noise  = Math.max(1e-6, p(sortedRms, 0.2));
         const speech = Math.max(noise + 1e-6, p(sortedRms, 0.8));
         const snrDb  = 20 * Math.log10(speech / noise);
-
         let voiced = 0;
         for (let f = 0; f < totalFrames; f++) {
           const voicedLike = rmsList[f] > noise * 2 && zcrList[f] < 0.25;
           if (voicedLike) voiced++;
         }
-
         const voicedRatio  = voiced / totalFrames;
         const voicedFrames = voiced;
         const usefulMs     = voicedFrames * 20;
-
         return { snrDb, voicedRatio, voicedFrames, totalFrames, usefulMs };
-      } catch {
-        return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
-      }
+      } catch { return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 }; }
     }
 
     receiver.speaking.removeAllListeners("start");
@@ -687,62 +585,45 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       const key = `${guildId}:${userId}`;
 
       const existing = captures.get(key);
-      if (existing?.opus) {
-        try { existing.opus.destroy(); } catch {}
-      }
+      if (existing?.opus) { try { existing.opus.destroy(); } catch {} }
 
       let killTimer = null;
       try {
-        const opus = receiver.subscribe(userId, {
-          end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS },
-        });
+        const opus = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS } });
         captures.set(key, { opus });
 
         const startedAtMs = Date.now();
-
         const pcm  = opus.pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
         const pass = new PassThrough();
         const wavPromise = writePcmToWav(pass, { rate: 48000, channels: 1 });
-
         pcm.on("data", (chunk) => pass.write(chunk));
 
-        killTimer = setTimeout(() => {
-          try { opus.destroy(); } catch {}
-        }, MAX_UTTERANCE_MS);
+        killTimer = setTimeout(() => { try { opus.destroy(); } catch {} }, MAX_UTTERANCE_MS);
 
         let finished = false;
         const finishOnce = async () => {
-          if (finished) return;
-          finished = true;
-
-          const cur = captures.get(key);
-          if (cur?.opus === opus) captures.delete(key);
-
+          if (finished) return; finished = true;
+          const cur = captures.get(key); if (cur?.opus === opus) captures.delete(key);
           if (killTimer) { clearTimeout(killTimer); killTimer = null; }
           pass.end();
 
           try {
             const { dir, file } = await wavPromise;
-
             const st = await fs.promises.stat(file).catch(() => null);
             if (!st || st.size < MIN_WAV_BYTES) return;
 
-            const latestTarget = await getLatestTarget();
-            if (!latestTarget) return;
+            const latestTarget = await getLatestTarget(); if (!latestTarget) return;
 
-            let consentOk = true;
-            try { consentOk = await hasVoiceConsent(userId, latestTarget.id); } catch {}
+            let consentOk = true; try { consentOk = await hasVoiceConsent(userId, latestTarget.id); } catch {}
             if (!consentOk) return;
 
             const { snrDb, voicedRatio, voicedFrames } = await analyzeWav(file);
             if (snrDb < MIN_SNR_DB || voicedRatio < MIN_VOICED_RATIO || voicedFrames < MIN_VOICED_FRAMES) return;
 
             const text  = await getTranscription(file, "whisper-1", "auto");
-            const clean = (text || "").trim();
-            if (!clean) return;
+            const clean = (text || "").trim(); if (!clean) return;
 
-            const norm = normText(clean);
-            const now  = Date.now();
+            const norm = normText(clean); const now  = Date.now();
             if (!setStartListening.__dups) setStartListening.__dups = new Map();
             const last = setStartListening.__dups.get(key);
             if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) return;
@@ -751,22 +632,12 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
             const speaker = await resolveSpeakerName(client, guildId, userId);
 
             if (typeof onTranscript === "function") {
-              await onTranscript({
-                guildId,
-                channelId: latestTarget.id,
-                userId,
-                speaker,
-                text: clean,
-                startedAtMs
-              });
+              await onTranscript({ guildId, channelId: latestTarget.id, userId, speaker, text: clean, startedAtMs });
             }
           } catch (err) {
             reportError(err, null, "TRANSCRIPTION_FLOW");
           } finally {
-            try {
-              const { dir } = await wavPromise;
-              await fs.promises.rm(dir, { recursive: true, force: true });
-            } catch {}
+            try { const { dir } = await wavPromise; await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
             try { opus.removeAllListeners(); } catch {}
             try { pcm.removeAllListeners(); } catch {}
           }
@@ -781,19 +652,15 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       } catch (err) {
         reportError(err, null, "VOICE_SUBSCRIBE");
         const cur = captures.get(key);
-        if (cur?.opus) {
-          try { cur.opus.removeAllListeners(); } catch {}
-        }
+        if (cur?.opus) { try { cur.opus.removeAllListeners(); } catch {} }
         captures.delete(key);
         if (killTimer) { clearTimeout(killTimer); killTimer = null; }
       }
     });
 
-    connection.on("stateChange", (oldS, newS) => {
+    connection.on("stateChange", (_oldS, newS) => {
       if (newS.status === "destroyed" || newS.status === "disconnected") {
-        if (activeRecordings.get(guildId) === connection) {
-          activeRecordings.delete(guildId);
-        }
+        if (activeRecordings.get(guildId) === connection) activeRecordings.delete(guildId);
       }
     });
   } catch (err) {
@@ -801,7 +668,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
   }
 }
 
-/* Generate speech from text and play it in sequence on a guild connection */
+/** TTS abspielen */
 async function getSpeech(connection, guildId, text, client, voice) {
   try {
     if (!connection || !text?.trim()) return;
@@ -854,6 +721,17 @@ async function getSpeech(connection, guildId, text, client, voice) {
   }
 }
 
+function resetTTSPlayer(guildId) {
+  try {
+    const p = playerMap.get(guildId);
+    if (p) { try { p.stop(true); } catch {} playerMap.delete(guildId); }
+  } catch (err) { reportError(err, null, "RESET_TTS_PLAYER"); }
+}
+function resetRecordingFlag(guildId) {
+  try { activeRecordings.delete(guildId); }
+  catch (err) { reportError(err, null, "RESET_RECORDING_FLAG"); }
+}
+
 module.exports = {
   getChannelConfig,
   setMessageReaction,
@@ -868,6 +746,6 @@ module.exports = {
   resetRecordingFlag,
   postSummariesIndividually,
   setReplyAsWebhookEmbed,
-  ensureChannelAvatar,           // exportiert für Tests/Debug
-  buildPublicAvatarUrl           // exportiert für saubere URL-Erzeugung
+  ensureChannelAvatar,
+  buildPublicAvatarUrl
 };
