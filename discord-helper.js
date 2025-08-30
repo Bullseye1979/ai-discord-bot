@@ -1,249 +1,149 @@
-// discord-helper.js — refactored v2.2
-// Minimal helper set for Discord bot: config loading, webhook replies (with chunked embeds), TTS, voice capture, and small utilities.
+// discord-helper.js — refactored v2.3 (no default persona file, central error routing)
+// Minimal helper set for Discord bot: config loading, webhook replies (with chunked embeds),
+// TTS, voice capture, and small utilities.
+
+require("dotenv").config();
 
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { getToolRegistry } = require("./tools.js");
-const { EndBehaviorType } = require("@discordjs/voice");
+const axios = require("axios");
 const { PassThrough } = require("stream");
-const { hasVoiceConsent } = require("./consent.js");
 const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
-const axios = require("axios");
+const { EndBehaviorType } = require("@discordjs/voice");
+
+const { getToolRegistry } = require("./tools.js");
+const { hasVoiceConsent } = require("./consent.js");
 const { getAIImage, getTranscription, getTTS } = require("./aiService.js");
 const { reportError } = require("./error.js");
-require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
 
+// ───────────────────────────────────────────────────────────────────────────────
 // State for voice & TTS
+// ───────────────────────────────────────────────────────────────────────────────
 const activeRecordings = new Map();
 const _avatarInFlight = new Map();
-const queueMap = new Map();
-const playerMap = new Map();
+const queueMap = new Map();   // guildId -> [{task, resolve, reject}, ...]
+const playerMap = new Map();  // guildId -> AudioPlayer
 
-/* Build a concise visual prompt from persona text */
-async function buildVisualPromptFromPersona(personaText) {
-  const { getAI } = require("./aiService.js");
-  const ctx = {
-    messages: [
-      {
-        role: "system",
-        content:
-          "Convert an assistant persona into ONE concise visual prompt for a square avatar. " +
-          "Be concrete: vibe/age, outfit, colors, expression, background. No text/logos/frames/brands. " +
-          "End with 'square portrait, centered, neutral background, soft lighting'. ~80 words max."
-      },
-      {
-        role: "user",
-        content: "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
-      }
-    ]
+// ───────────────────────────────────────────────────────────────────────────────
+// Small utilities
+// ───────────────────────────────────────────────────────────────────────────────
+
+/* Create a temp file path */
+async function makeTmpFile(ext = ".wav") {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
+  const file = path.join(dir, `${Date.now()}${ext}`);
+  return { dir, file };
+}
+
+/* Convert PCM stream to WAV using ffmpeg */
+function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const { dir, file } = await makeTmpFile(".wav");
+      ffmpeg()
+        .input(pcmReadable)
+        .inputOptions([`-f s16le`, `-ar ${rate}`, `-ac ${channels}`])
+        .audioCodec("pcm_s16le")
+        .format("wav")
+        .save(file)
+        .on("end", () => resolve({ dir, file }))
+        .on("error", reject);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+/* Heuristic: URL looks like an image by extension */
+function looksLikeImage(u) {
+  return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
+}
+
+/* Light URL cleanup (strip trailing bracket/commas) */
+function cleanUrl(u) {
+  try { return u.replace(/[),.]+$/g, ""); } catch { return u; }
+}
+
+/* Build a list of URLs (with optional labels) from text */
+function collectUrlsWithLabels(text) {
+  const out = [];
+  const seen = new Set();
+
+  const pushOnce = (url, label, kind, isImageExt) => {
+    const clean = cleanUrl(url);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
   };
-  const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
-  return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
+
+  String(text || "").replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url));
+    return "";
+  });
+
+  String(text || "").replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => {
+    pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url));
+    return "";
+  });
+
+  String(text || "").replace(/https?:\/\/[^\s)]+/g, (url) => {
+    pushOnce(url, null, "plain", looksLikeImage(url));
+    return "";
+  });
+
+  return out;
 }
 
-/* Stop and dispose the TTS player for a guild */
-function resetTTSPlayer(guildId) {
+/* Normalize text for embed: turn markdown images into ordinary links, reduce spacing */
+function prepareTextForEmbed(text) {
+  let s = String(text || "");
+  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
+    const a = String(alt || "").trim();
+    return a ? `[${a}](${url})` : `<${url}>`;
+  });
+  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+  return s;
+}
+
+/* Get Content-Type using HEAD (fallback GET stream) */
+async function headContentType(url) {
   try {
-    const p = playerMap.get(guildId);
-    if (!p) return;
-    try { p.stop(true); } catch {}
-    playerMap.delete(guildId);
-  } catch (err) {
-    reportError(err, null, "RESET_TTS_PLAYER", "WARN");
-  }
-}
-
-/* Clear internal recording flag to arm capture on next join */
-function resetRecordingFlag(guildId) {
-  try { activeRecordings.delete(guildId); } catch (err) {
-    reportError(err, null, "RESET_RECORDING_FLAG", "WARN");
-  }
-}
-
-/* Ensure a channel avatar image exists (generated from persona) and return its URL */
-async function ensureChannelAvatar(channelId, channelMeta) {
+    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
+    if (ct) return String(ct);
+  } catch {}
   try {
-    const dir = path.join(__dirname, "documents", "avatars");
-    const file = path.join(dir, `${channelId}.png`);
-    if (fs.existsSync(file)) return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
-
-    const persona = (channelMeta?.persona || "").trim();
-    if (!persona) return `https://ralfreschke.de/documents/avatars/default.png`;
-
-    if (_avatarInFlight.has(channelId)) {
-      await _avatarInFlight.get(channelId);
-      return fs.existsSync(file)
-        ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
-        : `https://ralfreschke.de/documents/avatars/default.png`;
-    }
-
-    const p = (async () => {
-      await fs.promises.mkdir(dir, { recursive: true });
-      const visualPrompt = await buildVisualPromptFromPersona(persona);
-      const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
-      const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
-      await fs.promises.writeFile(file, Buffer.from(res.data));
-    })();
-
-    _avatarInFlight.set(channelId, p);
-    await p;
-    _avatarInFlight.delete(channelId);
-
-    return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
-  } catch (err) {
-    _avatarInFlight.delete(channelId);
-    reportError(err, null, "ENSURE_CHANNEL_AVATAR", "ERROR");
-    return `https://ralfreschke.de/documents/avatars/default.png`;
-  }
+    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
+    try { res.data?.destroy?.(); } catch {}
+    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
+    if (ct) return String(ct);
+  } catch {}
+  return null;
 }
 
-/* Load default persona/config from channel-config/default.json */
-function getDefaultPersona() {
-  try {
-    const defaultPath = path.join(__dirname, "channel-config", "default.json");
-    const data = fs.readFileSync(defaultPath, "utf8");
-    const json = JSON.parse(data);
-    return {
-      persona: json.persona || "",
-      instructions: json.instructions || "",
-      voice: json.voice || "",
-      name: json.name || "",
-      botname: json.botname || "",
-      selectedTools: json.tools || [],
-      blocks: Array.isArray(json.blocks) ? json.blocks : [],
-      summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
-      admins: Array.isArray(json.admins) ? json.admins : [],
-      chatAppend: json.chatAppend || json.chatPrompt || json.chat_prompt || json.prompt_chat || "",
-      speechAppend: json.speechAppend || json.speechPrompt || json.speech_prompt || json.prompt_speech || "",
-      max_user_messages: json.max_user_messages ?? json.maxUserMessages ?? null,
-      max_tokens_chat: json.max_tokens_chat ?? json.maxTokensChat,
-      max_tokens_speaker: json.max_tokens_speaker ?? json.maxTokensSpeaker,
-    };
-  } catch (err) {
-    reportError(err, null, "GET_DEFAULT_PERSONA", "WARN");
-    return {
-      persona: "", instructions: "", voice: "", name: "", botname: "",
-      selectedTools: [], blocks: [], summaryPrompt: "", admins: [],
-      chatAppend: "", speechAppend: "",
-      max_user_messages: null, max_tokens_chat: undefined, max_tokens_speaker: undefined,
-    };
+/* Choose the best image candidate from a URL list */
+async function pickFirstImageCandidate(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const mdImg = list.find(l => l.kind === "md_image");
+  if (mdImg) return mdImg;
+  const withExt = list.find(l => l.isImageExt);
+  if (withExt) return withExt;
+  for (const l of list) {
+    try {
+      const ct = await headContentType(l.url);
+      if (ct && /^image\//i.test(ct)) return l;
+    } catch {}
   }
+  return null;
 }
 
-/* Load merged channel config (default + per-channel JSON) */
-function getChannelConfig(channelId) {
-  try {
-    const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
-    const def = getDefaultPersona();
-
-    let persona = def.persona || "";
-    let instructions = def.instructions || "";
-    let voice = def.voice || "";
-    let name = def.name || "";
-    let botname = def.botname || "AI";
-    let selectedTools = def.selectedTools || def.tools || [];
-    let blocks = Array.isArray(def.blocks) ? def.blocks : [];
-    let summaryPrompt = def.summaryPrompt || def.summary_prompt || "";
-    let max_user_messages = (Number.isFinite(Number(def.max_user_messages)) && Number(def.max_user_messages) >= 0)
-      ? Number(def.max_user_messages)
-      : null;
-    let admins = Array.isArray(def.admins) ? def.admins.map(String) : [];
-
-    let max_tokens_chat = (Number.isFinite(Number(def.max_tokens_chat)) && Number(def.max_tokens_chat) > 0)
-      ? Math.floor(Number(def.max_tokens_chat)) : 4096;
-    let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0)
-      ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
-
-    let chatAppend = typeof def.chatAppend === "string" ? def.chatAppend.trim() : "";
-    let speechAppend = typeof def.speechAppend === "string" ? def.speechAppend.trim() : "";
-
-    const hasConfigFile = fs.existsSync(configPath);
-    if (hasConfigFile) {
-      const raw = fs.readFileSync(configPath, "utf8");
-      const cfg = JSON.parse(raw);
-
-      if (typeof cfg.voice === "string") voice = cfg.voice;
-      if (typeof cfg.botname === "string") botname = cfg.botname;
-      if (typeof cfg.name === "string") name = cfg.name;
-      if (typeof cfg.persona === "string") persona = cfg.persona;
-      if (typeof cfg.instructions === "string") instructions = cfg.instructions;
-      if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
-      if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
-
-      if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
-      else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
-
-      const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
-      if (rawMax === null || rawMax === undefined || rawMax === "") {
-        max_user_messages = null;
-      } else {
-        const n = Number(rawMax);
-        max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
-      }
-
-      const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
-      if (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "") {
-        const n = Number(rawTokChat);
-        if (Number.isFinite(n) && n > 0) max_tokens_chat = Math.floor(n);
-      }
-      const rawTokSpk = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
-      if (rawTokSpk !== undefined && rawTokSpk !== null && rawTokSpk !== "") {
-        const n = Number(rawTokSpk);
-        if (Number.isFinite(n) && n > 0) max_tokens_speaker = Math.floor(n);
-      }
-
-      if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
-
-      const cfgChatAppend = cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
-      const cfgSpeechAppend = cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
-
-      if (typeof cfgChatAppend === "string") chatAppend = cfgChatAppend.trim();
-      if (typeof cfgSpeechAppend === "string") speechAppend = cfgSpeechAppend.trim();
-    }
-
-    const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
-
-    const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-    const avatarUrl = fs.existsSync(avatarPath)
-      ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
-      : `https://ralfreschke.de/documents/avatars/default.png`;
-
-    const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
-
-    return {
-      name,
-      botname,
-      voice,
-      persona,
-      avatarUrl,
-      instructions,
-      tools: ctxTools,
-      toolRegistry,
-      blocks,
-      summaryPrompt,
-      max_user_messages,
-      hasConfig: hasConfigFile,
-      summariesEnabled,
-      admins,
-      max_tokens_chat,
-      max_tokens_speaker,
-      chatAppend,
-      speechAppend,
-    };
-  } catch (err) {
-    reportError(err, null, "GET_CHANNEL_CONFIG", "ERROR");
-    return {
-      name: "", botname: "AI", voice: "", persona: "", avatarUrl: `https://ralfreschke.de/documents/avatars/default.png`,
-      instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
-      max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
-      max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
-    };
-  }
-}
+// ───────────────────────────────────────────────────────────────────────────────
+// Public helpers
+// ───────────────────────────────────────────────────────────────────────────────
 
 /* Split plain text into safe Discord message chunks (<=2000 chars) */
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
@@ -310,7 +210,7 @@ async function setBotPresence(client, activityText = "✅ Ready", status = "onli
       status,
     });
   } catch (err) {
-    reportError(err, null, "SET_BOT_PRESENCE", "WARN");
+    await reportError(err, null, "SET_BOT_PRESENCE", "WARN");
   }
 }
 
@@ -334,43 +234,6 @@ async function setAddUserMessage(message, chatContext) {
     await chatContext.add("user", senderName, content);
   } catch (err) {
     await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE", "ERROR");
-  }
-}
-
-/* Create a temp file path */
-async function makeTmpFile(ext = ".wav") {
-  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
-  const file = path.join(dir, `${Date.now()}${ext}`);
-  return { dir, file };
-}
-
-/* Convert PCM stream to WAV using ffmpeg */
-function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const { dir, file } = await makeTmpFile(".wav");
-      ffmpeg()
-        .input(pcmReadable)
-        .inputOptions([`-f s16le`, `-ar ${rate}`, `-ac ${channels}`])
-        .audioCodec("pcm_s16le")
-        .format("wav")
-        .save(file)
-        .on("end", () => resolve({ dir, file }))
-        .on("error", reject);
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
-
-/* Resolve a member's display name for a guild */
-async function resolveSpeakerName(client, guildId, userId) {
-  try {
-    const g = await client.guilds.fetch(guildId);
-    const m = await g.members.fetch(userId).catch(() => null);
-    return m?.displayName || m?.user?.username || "Unknown";
-  } catch {
-    return "Unknown";
   }
 }
 
@@ -427,90 +290,6 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
     await reportError(err, message?.channel, "REPLY_WEBHOOK", "ERROR");
     try { await sendChunked(message.channel, content); } catch {}
   }
-}
-
-/* Build a list of URLs (with optional labels) from text */
-function collectUrlsWithLabels(text) {
-  const out = [];
-  const seen = new Set();
-
-  const pushOnce = (url, label, kind, isImageExt) => {
-    const clean = cleanUrl(url);
-    if (!clean || seen.has(clean)) return;
-    seen.add(clean);
-    out.push({ url: clean, label: label || null, kind, isImageExt: !!isImageExt });
-  };
-
-  String(text || "").replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    pushOnce(url, (alt || "").trim(), "md_image", looksLikeImage(url));
-    return "";
-  });
-
-  String(text || "").replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label, url) => {
-    pushOnce(url, (label || "").trim(), "md_link", looksLikeImage(url));
-    return "";
-  });
-
-  String(text || "").replace(/https?:\/\/[^\s)]+/g, (url) => {
-    pushOnce(url, null, "plain", looksLikeImage(url));
-    return "";
-  });
-
-  return out;
-}
-
-/* Choose the best image candidate from a URL list */
-async function pickFirstImageCandidate(list) {
-  if (!Array.isArray(list) || list.length === 0) return null;
-  const mdImg = list.find(l => l.kind === "md_image");
-  if (mdImg) return mdImg;
-  const withExt = list.find(l => l.isImageExt);
-  if (withExt) return withExt;
-
-  for (const l of list) {
-    try {
-      const ct = await headContentType(l.url);
-      if (ct && /^image\//i.test(ct)) return l;
-    } catch {}
-  }
-  return null;
-}
-
-/* Get Content-Type using HEAD (fallback GET stream) */
-async function headContentType(url) {
-  try {
-    const res = await axios.head(url, { maxRedirects: 5, timeout: 7000, validateStatus: null });
-    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
-    if (ct) return String(ct);
-  } catch {}
-  try {
-    const res = await axios.get(url, { maxRedirects: 5, timeout: 8000, responseType: "stream", validateStatus: null });
-    try { res.data?.destroy?.(); } catch {}
-    const ct = res?.headers?.["content-type"] || res?.headers?.["Content-Type"];
-    if (ct) return String(ct);
-  } catch {}
-  return null;
-}
-
-/* Normalize text for embed: turn markdown images into ordinary links, reduce spacing */
-function prepareTextForEmbed(text) {
-  let s = String(text || "");
-  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
-    const a = String(alt || "").trim();
-    return a ? `[${a}](${url})` : `<${url}>`;
-  });
-  s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
-  return s;
-}
-
-/* Heuristic: URL looks like an image by extension */
-function looksLikeImage(u) {
-  return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
-}
-
-/* Light URL cleanup (strip trailing bracket/commas) */
-function cleanUrl(u) {
-  try { return u.replace(/[),.]+$/g, ""); } catch { return u; }
 }
 
 /* Send AI reply as chunked embeds; first embed may include a large image */
@@ -599,6 +378,239 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
   }
 }
 
+/* Build a concise visual prompt from persona text (for avatar) */
+async function buildVisualPromptFromPersona(personaText) {
+  try {
+    const { getAI } = require("./aiService.js");
+    const ctx = {
+      messages: [
+        {
+          role: "system",
+          content:
+            "Convert an assistant persona into ONE concise visual prompt for a square avatar. " +
+            "Be concrete: vibe/age, outfit, colors, expression, background. No text/logos/frames/brands. " +
+            "End with 'square portrait, centered, neutral background, soft lighting'. ~80 words max."
+        },
+        {
+          role: "user",
+          content: "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
+        }
+      ]
+    };
+    const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
+    return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
+  } catch (err) {
+    await reportError(err, null, "BUILD_AVATAR_PROMPT", "WARN");
+    return "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
+  }
+}
+
+/* Ensure a channel avatar image exists (generated from persona) and return its URL */
+async function ensureChannelAvatar(channelId, channelMeta) {
+  try {
+    const dir = path.join(__dirname, "documents", "avatars");
+    const file = path.join(dir, `${channelId}.png`);
+    if (fs.existsSync(file)) return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
+
+    const persona = (channelMeta?.persona || "").trim();
+    if (!persona) return `https://ralfreschke.de/documents/avatars/default.png`;
+
+    if (_avatarInFlight.has(channelId)) {
+      await _avatarInFlight.get(channelId);
+      return fs.existsSync(file)
+        ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
+        : `https://ralfreschke.de/documents/avatars/default.png`;
+    }
+
+    const p = (async () => {
+      await fs.promises.mkdir(dir, { recursive: true });
+      const visualPrompt = await buildVisualPromptFromPersona(persona);
+      const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
+      const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
+      await fs.promises.writeFile(file, Buffer.from(res.data));
+    })();
+
+    _avatarInFlight.set(channelId, p);
+    await p;
+    _avatarInFlight.delete(channelId);
+
+    return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
+  } catch (err) {
+    _avatarInFlight.delete(channelId);
+    await reportError(err, null, "ENSURE_CHANNEL_AVATAR", "WARN");
+    return `https://ralfreschke.de/documents/avatars/default.png`;
+  }
+}
+
+/* Load channel config from channel-config/<channelId>.json only (no global default). */
+function getChannelConfig(channelId) {
+  try {
+    const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
+    const hasConfigFile = fs.existsSync(configPath);
+
+    // Base defaults if there is NO per-channel config file
+    let persona = "";
+    let instructions = "";
+    let voice = "";
+    let name = "";
+    let botname = "AI";
+    let selectedTools = [];
+    let blocks = [];
+    let summaryPrompt = "";
+    let admins = [];
+    let max_user_messages = null;
+    let max_tokens_chat = 4096;
+    let max_tokens_speaker = 1024;
+    let chatAppend = "";
+    let speechAppend = "";
+
+    if (hasConfigFile) {
+      const raw = fs.readFileSync(configPath, "utf8");
+      const cfg = JSON.parse(raw);
+
+      if (typeof cfg.voice === "string") voice = cfg.voice;
+      if (typeof cfg.botname === "string") botname = cfg.botname;
+      if (typeof cfg.name === "string") name = cfg.name;
+      if (typeof cfg.persona === "string") persona = cfg.persona;
+      if (typeof cfg.instructions === "string") instructions = cfg.instructions;
+
+      if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
+      if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
+
+      if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
+      else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
+
+      const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
+      if (rawMax === null || rawMax === undefined || rawMax === "") {
+        max_user_messages = null;
+      } else {
+        const n = Number(rawMax);
+        max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
+      }
+
+      const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
+      if (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "") {
+        const n = Number(rawTokChat);
+        if (Number.isFinite(n) && n > 0) max_tokens_chat = Math.floor(n);
+      }
+      const rawTokSpk = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
+      if (rawTokSpk !== undefined && rawTokSpk !== null && rawTokSpk !== "") {
+        const n = Number(rawTokSpk);
+        if (Number.isFinite(n) && n > 0) max_tokens_speaker = Math.floor(n);
+      }
+
+      if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
+
+      const cfgChatAppend = cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
+      const cfgSpeechAppend = cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
+
+      if (typeof cfgChatAppend === "string") chatAppend = cfgChatAppend.trim();
+      if (typeof cfgSpeechAppend === "string") speechAppend = cfgSpeechAppend.trim();
+    }
+
+    const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
+
+    const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
+    const avatarUrl = fs.existsSync(avatarPath)
+      ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
+      : `https://ralfreschke.de/documents/avatars/default.png`;
+
+    const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
+
+    return {
+      name,
+      botname,
+      voice,
+      persona,
+      avatarUrl,
+      instructions,
+      tools: ctxTools,
+      toolRegistry,
+      blocks,
+      summaryPrompt,
+      max_user_messages,
+      hasConfig: hasConfigFile,
+      summariesEnabled,
+      admins,
+      max_tokens_chat,
+      max_tokens_speaker,
+      chatAppend,
+      speechAppend,
+    };
+  } catch (err) {
+    // Weiche Defaults, kein Versuch, default.json zu lesen
+    reportError(err, null, "GET_CHANNEL_CONFIG", "WARN");
+    return {
+      name: "",
+      botname: "AI",
+      voice: "",
+      persona: "",
+      avatarUrl: `https://ralfreschke.de/documents/avatars/default.png`,
+      instructions: "",
+      tools: [],
+      toolRegistry: {},
+      blocks: [],
+      summaryPrompt: "",
+      max_user_messages: null,
+      hasConfig: false,
+      summariesEnabled: false,
+      admins: [],
+      max_tokens_chat: 4096,
+      max_tokens_speaker: 1024,
+      chatAppend: "",
+      speechAppend: "",
+    };
+  }
+}
+
+/* Clear internal recording flag to arm capture on next join */
+function resetRecordingFlag(guildId) {
+  try {
+    activeRecordings.delete(guildId);
+  } catch (err) {
+    reportError(err, null, "RESET_RECORDING_FLAG", "WARN");
+  }
+}
+
+/* Stop and dispose the TTS player for a guild */
+function resetTTSPlayer(guildId) {
+  try {
+    const p = playerMap.get(guildId);
+    if (p) {
+      try { p.stop(true); } catch {}
+      playerMap.delete(guildId);
+    }
+  } catch (err) {
+    reportError(err, null, "RESET_TTS_PLAYER", "WARN");
+  }
+}
+
+/* Resolve a member's display name for a guild */
+async function resolveSpeakerName(client, guildId, userId) {
+  try {
+    const g = await client.guilds.fetch(guildId);
+    const m = await g.members.fetch(userId).catch(() => null);
+    return m?.displayName || m?.user?.username || "Unknown";
+  } catch {
+    return "Unknown";
+  }
+}
+
+/* Split text into smaller parts for TTS playback  */
+function getSplitTextToChunks(text, maxChars = 500) {
+  const sentences = String(text || "").match(/[^.!?\n]+[.!?\n]?/g) || [String(text || "")];
+  const chunks = [];
+  let current = "";
+  for (const s of sentences) {
+    if ((current + s).length > maxChars) {
+      if (current.trim()) chunks.push(current.trim());
+      current = s;
+    } else current += s;
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
 /* Enqueue a TTS task to be played sequentially per guild (returns when finished) */
 function setEnqueueTTS(guildId, task) {
   return new Promise((resolve, reject) => {
@@ -625,19 +637,57 @@ async function setProcessTTSQueue(guildId) {
   }
 }
 
-/* Split text into smaller parts for TTS playback  */
-function getSplitTextToChunks(text, maxChars = 500) {
-  const sentences = String(text || "").match(/[^.!?\n]+[.!?\n]?/g) || [String(text || "")];
-  const chunks = [];
-  let current = "";
-  for (const s of sentences) {
-    if ((current + s).length > maxChars) {
-      if (current.trim()) chunks.push(current.trim());
-      current = s;
-    } else current += s;
+/* Generate speech from text and play it in sequence on a guild connection */
+async function getSpeech(connection, guildId, text, client, voice) {
+  try {
+    if (!connection || !text?.trim()) return;
+    const chunks = getSplitTextToChunks(text);
+
+    return setEnqueueTTS(guildId, async () => {
+      let player = playerMap.get(guildId);
+      if (!player) {
+        const { createAudioPlayer } = require("@discordjs/voice");
+        player = createAudioPlayer();
+        if (typeof player.setMaxListeners === "function") player.setMaxListeners(50);
+        playerMap.set(guildId, player);
+      }
+
+      try { connection.subscribe(player); } catch {}
+
+      const { AudioPlayerStatus } = require("@discordjs/voice");
+
+      for (const chunk of chunks) {
+        try {
+          const response = await getTTS(chunk, "tts-1", voice);
+          const pass = new (require("stream").PassThrough)();
+          response.pipe(pass);
+
+          const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
+          const pcmStream = pass.pipe(decoder);
+          const { createAudioResource, StreamType } = require("@discordjs/voice");
+          const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
+
+          await new Promise((resolve, reject) => {
+            const onIdle = () => { cleanup(); resolve(); };
+            const onError = (err) => { cleanup(); reject(err); };
+            const cleanup = () => {
+              try { player.off(AudioPlayerStatus.Idle, onIdle); } catch {}
+              try { player.off("error", onError); } catch {}
+            };
+            player.on(AudioPlayerStatus.Idle, onIdle);
+            player.on("error", onError);
+            player.play(resource);
+          });
+
+          await new Promise(r => setTimeout(r, 100));
+        } catch (err) {
+          await reportError(err, null, "TTS_CHUNK", "WARN");
+        }
+      }
+    });
+  } catch (err) {
+    await reportError(err, null, "GET_SPEECH", "ERROR");
   }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks;
 }
 
 /* Capture and transcribe users speaking in a voice channel, then callback with transcript */
@@ -688,7 +738,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         const pcm = buf.subarray(44);
         const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
 
-        const frame = 960; // 20ms @ 48k
+        const sr = 48000, frame = 960; // 20ms
         const totalFrames = Math.floor(samples.length / frame);
         if (totalFrames <= 0) return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
 
@@ -847,65 +897,14 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       }
     });
   } catch (err) {
-    reportError(err, null, "SET_START_LISTENING", "ERROR");
+    await reportError(err, null, "SET_START_LISTENING", "ERROR");
   }
 }
 
-/* Generate speech from text and play it in sequence on a guild connection */
-async function getSpeech(connection, guildId, text, client, voice) {
-  try {
-    if (!connection || !text?.trim()) return;
-    const chunks = getSplitTextToChunks(text);
-
-    return setEnqueueTTS(guildId, async () => {
-      let player = playerMap.get(guildId);
-      if (!player) {
-        const { createAudioPlayer } = require("@discordjs/voice");
-        player = createAudioPlayer();
-        if (typeof player.setMaxListeners === "function") player.setMaxListeners(50);
-        playerMap.set(guildId, player);
-      }
-
-      try { connection.subscribe(player); } catch {}
-
-      const { AudioPlayerStatus } = require("@discordjs/voice");
-
-      for (const chunk of chunks) {
-        try {
-          const response = await getTTS(chunk, "tts-1", voice);
-          const pass = new PassThrough();
-          response.pipe(pass);
-
-          const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
-          const pcmStream = pass.pipe(decoder);
-          const { createAudioResource, StreamType } = require("@discordjs/voice");
-          const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
-
-          await new Promise((resolve, reject) => {
-            const onIdle = () => { cleanup(); resolve(); };
-            const onError = (err) => { cleanup(); reject(err); };
-            const cleanup = () => {
-              try { player.off(AudioPlayerStatus.Idle, onIdle); } catch {}
-              try { player.off("error", onError); } catch {}
-            };
-            player.on(AudioPlayerStatus.Idle, onIdle);
-            player.on("error", onError);
-            player.play(resource);
-          });
-
-          await new Promise(r => setTimeout(r, 100));
-        } catch (err) {
-          reportError(err, null, "TTS_CHUNK", "WARN");
-        }
-      }
-    });
-  } catch (err) {
-    reportError(err, null, "GET_SPEECH", "ERROR");
-  }
-}
-
+// ───────────────────────────────────────────────────────────────────────────────
+// Exports
+// ───────────────────────────────────────────────────────────────────────────────
 module.exports = {
-  getDefaultPersona,
   getChannelConfig,
   setMessageReaction,
   setReplyAsWebhook,
