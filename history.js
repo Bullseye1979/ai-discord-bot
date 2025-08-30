@@ -32,18 +32,15 @@ function compileNamed(sql, bindings) {
     values.push(bindings[name]);
     return "?";
   });
-  // LIMIT ergänzen, wenn fehlend
-  if (!/\blimit\s+\d+(\s*,\s*\d+)?\s*$/i.test(out)) return { sql: `${out} LIMIT 200`, values };
+  if (!/\blimit\s+\d+/i.test(out)) return { sql: `${out} LIMIT 200`, values };
   return { sql: out, values };
 }
 
-/** Ensures there's an ORDER BY timestamp ASC, putting it before LIMIT when needed. */
+/** Ensure an ORDER BY timestamp ASC exists (if none present). */
 function ensureOrderByTimestamp(sql) {
-  if (/\border\s+by\b/i.test(sql)) return sql; // bereits vorhanden
-  const limitMatch = sql.match(/\blimit\s+\d+(\s*,\s*\d+)?\s*$/i);
-  if (limitMatch) {
-    return sql.replace(limitMatch[0], `ORDER BY timestamp ASC ${limitMatch[0]}`);
-  }
+  const hasOrder = /\border\s+by\b/i.test(sql);
+  if (hasOrder) return sql;
+  // Wir erzwingen eine stabile Sortierung nach timestamp (ASC)
   return `${sql} ORDER BY timestamp ASC`;
 }
 
@@ -60,28 +57,28 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       typeof toolFunction.arguments === "string"
         ? JSON.parse(toolFunction.arguments || "{}")
         : (toolFunction.arguments || {});
-    const sql = String(args.sql || "").trim();
+    const sqlIn = String(args.sql || "").trim();
     const extra = (args.bindings && typeof args.bindings === "object") ? args.bindings : {};
 
-    if (!sql) throw new Error("SQL missing");
+    if (!sqlIn) throw new Error("SQL missing");
 
+    // channel_id aus runtime oder Context nehmen
     let channelId = "";
     if (runtime && runtime.channel_id) channelId = String(runtime.channel_id).trim();
     else if (ctxOrUndefined && ctxOrUndefined.channelId) channelId = String(ctxOrUndefined.channelId).trim();
     if (!channelId) throw new Error("channel_id missing");
 
-    const lowered = sql.toLowerCase();
+    const lowered = sqlIn.toLowerCase();
     if (!lowered.startsWith("select")) throw new Error("Only SELECT is allowed");
-    if (!/(from|join)\s+(context_log|summaries)\b/i.test(sql)) {
+    if (!/(from|join)\s+(context_log|summaries)\b/i.test(sqlIn)) {
       throw new Error("Only tables context_log or summaries are allowed");
     }
-    if (!/:channel_id\b/.test(sql)) throw new Error("Query must include :channel_id in WHERE");
+    if (!/:channel_id\b/.test(sqlIn)) throw new Error("Query must include :channel_id in WHERE");
 
+    // ORDER BY timestamp erzwingen, falls fehlend
+    const sqlOrdered = ensureOrderByTimestamp(sqlIn);
     const bindings = { channel_id: channelId, ...extra };
-    let { sql: compiled, values } = compileNamed(sql, bindings);
-
-    // Immer nach timestamp sortieren (vor LIMIT, wenn vorhanden)
-    compiled = ensureOrderByTimestamp(compiled);
+    const { sql: compiled, values } = compileNamed(sqlOrdered, bindings);
 
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);

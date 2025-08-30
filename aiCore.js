@@ -46,11 +46,25 @@ async function getAIResponse(
     if (tokenlimit == null) tokenlimit = 4096;
 
     // Arbeitskopien des Kontexts (Antwort-Kontext + Handover für Tools)
-    const context = new Context("", "", context_orig.tools, context_orig.toolRegistry, context_orig.channelId, { persistToDB: false, skipInitialSummaries: true });
+    // WICHTIG: channelId mitgeben, damit Tools (getHistory) die :channel_id erkennen
+    const context = new Context(
+      "",
+      "",
+      context_orig.tools,
+      context_orig.toolRegistry,
+      context_orig.channelId || null,
+      { skipInitialSummaries: true, persistToDB: false }
+    );
     context.messages = [...context_orig.messages];
 
-    // ⬅️ WICHTIG: Handover-Kontext mit channelId, damit Tools (z.B. getHistory) channel_id bekommen
-    const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry, context_orig.channelId, { persistToDB: false, skipInitialSummaries: true });
+    const handoverContext = new Context(
+      "",
+      "",
+      context_orig.tools,
+      context_orig.toolRegistry,
+      context_orig.channelId || null,
+      { skipInitialSummaries: true, persistToDB: false }
+    );
     handoverContext.messages = [...context_orig.messages];
 
     const toolRegistry = context.toolRegistry;
@@ -152,11 +166,13 @@ async function getAIResponse(
           }
 
           try {
-            // ⬅️ handoverContext enthält channelId → Tools können channel_id nutzen
-            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, { channel_id: context_orig.channelId });
+            // *** HIER WICHTIG: runtime mit channel_id an das Tool geben ***
+            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
+            await reportError(toolError, null, `TOOL_${fnName.toUpperCase()}`);
             replyTool({ error: emsg, tool: fnName });
           }
         }
