@@ -1,6 +1,5 @@
-// discord-helper.js — refactored v2.2 (no default persona)
-// Minimal helper set for Discord bot: config loading (channel-only), webhook replies (chunked embeds),
-// TTS, voice capture, and small utilities. All logging via reportError.
+// discord-helper.js — refactored v2.2
+// Minimal helper set for Discord bot: config loading, webhook replies (with chunked embeds), TTS, voice capture, and small utilities.
 
 const fs = require("fs");
 const os = require("os");
@@ -24,31 +23,39 @@ const _avatarInFlight = new Map();
 const queueMap = new Map();
 const playerMap = new Map();
 
+/* Small helpers */
+function publicBase() {
+  const b = (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/,"");
+  return b && /^https?:\/\//i.test(b) ? b : null;
+}
+function absoluteOrNull(urlMaybe) {
+  if (!urlMaybe) return null;
+  if (/^https?:\/\//i.test(urlMaybe)) return urlMaybe;
+  const base = publicBase();
+  if (base && urlMaybe.startsWith("/")) return base + urlMaybe;
+  return null;
+}
+
 /* Build a concise visual prompt from persona text */
 async function buildVisualPromptFromPersona(personaText) {
-  try {
-    const { getAI } = require("./aiService.js");
-    const ctx = {
-      messages: [
-        {
-          role: "system",
-          content:
-            "Convert an assistant persona into ONE concise visual prompt for a square avatar. " +
-            "Be concrete: vibe/age, outfit, colors, expression, background. No text/logos/frames/brands. " +
-            "End with 'square portrait, centered, neutral background, soft lighting'. ~80 words max."
-        },
-        {
-          role: "user",
-          content: "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
-        }
-      ]
-    };
-    const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
-    return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
-  } catch (err) {
-    await reportError(err, null, "BUILD_VISUAL_PROMPT", "WARN");
-    return "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
-  }
+  const { getAI } = require("./aiService.js");
+  const ctx = {
+    messages: [
+      {
+        role: "system",
+        content:
+          "Convert an assistant persona into ONE concise visual prompt for a square avatar. " +
+          "Be concrete: vibe/age, outfit, colors, expression, background. No text/logos/frames/brands. " +
+          "End with 'square portrait, centered, neutral background, soft lighting'. ~80 words max."
+      },
+      {
+        role: "user",
+        content: "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
+      }
+    ]
+  };
+  const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
+  return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
 }
 
 /* Stop and dispose the TTS player for a guild */
@@ -60,7 +67,7 @@ function resetTTSPlayer(guildId) {
       playerMap.delete(guildId);
     }
   } catch (err) {
-    reportError(err, null, "RESET_TTS_PLAYER", "WARN");
+    reportError(err, null, "RESET_TTS_PLAYER");
   }
 }
 
@@ -69,66 +76,71 @@ function resetRecordingFlag(guildId) {
   try {
     activeRecordings.delete(guildId);
   } catch (err) {
-    reportError(err, null, "RESET_RECORDING_FLAG", "WARN");
+    reportError(err, null, "RESET_RECORDING_FLAG");
   }
 }
 
-/* Ensure a channel avatar image exists (generated from persona) and return its URL */
+/* Ensure a channel avatar image exists (generated from persona) and return its ABSOLUTE URL, or null */
 async function ensureChannelAvatar(channelId, channelMeta) {
   try {
-    const dir = path.join(__dirname, "documents", "avatars");
-    const file = path.join(dir, `${channelId}.png`);
-    if (fs.existsSync(file)) return `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/${channelId}.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//");
+    const base = publicBase(); // may be null
+    const dirFs = path.join(__dirname, "documents", "avatars");
+    const fileFs = path.join(dirFs, `${channelId}.png`);
+    const defaultAbs = absoluteOrNull("/documents/avatars/default.png");
+
+    if (fs.existsSync(fileFs)) {
+      const out = absoluteOrNull(`/documents/avatars/${channelId}.png`);
+      return out || defaultAbs || null;
+    }
 
     const persona = (channelMeta?.persona || "").trim();
-    if (!persona) {
-      // no persona → fallback default avatar
-      return `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/default.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//");
-    }
+    if (!persona) return defaultAbs || null;
 
     if (_avatarInFlight.has(channelId)) {
       await _avatarInFlight.get(channelId);
-      return fs.existsSync(file)
-        ? `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/${channelId}.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//")
-        : `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/default.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//");
+      const out = fs.existsSync(fileFs)
+        ? absoluteOrNull(`/documents/avatars/${channelId}.png`)
+        : defaultAbs;
+      return out || null;
     }
 
     const p = (async () => {
-      await fs.promises.mkdir(dir, { recursive: true });
+      await fs.promises.mkdir(dirFs, { recursive: true });
       const visualPrompt = await buildVisualPromptFromPersona(persona);
       const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
       const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
-      await fs.promises.writeFile(file, Buffer.from(res.data));
+      await fs.promises.writeFile(fileFs, Buffer.from(res.data));
     })();
 
     _avatarInFlight.set(channelId, p);
     await p;
     _avatarInFlight.delete(channelId);
 
-    return `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/${channelId}.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//");
+    const out = absoluteOrNull(`/documents/avatars/${channelId}.png`);
+    return out || defaultAbs || null;
   } catch (err) {
     _avatarInFlight.delete(channelId);
-    reportError(err, null, "ENSURE_CHANNEL_AVATAR", "WARN");
-    return `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/default.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//");
+    reportError(err, null, "ENSURE_CHANNEL_AVATAR");
+    const def = absoluteOrNull("/documents/avatars/default.png");
+    return def || null;
   }
 }
 
-/* Load channel config ONLY from channel-config/<channelId>.json (no defaults) */
+/* Load merged channel config (per-channel JSON only; no default persona fallback) */
 function getChannelConfig(channelId) {
   try {
-    const cfgFile = path.join(__dirname, "channel-config", `${channelId}.json`);
-    if (!fs.existsSync(cfgFile)) {
-      // no config for this channel
+    const cfgPath = path.join(__dirname, "channel-config", `${channelId}.json`);
+    const hasConfigFile = fs.existsSync(cfgPath);
+    if (!hasConfigFile) {
       return {
-        name: "", botname: "AI", voice: "",
-        persona: "", avatarUrl: `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/default.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//"),
-        instructions: "", tools: [], toolRegistry: {}, blocks: [],
-        summaryPrompt: "", max_user_messages: null, hasConfig: false, summariesEnabled: false,
-        admins: [], max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
+        name: "", botname: "AI", voice: "", persona: "", avatarUrl: null,
+        instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
+        max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
+        max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
       };
     }
 
-    const raw = fs.readFileSync(cfgFile, "utf8");
+    const raw = fs.readFileSync(cfgPath, "utf8");
     const cfg = JSON.parse(raw);
 
     const name = typeof cfg.name === "string" ? cfg.name : "";
@@ -136,13 +148,10 @@ function getChannelConfig(channelId) {
     const voice = typeof cfg.voice === "string" ? cfg.voice : "";
     const persona = typeof cfg.persona === "string" ? cfg.persona : "";
     const instructions = typeof cfg.instructions === "string" ? cfg.instructions : "";
-
-    const selectedTools = Array.isArray(cfg.tools) ? cfg.tools : [];
     const blocks = Array.isArray(cfg.blocks) ? cfg.blocks : [];
-
-    const summaryPrompt = typeof cfg.summaryPrompt === "string"
-      ? cfg.summaryPrompt
-      : (typeof cfg.summary_prompt === "string" ? cfg.summary_prompt : "");
+    const summaryPrompt = typeof cfg.summaryPrompt === "string" ? cfg.summaryPrompt
+                        : (typeof cfg.summary_prompt === "string" ? cfg.summary_prompt : "");
+    const admins = Array.isArray(cfg.admins) ? cfg.admins.map(String) : [];
 
     const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
     const max_user_messages =
@@ -150,29 +159,32 @@ function getChannelConfig(channelId) {
         ? null
         : (Number.isFinite(Number(rawMax)) && Number(rawMax) >= 0 ? Math.floor(Number(rawMax)) : null);
 
-    const max_tokens_chat = (() => {
-      const x = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
-      const n = Number(x);
-      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4096;
-    })();
+    const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
+    const max_tokens_chat =
+      (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "" && Number.isFinite(Number(rawTokChat)) && Number(rawTokChat) > 0)
+        ? Math.floor(Number(rawTokChat)) : 4096;
 
-    const max_tokens_speaker = (() => {
-      const x = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
-      const n = Number(x);
-      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1024;
-    })();
+    const rawTokSpk = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
+    const max_tokens_speaker =
+      (rawTokSpk !== undefined && rawTokSpk !== null && rawTokSpk !== "" && Number.isFinite(Number(rawTokSpk)) && Number(rawTokSpk) > 0)
+        ? Math.floor(Number(rawTokSpk)) : 1024;
 
-    const admins = Array.isArray(cfg.admins) ? cfg.admins.map(String) : [];
+    const chatAppend = typeof (cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat) === "string"
+      ? (cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat).trim() : "";
+    const speechAppend = typeof (cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech) === "string"
+      ? (cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech).trim() : "";
 
-    const chatAppend = String(cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "").trim();
-    const speechAppend = String(cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "").trim();
-
+    // tools
+    const selectedTools = Array.isArray(cfg.tools) ? cfg.tools : [];
     const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
 
+    // avatar (absolute or null)
     const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-    const avatarUrl = fs.existsSync(avatarPath)
-      ? `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/${channelId}.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//")
-      : `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/default.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//");
+    let avatarUrl = null;
+    if (fs.existsSync(avatarPath)) {
+      avatarUrl = absoluteOrNull(`/documents/avatars/${channelId}.png`);
+    }
+    if (!avatarUrl) avatarUrl = absoluteOrNull("/documents/avatars/default.png");
 
     const summariesEnabled = !!String(summaryPrompt || "").trim();
 
@@ -181,7 +193,7 @@ function getChannelConfig(channelId) {
       botname,
       voice,
       persona,
-      avatarUrl,
+      avatarUrl, // may be null
       instructions,
       tools: ctxTools,
       toolRegistry,
@@ -197,10 +209,9 @@ function getChannelConfig(channelId) {
       speechAppend,
     };
   } catch (err) {
-    reportError(err, null, "GET_CHANNEL_CONFIG", "ERROR");
+    reportError(err, null, "GET_CHANNEL_CONFIG");
     return {
-      name: "", botname: "AI", voice: "", persona: "",
-      avatarUrl: `${process.env.PUBLIC_BASE_URL || ""}/documents/avatars/default.png`.replace(/\/+$/,"").replace(/(?<=:)\/\//, "//"),
+      name: "", botname: "AI", voice: "", persona: "", avatarUrl: null,
       instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
@@ -245,7 +256,7 @@ async function sendChunked(channel, content) {
       await channel.send({ content: p });
     }
   } catch (err) {
-    await reportError(err, channel, "SEND_CHUNKED", "WARN");
+    await reportError(err, channel, "SEND_CHUNKED");
   }
 }
 
@@ -260,7 +271,7 @@ async function postSummariesIndividually(channel, summaries, headerPrefix = null
       await sendChunked(channel, `${header}\n\n${summaries[i]}`);
     }
   } catch (err) {
-    await reportError(err, channel, "POST_SUMMARIES", "WARN");
+    await reportError(err, channel, "POST_SUMMARIES");
   }
 }
 
@@ -273,7 +284,7 @@ async function setBotPresence(client, activityText = "✅ Ready", status = "onli
       status,
     });
   } catch (err) {
-    reportError(err, null, "SET_BOT_PRESENCE", "WARN");
+    reportError(err, null, "SET_BOT_PRESENCE");
   }
 }
 
@@ -296,7 +307,7 @@ async function setAddUserMessage(message, chatContext) {
 
     await chatContext.add("user", senderName, content);
   } catch (err) {
-    await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE", "WARN");
+    await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE");
   }
 }
 
@@ -353,42 +364,7 @@ async function setMessageReaction(message, emoji) {
       await message.react(emoji).catch(() => {});
     }
   } catch (err) {
-    await reportError(err, message?.channel, "SET_MESSAGE_REACTION", "WARN");
-  }
-}
-
-/* Reply via webhook with text only (chunked as plain content) */
-async function setReplyAsWebhook(message, content, { botname } = {}) {
-  try {
-    const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
-    const hookChannel = isThread ? message.channel.parent : message.channel;
-
-    const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
-    const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
-
-    const hooks = await hookChannel.fetchWebhooks();
-    let hook = hooks.find((w) => w.name === (botname || "AI"));
-    if (!hook) {
-      hook = await hookChannel.createWebhook({
-        name: botname || "AI",
-        avatar: personaAvatarUrl || undefined,
-      });
-    }
-
-    const parts = splitIntoChunks(content);
-    for (const p of parts) {
-      await hook.send({
-        content: p,
-        username: botname || "AI",
-        avatarURL: personaAvatarUrl || undefined,
-        allowedMentions: { parse: [] },
-        threadId: isThread ? message.channel.id : undefined
-      });
-    }
-  } catch (err) {
-    await reportError(err, message?.channel, "REPLY_WEBHOOK", "WARN");
-    try { await sendChunked(message.channel, content); } catch {}
+    await reportError(err, message?.channel, "SET_MESSAGE_REACTION");
   }
 }
 
@@ -430,7 +406,7 @@ async function pickFirstImageCandidate(list) {
   const withExt = list.find(l => l.isImageExt);
   if (withExt) return withExt;
 
-  // Fallback: probe Content-Type (best-effort)
+  // Fallback: Content-Type prüfen – zwei spezialisierte Versuche sind hier gewollt.
   for (const l of list) {
     try {
       const ct = await headContentType(l.url);
@@ -472,7 +448,7 @@ function looksLikeImage(u) {
   return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
 }
 
-/* Light URL cleanup */
+/* Light URL cleanup (strip trailing bracket/commas) */
 function cleanUrl(u) {
   try { return u.replace(/[),.]+$/g, ""); } catch { return u; }
 }
@@ -487,6 +463,8 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
+
+    // persona avatar: absolute URL or null (omit if null)
     const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
@@ -494,7 +472,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
     if (!hook) {
       hook = await hookChannel.createWebhook({
         name: botname || meta?.botname || "AI",
-        avatar: personaAvatarUrl || undefined,
+        avatar: personaAvatarUrl || undefined, // undefined ok; relative is prevented earlier
       });
     }
 
@@ -535,7 +513,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
 
     const makeEmbed = (desc, i, n) => ({
       color: themeColor,
-      author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
+      author: { name: botname || meta?.botname || "AI", ...(personaAvatarUrl ? { icon_url: personaAvatarUrl } : {}) },
       description: desc,
       timestamp: new Date().toISOString(),
       footer: { text: (meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI")) + (n > 1 ? ` — Part ${i}/${n}` : "") }
@@ -551,14 +529,14 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       await hook.send({
         content: "",
         username: botname || meta?.botname || "AI",
-        avatarURL: personaAvatarUrl || undefined,
+        avatarURL: personaAvatarUrl || undefined, // must be absolute
         embeds: slice,
         allowedMentions: { parse: [] },
         threadId: isThread ? message.channel.id : undefined
       });
     }
   } catch (err) {
-    await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED", "WARN");
+    await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED");
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
@@ -774,8 +752,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
               });
             }
           } catch (err) {
-            // In voice pipeline we might not have a channel available → no channel param
-            reportError(err, null, "TRANSCRIPTION_FLOW", "WARN");
+            reportError(err, null, "TRANSCRIPTION_FLOW");
           } finally {
             try {
               const { dir } = await wavPromise;
@@ -793,7 +770,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         pcm.once("error",  () => finishOnce());
 
       } catch (err) {
-        reportError(err, null, "VOICE_SUBSCRIBE", "ERROR");
+        reportError(err, null, "VOICE_SUBSCRIBE");
         const cur = captures.get(key);
         if (cur?.opus) {
           try { cur.opus.removeAllListeners(); } catch {}
@@ -811,7 +788,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
       }
     });
   } catch (err) {
-    reportError(err, null, "SET_START_LISTENING", "ERROR");
+    reportError(err, null, "SET_START_LISTENING");
   }
 }
 
@@ -859,19 +836,52 @@ async function getSpeech(connection, guildId, text, client, voice) {
 
           await new Promise(r => setTimeout(r, 100));
         } catch (err) {
-          reportError(err, null, "TTS_CHUNK", "WARN");
+          reportError(err, null, "TTS_CHUNK");
         }
       }
     });
   } catch (err) {
-    reportError(err, null, "GET_SPEECH", "ERROR");
+    reportError(err, null, "GET_SPEECH");
   }
 }
 
 module.exports = {
   getChannelConfig,
   setMessageReaction,
-  setReplyAsWebhook,
+  setReplyAsWebhook: async (message, content, opts) => {
+    // (optional legacy function — aktuell nicht genutzt; Embed-Variante verwenden)
+    const { splitIntoChunks, sendChunked } = module.exports;
+    try {
+      const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+      const hookChannel = isThread ? message.channel.parent : message.channel;
+      const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+      const meta = getChannelConfig(effectiveChannelId);
+      const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
+
+      const hooks = await hookChannel.fetchWebhooks();
+      let hook = hooks.find((w) => w.name === (opts?.botname || meta?.botname || "AI"));
+      if (!hook) {
+        hook = await hookChannel.createWebhook({
+          name: opts?.botname || meta?.botname || "AI",
+          avatar: personaAvatarUrl || undefined,
+        });
+      }
+
+      const parts = splitIntoChunks(content);
+      for (const p of parts) {
+        await hook.send({
+          content: p,
+          username: opts?.botname || meta?.botname || "AI",
+          avatarURL: personaAvatarUrl || undefined,
+          allowedMentions: { parse: [] },
+          threadId: isThread ? message.channel.id : undefined
+        });
+      }
+    } catch (err) {
+      await reportError(err, message?.channel, "REPLY_WEBHOOK");
+      try { await sendChunked(message.channel, content); } catch {}
+    }
+  },
   splitIntoChunks,
   setAddUserMessage,
   sendChunked,

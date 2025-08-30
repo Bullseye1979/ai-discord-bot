@@ -1,4 +1,4 @@
-// discord-handler.js — refactored v3.0
+// discord-handler.js — refactored v2.9 + TOOLS_ACTIVE hack
 // Discord AI flow: routing to AI, token limits, tool setup, voice join, and gated TTS playback.
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
@@ -39,11 +39,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     await setMessageReaction(message, "⏳");
 
-    // Effective channel (threads → parent)
-    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
-    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
-
-    const channelMeta = getChannelConfig(effectiveChannelId);
+    const channelMeta = getChannelConfig(message.channelId);
     if (!channelMeta) {
       await setMessageReaction(message, "❌");
       return;
@@ -64,6 +60,10 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     // Disable auto-continue for speaker mode
     const sequenceLimit = isSpeakerMsg ? 1 : 1000;
+
+    // Effective channel id (threads → parent)
+    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
 
     // If speaker-triggered (voice), allow TTS for a short time window on this channel
     if (isSpeakerMsg) markTTSAllowedForChannel(effectiveChannelId);
@@ -148,6 +148,15 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
     }
 
+    // --- TOOLS_ACTIVE hack (INFO): zeige aktive Tool-Namen vor dem OpenAI-Call
+    const activeToolNames = (chatContext.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean);
+    await reportError(
+      new Error(`Active tools: ${activeToolNames.join(", ") || "(none)"}`),
+      message?.channel,
+      "TOOLS_ACTIVE",
+      "INFO"
+    );
+
     // AI call
     const output = await getAIResponse(
       chatContext,
@@ -168,7 +177,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       await setMessageReaction(message, "❌");
     }
   } catch (err) {
-    await reportError(err, message?.channel, "PROCESS_AI_REQUEST", "ERROR");
+    await reportError(err, message?.channel, "PROCESS_AI_REQUEST");
     try { await setMessageReaction(message, "❌"); } catch {}
   } finally {
     try {
@@ -197,7 +206,7 @@ async function setVoiceChannel(message, guildTextChannels) {
     guildTextChannels.set(message.guild.id, message.channel.id);
     await message.channel.send(`🔊 Joined **${channel.name}**. TTS ready.`);
   } catch (err) {
-    await reportError(err, message?.channel, "SET_VOICE_CHANNEL", "ERROR");
+    await reportError(err, message?.channel, "SET_VOICE_CHANNEL");
   }
 }
 
@@ -251,7 +260,7 @@ async function setTTS(message, client, guildTextChannels) {
       await getSpeech(connection, guildId, cleaned, client, meta?.voice);
     }
   } catch (err) {
-    await reportError(err, message?.channel, "SET_TTS", "ERROR");
+    await reportError(err, message?.channel, "SET_TTS");
   }
 }
 
@@ -259,5 +268,4 @@ module.exports = {
   getProcessAIRequest,
   setVoiceChannel,
   setTTS,
-  markTTSAllowedForChannel, // exported for testing if needed
 };
