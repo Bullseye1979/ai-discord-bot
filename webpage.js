@@ -1,26 +1,27 @@
-// webpage.js — clean v1.3
+// webpage.js — refactored v1.4
 // Fetches a webpage via Puppeteer, strips UI/noise, returns clean text; optional summarization.
 
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const { getAI } = require("./aiService.js");
 const Context = require("./context.js");
+const { reportError } = require("./error.js");
 
 puppeteer.use(StealthPlugin());
 
 /** Fetch, clean and optionally summarize a webpage (tool entry). */
 async function getWebpage(toolFunction) {
-  const args =
-    typeof toolFunction.arguments === "string"
-      ? JSON.parse(toolFunction.arguments || "{}")
-      : (toolFunction.arguments || {});
-  const url = String(args.url || "").trim();
-  const wantSummary = args.summary === true; // default: return clean text
-
-  if (!url) return "[ERROR]: WEBPAGE_INPUT — Missing 'url'.";
-
   let browser;
   try {
+    const args =
+      typeof toolFunction.arguments === "string"
+        ? JSON.parse(toolFunction.arguments || "{}")
+        : (toolFunction.arguments || {});
+    const url = String(args.url || "").trim();
+    const wantSummary = args.summary === true; // default: return clean text
+
+    if (!url) return "[ERROR]: WEBPAGE_INPUT — Missing 'url'.";
+
     browser = await puppeteer.launch({
       headless: "new",
       args: [
@@ -43,26 +44,36 @@ async function getWebpage(toolFunction) {
     });
 
     const resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
-    if (!resp) return "[ERROR]: WEBPAGE_FETCH — No response received.";
+    if (!resp) {
+      await reportError(new Error("No response from page.goto"), null, "WEBPAGE_FETCH_NO_RESPONSE", "WARN");
+      return "[ERROR]: WEBPAGE_FETCH — No response received.";
+    }
 
     const status = resp.status();
     const ctype = String(resp.headers()?.["content-type"] || "").toLowerCase();
 
     if (status >= 400) {
+      await reportError(new Error(`HTTP ${status} for ${url}`), null, "WEBPAGE_STATUS", "WARN");
       return `[ERROR]: WEBPAGE_STATUS — HTTP ${status} for ${url}`;
     }
 
+    // JSON → pretty print
     if (ctype.includes("application/json")) {
       const jsonText = await resp.text();
-      if (!jsonText || jsonText.length < 2) return "[ERROR]: WEBPAGE_JSON_EMPTY — Empty JSON body.";
+      if (!jsonText || jsonText.length < 2) {
+        await reportError(new Error("Empty JSON body"), null, "WEBPAGE_JSON_EMPTY", "WARN");
+        return "[ERROR]: WEBPAGE_JSON_EMPTY — Empty JSON body.";
+      }
       try {
         const parsed = JSON.parse(jsonText);
         return JSON.stringify(parsed, null, 2);
-      } catch {
+      } catch (e) {
+        await reportError(e, null, "WEBPAGE_JSON_PARSE", "ERROR");
         return "[ERROR]: WEBPAGE_JSON_PARSE — JSON could not be parsed.";
       }
     }
 
+    // HTML/XHTML → extrahieren
     if (ctype.includes("text/html") || ctype.includes("application/xhtml+xml")) {
       await page.waitForSelector("main, article, body", { timeout: 15000 }).catch(() => {});
       const { title, text } = await extractReadableText(page);
@@ -71,6 +82,7 @@ async function getWebpage(toolFunction) {
       if (!raw || raw.trim().length < 50) {
         const fallback = (await page.evaluate(() => document.body?.innerText || "")).trim();
         if (!fallback || fallback.length < 50) {
+          await reportError(new Error("Could not extract meaningful text."), null, "WEBPAGE_CONTENT_EMPTY", "WARN");
           return "[ERROR]: WEBPAGE_CONTENT_EMPTY — Could not extract meaningful text.";
         }
         return wantSummary ? await summarizeText(fallback.slice(0, 120000)) : fallback;
@@ -80,11 +92,15 @@ async function getWebpage(toolFunction) {
       return wantSummary ? await summarizeText(clipped) : clipped;
     }
 
+    // Andere Typen → Rohtext (geclippt) oder Fehler
     const rawOther = await resp.text().catch(() => "");
-    return rawOther && rawOther.length
-      ? rawOther.slice(0, 4000)
-      : "[ERROR]: WEBPAGE_UNSUPPORTED_TYPE — Unsupported content type.";
+    if (!rawOther || !rawOther.length) {
+      await reportError(new Error(`Unsupported content-type: ${ctype}`), null, "WEBPAGE_UNSUPPORTED_TYPE", "INFO");
+      return "[ERROR]: WEBPAGE_UNSUPPORTED_TYPE — Unsupported content type.";
+    }
+    return rawOther.slice(0, 4000);
   } catch (e) {
+    await reportError(e, null, "WEBPAGE_EXCEPTION", "ERROR");
     return `[ERROR]: WEBPAGE_EXCEPTION — ${e?.message || "Unexpected error."}`;
   } finally {
     try { await browser?.close(); } catch {}
@@ -95,31 +111,9 @@ async function getWebpage(toolFunction) {
 async function extractReadableText(page) {
   return page.evaluate(() => {
     const remove = [
-      "script",
-      "style",
-      "noscript",
-      "iframe",
-      "svg",
-      "canvas",
-      "form",
-      "nav",
-      "header",
-      "footer",
-      "aside",
-      "picture",
-      "video",
-      "audio",
-      "source",
-      "template",
-      "link",
-      "meta",
-      "button",
-      "input",
-      "select",
-      "textarea",
-      ".advertisement",
-      "[role='navigation']",
-      "[aria-hidden='true']",
+      "script","style","noscript","iframe","svg","canvas","form","nav","header","footer","aside",
+      "picture","video","audio","source","template","link","meta","button","input","select","textarea",
+      ".advertisement","[role='navigation']","[aria-hidden='true']",
     ];
     remove.forEach((sel) => document.querySelectorAll(sel).forEach((n) => n.remove()));
 
@@ -145,6 +139,7 @@ async function summarizeText(text) {
     const out = await getAI(ctx, 900, "gpt-4o");
     return out?.trim() || "[ERROR]: WEBPAGE_SUMMARY_EMPTY — No summary returned.";
   } catch (e) {
+    await reportError(e, null, "WEBPAGE_SUMMARY_FAIL", "ERROR");
     return `[ERROR]: WEBPAGE_SUMMARY_FAIL — ${e?.message || "Summarization failed."}`;
   }
 }

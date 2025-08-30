@@ -1,4 +1,4 @@
-// discord-helper.js — clean v2
+// discord-helper.js — refactored v2.2
 // Minimal helper set for Discord bot: config loading, webhook replies (with chunked embeds), TTS, voice capture, and small utilities.
 
 const fs = require("fs");
@@ -12,6 +12,7 @@ const prism = require("prism-media");
 const ffmpeg = require("fluent-ffmpeg");
 const axios = require("axios");
 const { getAIImage, getTranscription, getTTS } = require("./aiService.js");
+const { reportError } = require("./error.js");
 require("dotenv").config();
 
 ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH || "/usr/bin/ffmpeg");
@@ -48,16 +49,19 @@ async function buildVisualPromptFromPersona(personaText) {
 function resetTTSPlayer(guildId) {
   try {
     const p = playerMap.get(guildId);
-    if (p) {
-      try { p.stop(true); } catch {}
-      playerMap.delete(guildId);
-    }
-  } catch {}
+    if (!p) return;
+    try { p.stop(true); } catch {}
+    playerMap.delete(guildId);
+  } catch (err) {
+    reportError(err, null, "RESET_TTS_PLAYER", "WARN");
+  }
 }
 
 /* Clear internal recording flag to arm capture on next join */
 function resetRecordingFlag(guildId) {
-  try { activeRecordings.delete(guildId); } catch {}
+  try { activeRecordings.delete(guildId); } catch (err) {
+    reportError(err, null, "RESET_RECORDING_FLAG", "WARN");
+  }
 }
 
 /* Ensure a channel avatar image exists (generated from persona) and return its URL */
@@ -90,17 +94,17 @@ async function ensureChannelAvatar(channelId, channelMeta) {
     _avatarInFlight.delete(channelId);
 
     return `https://ralfreschke.de/documents/avatars/${channelId}.png`;
-  } catch (e) {
-    console.warn("[ensureChannelAvatar] failed:", e?.response?.data || e?.message || e);
+  } catch (err) {
     _avatarInFlight.delete(channelId);
+    reportError(err, null, "ENSURE_CHANNEL_AVATAR", "ERROR");
     return `https://ralfreschke.de/documents/avatars/default.png`;
   }
 }
 
 /* Load default persona/config from channel-config/default.json */
 function getDefaultPersona() {
-  const defaultPath = path.join(__dirname, "channel-config", "default.json");
   try {
+    const defaultPath = path.join(__dirname, "channel-config", "default.json");
     const data = fs.readFileSync(defaultPath, "utf8");
     const json = JSON.parse(data);
     return {
@@ -119,7 +123,8 @@ function getDefaultPersona() {
       max_tokens_chat: json.max_tokens_chat ?? json.maxTokensChat,
       max_tokens_speaker: json.max_tokens_speaker ?? json.maxTokensSpeaker,
     };
-  } catch {
+  } catch (err) {
+    reportError(err, null, "GET_DEFAULT_PERSONA", "WARN");
     return {
       persona: "", instructions: "", voice: "", name: "", botname: "",
       selectedTools: [], blocks: [], summaryPrompt: "", admins: [],
@@ -131,33 +136,33 @@ function getDefaultPersona() {
 
 /* Load merged channel config (default + per-channel JSON) */
 function getChannelConfig(channelId) {
-  const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
-  const def = getDefaultPersona();
+  try {
+    const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
+    const def = getDefaultPersona();
 
-  let persona = def.persona || "";
-  let instructions = def.instructions || "";
-  let voice = def.voice || "";
-  let name = def.name || "";
-  let botname = def.botname || "AI";
-  let selectedTools = def.selectedTools || def.tools || [];
-  let blocks = Array.isArray(def.blocks) ? def.blocks : [];
-  let summaryPrompt = def.summaryPrompt || def.summary_prompt || "";
-  let max_user_messages = (Number.isFinite(Number(def.max_user_messages)) && Number(def.max_user_messages) >= 0)
-    ? Number(def.max_user_messages)
-    : null;
-  let admins = Array.isArray(def.admins) ? def.admins.map(String) : [];
+    let persona = def.persona || "";
+    let instructions = def.instructions || "";
+    let voice = def.voice || "";
+    let name = def.name || "";
+    let botname = def.botname || "AI";
+    let selectedTools = def.selectedTools || def.tools || [];
+    let blocks = Array.isArray(def.blocks) ? def.blocks : [];
+    let summaryPrompt = def.summaryPrompt || def.summary_prompt || "";
+    let max_user_messages = (Number.isFinite(Number(def.max_user_messages)) && Number(def.max_user_messages) >= 0)
+      ? Number(def.max_user_messages)
+      : null;
+    let admins = Array.isArray(def.admins) ? def.admins.map(String) : [];
 
-  let max_tokens_chat = (Number.isFinite(Number(def.max_tokens_chat)) && Number(def.max_tokens_chat) > 0)
-    ? Math.floor(Number(def.max_tokens_chat)) : 4096;
-  let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0)
-    ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
+    let max_tokens_chat = (Number.isFinite(Number(def.max_tokens_chat)) && Number(def.max_tokens_chat) > 0)
+      ? Math.floor(Number(def.max_tokens_chat)) : 4096;
+    let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0)
+      ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
 
-  let chatAppend = typeof def.chatAppend === "string" ? def.chatAppend.trim() : "";
-  let speechAppend = typeof def.speechAppend === "string" ? def.speechAppend.trim() : "";
+    let chatAppend = typeof def.chatAppend === "string" ? def.chatAppend.trim() : "";
+    let speechAppend = typeof def.speechAppend === "string" ? def.speechAppend.trim() : "";
 
-  const hasConfigFile = fs.existsSync(configPath);
-  if (hasConfigFile) {
-    try {
+    const hasConfigFile = fs.existsSync(configPath);
+    if (hasConfigFile) {
       const raw = fs.readFileSync(configPath, "utf8");
       const cfg = JSON.parse(raw);
 
@@ -198,40 +203,46 @@ function getChannelConfig(channelId) {
 
       if (typeof cfgChatAppend === "string") chatAppend = cfgChatAppend.trim();
       if (typeof cfgSpeechAppend === "string") speechAppend = cfgSpeechAppend.trim();
-    } catch (e) {
-      console.error(`[ERROR] Failed to parse channel config ${channelId}:`, e.message);
     }
+
+    const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
+
+    const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
+    const avatarUrl = fs.existsSync(avatarPath)
+      ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
+      : `https://ralfreschke.de/documents/avatars/default.png`;
+
+    const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
+
+    return {
+      name,
+      botname,
+      voice,
+      persona,
+      avatarUrl,
+      instructions,
+      tools: ctxTools,
+      toolRegistry,
+      blocks,
+      summaryPrompt,
+      max_user_messages,
+      hasConfig: hasConfigFile,
+      summariesEnabled,
+      admins,
+      max_tokens_chat,
+      max_tokens_speaker,
+      chatAppend,
+      speechAppend,
+    };
+  } catch (err) {
+    reportError(err, null, "GET_CHANNEL_CONFIG", "ERROR");
+    return {
+      name: "", botname: "AI", voice: "", persona: "", avatarUrl: `https://ralfreschke.de/documents/avatars/default.png`,
+      instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
+      max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
+      max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
+    };
   }
-
-  const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
-
-  const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-  const avatarUrl = fs.existsSync(avatarPath)
-    ? `https://ralfreschke.de/documents/avatars/${channelId}.png`
-    : `https://ralfreschke.de/documents/avatars/default.png`;
-
-  const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
-
-  return {
-    name,
-    botname,
-    voice,
-    persona,
-    avatarUrl,
-    instructions,
-    tools: ctxTools,
-    toolRegistry,
-    blocks,
-    summaryPrompt,
-    max_user_messages,
-    hasConfig: hasConfigFile,
-    summariesEnabled,
-    admins,
-    max_tokens_chat,
-    max_tokens_speaker,
-    chatAppend,
-    speechAppend,
-  };
 }
 
 /* Split plain text into safe Discord message chunks (<=2000 chars) */
@@ -265,20 +276,28 @@ function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
 
 /* Send long content to a channel using chunking */
 async function sendChunked(channel, content) {
-  const parts = splitIntoChunks(content);
-  for (const p of parts) {
-    await channel.send({ content: p });
+  try {
+    const parts = splitIntoChunks(content);
+    for (const p of parts) {
+      await channel.send({ content: p });
+    }
+  } catch (err) {
+    await reportError(err, channel, "SEND_CHUNKED", "ERROR");
   }
 }
 
 /* Post a list of summaries as separate messages (with optional header) */
 async function postSummariesIndividually(channel, summaries, headerPrefix = null) {
-  for (let i = 0; i < summaries.length; i++) {
-    const header =
-      headerPrefix
-        ? `${headerPrefix} ${i + 1}/${summaries.length}`
-        : `**Summary ${i + 1}/${summaries.length}**`;
-    await sendChunked(channel, `${header}\n\n${summaries[i]}`);
+  try {
+    for (let i = 0; i < summaries.length; i++) {
+      const header =
+        headerPrefix
+          ? `${headerPrefix} ${i + 1}/${summaries.length}`
+          : `**Summary ${i + 1}/${summaries.length}**`;
+      await sendChunked(channel, `${header}\n\n${summaries[i]}`);
+    }
+  } catch (err) {
+    await reportError(err, channel, "POST_SUMMARIES", "ERROR");
   }
 }
 
@@ -290,8 +309,8 @@ async function setBotPresence(client, activityText = "✅ Ready", status = "onli
       activities: [{ name: activityText, type: activityType }],
       status,
     });
-  } catch (e) {
-    console.warn("[presence] setBotPresence failed:", e?.message || e);
+  } catch (err) {
+    reportError(err, null, "SET_BOT_PRESENCE", "WARN");
   }
 }
 
@@ -313,8 +332,8 @@ async function setAddUserMessage(message, chatContext) {
       "user";
 
     await chatContext.add("user", senderName, content);
-  } catch (e) {
-    console.warn("[setAddUserMessage] failed:", e?.message || e);
+  } catch (err) {
+    await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE", "ERROR");
   }
 }
 
@@ -338,8 +357,8 @@ function writePcmToWav(pcmReadable, { rate = 48000, channels = 1 } = {}) {
         .save(file)
         .on("end", () => resolve({ dir, file }))
         .on("error", reject);
-    } catch (e) {
-      reject(e);
+    } catch (err) {
+      reject(err);
     }
   });
 }
@@ -357,8 +376,8 @@ async function resolveSpeakerName(client, guildId, userId) {
 
 /* Add or replace a simple status reaction on a message (⏳/✅/❌) */
 async function setMessageReaction(message, emoji) {
-  const STATUS = ["⏳", "✅", "❌"];
   try {
+    const STATUS = ["⏳", "✅", "❌"];
     const me = message.client?.user;
     if (!me) return;
 
@@ -370,8 +389,8 @@ async function setMessageReaction(message, emoji) {
     if (emoji && STATUS.includes(emoji)) {
       await message.react(emoji).catch(() => {});
     }
-  } catch (e) {
-    console.warn("[setMessageReaction] failed:", e?.message || e);
+  } catch (err) {
+    await reportError(err, message?.channel, "SET_MESSAGE_REACTION", "WARN");
   }
 }
 
@@ -404,9 +423,9 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
         threadId: isThread ? message.channel.id : undefined
       });
     }
-  } catch (e) {
-    console.error("[Webhook Reply] failed:", e);
-    await sendChunked(message.channel, content);
+  } catch (err) {
+    await reportError(err, message?.channel, "REPLY_WEBHOOK", "ERROR");
+    try { await sendChunked(message.channel, content); } catch {}
   }
 }
 
@@ -574,8 +593,8 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
         threadId: isThread ? message.channel.id : undefined
       });
     }
-  } catch (e) {
-    console.error("[Webhook Embed Reply] failed:", e);
+  } catch (err) {
+    await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED", "ERROR");
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
@@ -598,8 +617,8 @@ async function setProcessTTSQueue(guildId) {
   try {
     await task();
     resolve();
-  } catch (e) {
-    reject(e);
+  } catch (err) {
+    reject(err);
   } finally {
     q.shift();
     if (q.length > 0) setProcessTTSQueue(guildId);
@@ -669,7 +688,7 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         const pcm = buf.subarray(44);
         const samples = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
 
-        const sr = 48000, frame = 960; // 20ms
+        const frame = 960; // 20ms @ 48k
         const totalFrames = Math.floor(samples.length / frame);
         if (totalFrames <= 0) return { snrDb: 0, voicedRatio: 0, voicedFrames: 0, totalFrames: 0, usefulMs: 0 };
 
@@ -791,7 +810,8 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
               });
             }
           } catch (err) {
-            console.warn("[Transcription] failed:", err?.message || err);
+            // Im Voice-Stream keine Channel-Garantie; daher ohne Channel posten
+            reportError(err, null, "TRANSCRIPTION_FLOW", "WARN");
           } finally {
             try {
               const { dir } = await wavPromise;
@@ -808,8 +828,8 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         pcm.once("end",    () => finishOnce());
         pcm.once("error",  () => finishOnce());
 
-      } catch (e) {
-        console.warn("[Voice subscribe] failed:", e?.message || e);
+      } catch (err) {
+        reportError(err, null, "VOICE_SUBSCRIBE", "ERROR");
         const cur = captures.get(key);
         if (cur?.opus) {
           try { cur.opus.removeAllListeners(); } catch {}
@@ -826,57 +846,62 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
         }
       }
     });
-  } catch (e) {
-    console.warn("[setStartListening] failed:", e?.message || e);
+  } catch (err) {
+    reportError(err, null, "SET_START_LISTENING", "ERROR");
   }
 }
 
 /* Generate speech from text and play it in sequence on a guild connection */
 async function getSpeech(connection, guildId, text, client, voice) {
-  if (!connection || !text?.trim()) return;
-  const chunks = getSplitTextToChunks(text);
+  try {
+    if (!connection || !text?.trim()) return;
+    const chunks = getSplitTextToChunks(text);
 
-  return setEnqueueTTS(guildId, async () => {
-    let player = playerMap.get(guildId);
-    if (!player) {
-      const { createAudioPlayer } = require("@discordjs/voice");
-      player = createAudioPlayer();
-      if (typeof player.setMaxListeners === "function") player.setMaxListeners(50);
-      playerMap.set(guildId, player);
-    }
-
-    try { connection.subscribe(player); } catch {}
-    const { AudioPlayerStatus } = require("@discordjs/voice");
-
-    for (const chunk of chunks) {
-      try {
-        const response = await getTTS(chunk, "tts-1", voice);
-        const pass = new (require("stream").PassThrough)();
-        response.pipe(pass);
-
-        const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
-        const pcmStream = pass.pipe(decoder);
-        const { createAudioResource, StreamType } = require("@discordjs/voice");
-        const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
-
-        await new Promise((resolve, reject) => {
-          const onIdle = () => { cleanup(); resolve(); };
-          const onError = (err) => { cleanup(); reject(err); };
-          const cleanup = () => {
-            try { player.off(AudioPlayerStatus.Idle, onIdle); } catch {}
-            try { player.off("error", onError); } catch {}
-          };
-          player.on(AudioPlayerStatus.Idle, onIdle);
-          player.on("error", onError);
-          player.play(resource);
-        });
-
-        await new Promise(r => setTimeout(r, 100));
-      } catch (e) {
-        console.error("[TTS ERROR]:", e);
+    return setEnqueueTTS(guildId, async () => {
+      let player = playerMap.get(guildId);
+      if (!player) {
+        const { createAudioPlayer } = require("@discordjs/voice");
+        player = createAudioPlayer();
+        if (typeof player.setMaxListeners === "function") player.setMaxListeners(50);
+        playerMap.set(guildId, player);
       }
-    }
-  });
+
+      try { connection.subscribe(player); } catch {}
+
+      const { AudioPlayerStatus } = require("@discordjs/voice");
+
+      for (const chunk of chunks) {
+        try {
+          const response = await getTTS(chunk, "tts-1", voice);
+          const pass = new PassThrough();
+          response.pipe(pass);
+
+          const decoder = new prism.FFmpeg({ args: ["-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2"] });
+          const pcmStream = pass.pipe(decoder);
+          const { createAudioResource, StreamType } = require("@discordjs/voice");
+          const resource = createAudioResource(pcmStream, { inputType: StreamType.Raw });
+
+          await new Promise((resolve, reject) => {
+            const onIdle = () => { cleanup(); resolve(); };
+            const onError = (err) => { cleanup(); reject(err); };
+            const cleanup = () => {
+              try { player.off(AudioPlayerStatus.Idle, onIdle); } catch {}
+              try { player.off("error", onError); } catch {}
+            };
+            player.on(AudioPlayerStatus.Idle, onIdle);
+            player.on("error", onError);
+            player.play(resource);
+          });
+
+          await new Promise(r => setTimeout(r, 100));
+        } catch (err) {
+          reportError(err, null, "TTS_CHUNK", "WARN");
+        }
+      }
+    });
+  } catch (err) {
+    reportError(err, null, "GET_SPEECH", "ERROR");
+  }
 }
 
 module.exports = {

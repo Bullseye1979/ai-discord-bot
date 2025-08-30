@@ -1,4 +1,4 @@
-// discord-handler.js — clean v2.8
+// discord-handler.js — refactored v3.0
 // Discord AI flow: routing to AI, token limits, tool setup, voice join, and gated TTS playback.
 
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
@@ -10,6 +10,7 @@ const {
 } = require("./discord-helper.js");
 const { getAIResponse } = require("./aiCore.js");
 const { getToolRegistry } = require("./tools.js");
+const { reportError } = require("./error.js");
 
 // TTS gate per channel (enabled temporarily after voice-triggered input)
 const ttsGate = new Map();
@@ -28,24 +29,22 @@ function markTTSAllowedForChannel(channelId, ttlMs = TTS_TTL_MS) {
 
 /** Run a full AI request for a Discord message (tools, limits, instructions, reply & logging) */
 async function getProcessAIRequest(message, chatContext, client, state, model, apiKey) {
-  if (state.isAIProcessing >= 3) {
-    try { await setMessageReaction(message, "❌"); } catch {}
-    return;
-  }
-
-  state.isAIProcessing++;
   let _instrBackup = chatContext.instructions;
-
   try {
+    if (state.isAIProcessing >= 3) {
+      await setMessageReaction(message, "❌");
+      return;
+    }
+    state.isAIProcessing++;
+
     await setMessageReaction(message, "⏳");
 
     const channelMeta = getChannelConfig(message.channelId);
-    if (!channelMeta) { await setMessageReaction(message, "❌"); return; }
 
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const isSpeakerMsg = !!message.webhookId;
 
-    // Token limit per mode (speaker vs chat) with sane clamps
+    // Token limit per mode (speaker vs chat) with clamps
     const tokenlimit = (() => {
       const raw = isSpeakerMsg
         ? (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker)
@@ -63,9 +62,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
 
     // If speaker-triggered (voice), allow TTS for a short time window on this channel
-    if (isSpeakerMsg) {
-      markTTSAllowedForChannel(effectiveChannelId);
-    }
+    if (isSpeakerMsg) markTTSAllowedForChannel(effectiveChannelId);
 
     // Block matching
     const speakerName = (message.member?.displayName || message.author?.username || "").trim().toLowerCase();
@@ -110,28 +107,24 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     }
 
     // Strict guard if no summaries exist
-    try {
-      const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
-      if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
-        _instrBackup = chatContext.instructions;
-        chatContext.instructions = (_instrBackup || "") +
-          "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
-          "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
-      }
-    } catch {}
+    const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
+    if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
+      _instrBackup = chatContext.instructions;
+      chatContext.instructions = (_instrBackup || "") +
+        "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
+        "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
+    }
 
     // Auto-append image URLs found in user attachments (non-webhook messages)
     const imageUrls = [];
-    try {
-      if (!message.webhookId && message.attachments?.size > 0) {
-        for (const att of message.attachments.values()) {
-          const ct = (att.contentType || att.content_type || "").toLowerCase();
-          const isImageCT  = ct.startsWith("image/");
-          const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
-          if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
-        }
+    if (!message.webhookId && message.attachments?.size > 0) {
+      for (const att of message.attachments.values()) {
+        const ct = (att.contentType || att.content_type || "").toLowerCase();
+        const isImageCT  = ct.startsWith("image/");
+        const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
+        if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
       }
-    } catch {}
+    }
 
     if (imageUrls.length) {
       const hasGetImageTool =
@@ -146,12 +139,10 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
     }
 
     // Mode-specific instruction append (chat vs speech)
-    try {
-      const modeAppend = (isSpeakerMsg ? channelMeta.speechAppend : channelMeta.chatAppend) || "";
-      if (modeAppend.trim()) {
-        chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
-      }
-    } catch {}
+    const modeAppend = (isSpeakerMsg ? channelMeta.speechAppend : channelMeta.chatAppend) || "";
+    if (modeAppend.trim()) {
+      chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
+    }
 
     // AI call
     const output = await getAIResponse(
@@ -173,7 +164,7 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       await setMessageReaction(message, "❌");
     }
   } catch (err) {
-    console.error("[AI ERROR]:", err);
+    await reportError(err, message?.channel, "PROCESS_AI_REQUEST", "ERROR");
     try { await setMessageReaction(message, "❌"); } catch {}
   } finally {
     try {
@@ -185,68 +176,78 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
 /** Join the caller’s voice channel and remember the associated text channel */
 async function setVoiceChannel(message, guildTextChannels) {
-  const channel = message.member?.voice?.channel;
-  if (!channel) {
-    await message.channel.send("❌ Join a voice channel first, then run `!joinvc`.");
-    return;
+  try {
+    const channel = message.member?.voice?.channel;
+    if (!channel) {
+      await message.channel.send("❌ Join a voice channel first, then run `!joinvc`.");
+      return;
+    }
+
+    joinVoiceChannel({
+      channelId: channel.id,
+      guildId: message.guild.id,
+      adapterCreator: message.guild.voiceAdapterCreator,
+      selfDeaf: false,
+    });
+
+    guildTextChannels.set(message.guild.id, message.channel.id);
+    await message.channel.send(`🔊 Joined **${channel.name}**. TTS ready.`);
+  } catch (err) {
+    await reportError(err, message?.channel, "SET_VOICE_CHANNEL", "ERROR");
   }
-
-  joinVoiceChannel({
-    channelId: channel.id,
-    guildId: message.guild.id,
-    adapterCreator: message.guild.voiceAdapterCreator,
-    selfDeaf: false,
-  });
-
-  guildTextChannels.set(message.guild.id, message.channel.id);
-  await message.channel.send(`🔊 Joined **${channel.name}**. TTS ready.`);
 }
 
 /** Speak AI webhook replies via TTS if the channel is temporarily allowed for TTS */
 async function setTTS(message, client, guildTextChannels) {
-  if (!message.guild) return;
+  try {
+    if (!message.guild) return;
 
-  const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
-  if (inThread && message.channel.name === "Transcripts") return;
+    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    if (inThread && message.channel.name === "Transcripts") return;
 
-  const txt = (message.content || "").trim();
-  const looksLikeSummary =
-    txt.startsWith("**Summary") ||
-    txt.includes("Summary in progress…") ||
-    txt.includes("Summary completed.");
-  if (looksLikeSummary) return;
+    const txt = (message.content || "").trim();
+    const looksLikeSummary =
+      txt.startsWith("**Summary") ||
+      txt.includes("Summary in progress…") ||
+      txt.includes("Summary completed.");
+    if (looksLikeSummary) return;
 
-  const isWebhook = !!message.webhookId;
-  const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
-  const meta = getChannelConfig(effectiveChannelId);
+    const isWebhook = !!message.webhookId;
+    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+    const meta = getChannelConfig(effectiveChannelId);
 
-  const isAIWebhook =
-    isWebhook &&
-    (await message.channel.fetchWebhooks().then(ws => {
-      const w = ws.find(x => x.id === message.webhookId);
-      return w && w.name === (meta?.botname || "AI");
-    }).catch(() => false));
+    const isAIWebhook =
+      isWebhook &&
+      (await message.channel.fetchWebhooks()
+        .then(ws => {
+          const w = ws.find(x => x.id === message.webhookId);
+          return w && w.name === (meta?.botname || "AI");
+        })
+        .catch(() => false));
 
-  if (!isAIWebhook) return;
+    if (!isAIWebhook) return;
 
-  const gate = ttsGate.get(String(effectiveChannelId));
-  if (!gate || gate < Date.now()) return;
+    const gate = ttsGate.get(String(effectiveChannelId));
+    if (!gate || gate < Date.now()) return;
 
-  const guildId = message.guild.id;
-  const expectedChannelId = guildTextChannels.get(guildId);
-  if (expectedChannelId && message.channel.id !== expectedChannelId) return;
+    const guildId = message.guild.id;
+    const expectedChannelId = guildTextChannels.get(guildId);
+    if (expectedChannelId && message.channel.id !== expectedChannelId) return;
 
-  const connection = getVoiceConnection(guildId);
-  if (!connection) return;
+    const connection = getVoiceConnection(guildId);
+    if (!connection) return;
 
-  const cleaned = txt
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
-    .replace(/https?:\/\/\S+/g, "Link")
-    .replace(/<@!?(\d+)>/g, "someone")
-    .replace(/:[^:\s]+:/g, "");
+    const cleaned = txt
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
+      .replace(/https?:\/\/\S+/g, "Link")
+      .replace(/<@!?(\d+)>/g, "someone")
+      .replace(/:[^:\s]+:/g, "");
 
-  if (cleaned) {
-    await getSpeech(connection, guildId, cleaned, client, meta?.voice);
+    if (cleaned) {
+      await getSpeech(connection, guildId, cleaned, client, meta?.voice);
+    }
+  } catch (err) {
+    await reportError(err, message?.channel, "SET_TTS", "ERROR");
   }
 }
 

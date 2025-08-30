@@ -1,10 +1,11 @@
-// aiCore.js — clean v1.7
-// Chat loop with tool-calls, safe logging, strict auto-continue guard.
+// aiCore.js — refactored v1.9
+// Chat loop with tool-calls, strict auto-continue guard, centralized error reporting.
 
 require("dotenv").config();
 const axios = require("axios");
 const { OPENAI_API_URL } = require("./config.js");
 const Context = require("./context.js");
+const { reportError } = require("./error.js");
 
 /** Sanitize 'name' per OpenAI schema; omit for system/tool roles */
 function cleanOpenAIName(role, name) {
@@ -25,36 +26,6 @@ function cleanOpenAIName(role, name) {
   return s;
 }
 
-/** Log axios errors without leaking secrets */
-function logAxiosErrorSafe(prefix, err) {
-  const redactAuth = (h = {}) => {
-    const out = { ...h };
-    if (out.authorization) out.authorization = "Bearer ***";
-    if (out.Authorization) out.Authorization = "Bearer ***";
-    return out;
-  };
-  const msg = err?.message || String(err);
-  console.error(prefix, msg);
-  if (err?.response) {
-    try {
-      const cfg = err.response.config || {};
-      console.error(`${prefix} Response:`, {
-        status: err.response.status,
-        statusText: err.response.statusText,
-        headers: redactAuth(err.response.headers),
-        data: err.response.data,
-        config: {
-          method: cfg.method,
-          url: cfg.url,
-          headers: cfg.headers ? redactAuth(cfg.headers) : undefined,
-        },
-      });
-    } catch (e) {
-      console.error(`${prefix} (while masking)`, e?.message || e);
-    }
-  }
-}
-
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
  * @param {Context} context_orig
@@ -70,195 +41,154 @@ async function getAIResponse(
   model = "gpt-4o",
   apiKey = null
 ) {
-  if (tokenlimit == null) tokenlimit = 4096;
-
-  const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
-  context.messages = [...context_orig.messages];
-
-  const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry);
-  handoverContext.messages = [...context_orig.messages];
-
-  const toolRegistry = context.toolRegistry;
-
-  try {
-    const sysParts = [];
-    if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
-    if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
-    const sysCombined = sysParts.join("\n\n").trim();
-    if (sysCombined) {
-      context.messages.unshift({ role: "system", content: sysCombined });
-    }
-  } catch {}
-
-  const nowUtc = new Date().toISOString();
-  context.messages.unshift({
-    role: "system",
-    content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`
-  });
-
   let responseMessage = "";
-  let hasToolCalls = false;
-  let continueResponse = false;
-  let sequenceCounter = 0;
+  try {
+    if (tokenlimit == null) tokenlimit = 4096;
 
-  const authKey = apiKey || process.env.OPENAI_API_KEY;
+    // Arbeitskopien des Kontexts (Antwort-Kontext + Handover für Tools)
+    const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
+    context.messages = [...context_orig.messages];
 
-  do {
-    const messagesToSend = context.messages.map((m) => {
-      const out = { role: m.role, content: m.content };
-      const safeName = cleanOpenAIName(m.role, m.name);
-      if (safeName) out.name = safeName;
-      if (m.tool_calls) out.tool_calls = m.tool_calls;
-      if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
-      return out;
-    });
+    const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry);
+    handoverContext.messages = [...context_orig.messages];
 
-    const payload = {
-      model,
-      messages: messagesToSend,
-      max_tokens: tokenlimit,
-      tool_choice: "auto",
-      tools: context.tools,
-    };
+    const toolRegistry = context.toolRegistry;
 
+    // Systemzusammensetzung
     try {
-      console.log("── getAIResponse → payload (preview) ──");
-      console.log(
-        JSON.stringify(
-          {
-            model,
-            max_tokens: tokenlimit,
-            tools: (context.tools || []).map((t) => t.function?.name),
-            messages_preview: messagesToSend.map((m) => ({
-              role: m.role,
-              name: m.name,
-              content:
-                (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 400),
-            })),
-          },
-          null,
-          2
-        )
-      );
+      const sysParts = [];
+      if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
+      if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
+      const sysCombined = sysParts.join("\n\n").trim();
+      if (sysCombined) {
+        context.messages.unshift({ role: "system", content: sysCombined });
+      }
     } catch {}
 
-    let aiResponse;
-    try {
-      aiResponse = await axios.post(OPENAI_API_URL, payload, {
-        headers: { Authorization: `Bearer ${authKey}`, "Content-Type": "application/json" },
+    // Zeit-Hinweis
+    const nowUtc = new Date().toISOString();
+    context.messages.unshift({
+      role: "system",
+      content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`
+    });
+
+    let hasToolCalls = false;
+    let continueResponse = false;
+    let sequenceCounter = 0;
+
+    const authKey = apiKey || process.env.OPENAI_API_KEY;
+
+    do {
+      // Nachrichten für API aufbereiten
+      const messagesToSend = context.messages.map((m) => {
+        const out = { role: m.role, content: m.content };
+        const safeName = cleanOpenAIName(m.role, m.name);
+        if (safeName) out.name = safeName;
+        if (m.tool_calls) out.tool_calls = m.tool_calls;
+        if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+        return out;
       });
 
+      const payload = {
+        model,
+        messages: messagesToSend,
+        max_tokens: tokenlimit,
+        tool_choice: "auto",
+        tools: context.tools,
+      };
+
+      // API Call
+      let aiResponse;
       try {
-        const meta = {
-          created: aiResponse.data?.created,
-          model: aiResponse.data?.model,
-          finish_reason: aiResponse.data?.choices?.[0]?.finish_reason,
-          has_tool_calls: !!aiResponse.data?.choices?.[0]?.message?.tool_calls,
-        };
-        console.log("getAIResponse ← OpenAI meta:", meta);
-      } catch {}
-    } catch (err) {
-      logAxiosErrorSafe("[FATAL] OpenAI chat error:", err);
-      throw err;
-    }
+        aiResponse = await axios.post(OPENAI_API_URL, payload, {
+          headers: { Authorization: `Bearer ${authKey}`, "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        await reportError(err, null, "OPENAI_CHAT", "ERROR");
+        throw err;
+      }
 
-    const choice = aiResponse.data.choices[0];
-    const aiMessage = choice.message;
-    const finishReason = choice.finish_reason;
+      const choice = aiResponse.data.choices[0];
+      const aiMessage = choice.message;
+      const finishReason = choice.finish_reason;
 
-    hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
+      hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
 
-    if (aiMessage.tool_calls) {
-      context.messages.push({
-        role: "assistant",
-        tool_calls: aiMessage.tool_calls || null,
-      });
+      if (aiMessage.tool_calls) {
+        context.messages.push({
+          role: "assistant",
+          tool_calls: aiMessage.tool_calls || null,
+        });
+      }
 
-      try {
-        console.log(
-          "ToolCalls:",
-          aiMessage.tool_calls.map((tc) => ({
-            id: tc.id,
-            name: tc.function?.name,
-            args: tc.function?.arguments,
-          }))
-        );
-      } catch {}
-    }
+      if (aiMessage.content) {
+        responseMessage += (aiMessage.content || "").trim();
+      }
 
-    if (aiMessage.content) {
-      responseMessage += (aiMessage.content || "").trim();
-    }
+      // Tool-Ausführung (gezielt gekapselt pro Tool)
+      if (hasToolCalls) {
+        for (const toolCall of aiMessage.tool_calls) {
+          const fnName = toolCall?.function?.name;
+          const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
 
-    if (hasToolCalls) {
-      for (const toolCall of aiMessage.tool_calls) {
-        const fnName = toolCall?.function?.name;
-        const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
+          const replyTool = (content) => {
+            const out =
+              typeof content === "string" || content == null
+                ? content || ""
+                : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
 
-        const replyTool = (content) => {
-          const out =
-            typeof content === "string" || content == null
-              ? content || ""
-              : (() => {
-                  try {
-                    return JSON.stringify(content);
-                  } catch {
-                    return String(content);
-                  }
-                })();
+            context.messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: out,
+            });
+          };
 
-          context.messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: out,
-          });
-        };
+          if (!toolFunction) {
+            const msg = `Tool '${fnName}' not available or arguments invalid.`;
+            await reportError(new Error(msg), null, "TOOL_MISSING", "WARN");
+            replyTool(`[ERROR]: ${msg}`);
+            continue;
+          }
 
-        if (!toolFunction) {
-          const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
-          console.error(msg);
-          replyTool(msg);
-          continue;
-        }
-
-        try {
-          console.log("Execute Tool:", { tool: fnName, args: toolCall.function?.arguments });
-          const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse);
-          console.log(
-            "Tool Result (first 400 chars):",
-            typeof toolResult === "string" ? toolResult.slice(0, 400) : toolResult
-          );
-          replyTool(toolResult || "");
-        } catch (toolError) {
-          const emsg = toolError?.message || String(toolError);
-          console.error(`[ERROR] Tool execution failed for '${fnName}':`, emsg);
-          replyTool({ error: emsg, tool: fnName });
+          try {
+            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse);
+            replyTool(toolResult || "");
+          } catch (toolError) {
+            const emsg = toolError?.message || String(toolError);
+            await reportError(toolError, null, "TOOL_EXEC", "ERROR");
+            replyTool({ error: emsg, tool: fnName });
+          }
         }
       }
-    }
 
-    sequenceCounter++;
+      sequenceCounter++;
 
-    const dueToLength = !hasToolCalls && finishReason === "length";
+      const dueToLength = !hasToolCalls && finishReason === "length";
 
-    if (sequenceLimit <= 1) {
-      continueResponse = false;
-    } else if (dueToLength) {
-      if (sequenceCounter < sequenceLimit) {
-        if ((aiMessage.content || "").trim()) {
-          context.messages.push({ role: "assistant", content: (aiMessage.content || "").trim() });
+      if (sequenceLimit <= 1) {
+        continueResponse = false;
+      } else if (dueToLength) {
+        if (sequenceCounter < sequenceLimit) {
+          if ((aiMessage.content || "").trim()) {
+            context.messages.push({ role: "assistant", content: (aiMessage.content || "").trim() });
+          }
+          context.messages.push({ role: "user", content: "continue" });
+          continueResponse = true;
+        } else {
+          continueResponse = false;
         }
-        context.messages.push({ role: "user", content: "continue" });
-        continueResponse = true;
       } else {
         continueResponse = false;
       }
-    } else {
-      continueResponse = false;
-    }
-  } while (hasToolCalls || continueResponse);
+    } while (hasToolCalls || continueResponse);
 
-  return responseMessage;
+    return responseMessage;
+  } catch (err) {
+    await reportError(err, null, "GET_AI_RESPONSE", "ERROR");
+    // Fehler an Aufrufer weitergeben, damit der äußere Handler korrekt reagieren kann
+    throw err;
+  }
 }
 
 module.exports = { getAIResponse };
