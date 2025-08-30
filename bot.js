@@ -607,10 +607,8 @@ function onClientReadyOnce() {
     reportError(err, null, "READY_INIT", { emit: "console" });
   }
 }
-// New name (v14+ future): clientReady
+
 client.once("clientReady", onClientReadyOnce);
-// Back-compat for current versions:
-client.once("ready", onClientReadyOnce);
 
 // ==== Startup ====
 (async () => {
