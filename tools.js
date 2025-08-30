@@ -116,7 +116,7 @@ const tools = [
     type: "function",
     function: {
       name: "getHistory",
-      description: "Run a READ-ONLY MySQL SELECT over this channel’s history. The model must write the full SELECT. Allowed tables: context_log(id,timestamp,channel_id,role,sender,content) and summaries(id,timestamp,channel_id,summary,last_context_id). Always include a WHERE with :channel_id.",
+      description: "Use this, to get the history of the chat, when you don't find the information in the context. Run a READ-ONLY MySQL SELECT over this channel’s history. The model must write the full SELECT. Allowed tables: context_log(id,timestamp,channel_id,role,sender,content) and summaries(id,timestamp,channel_id,summary,last_context_id). Always include a WHERE with :channel_id.",
       parameters: {
         type: "object",
         properties: {

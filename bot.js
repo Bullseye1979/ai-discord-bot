@@ -21,8 +21,8 @@ const {
   sendChunked,
   resetTTSPlayer,
   resetRecordingFlag,
-  postSummariesIndividually,
 } = require("./discord-helper.js");
+
 const { reportError, reportInfo, reportWarn } = require("./error.js");
 const { getToolRegistry } = require("./tools.js"); // voice block toolset
 
@@ -617,11 +617,7 @@ client.on("messageCreate", async (message) => {
         return;
       }
 
-      await reportInfo(
-        message.channel,
-        "**Summary in progress…** New messages won’t be considered.",
-        "SUMMARY"
-      );
+      await reportInfo(message.channel, "**Summary in progress…** New messages won’t be considered.", "SUMMARY");
 
       const cutoffMs = Date.now();
       const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
@@ -645,39 +641,47 @@ client.on("messageCreate", async (message) => {
       }
 
       try {
+        // Fetch & render summaries as Persona via webhook embed:
         const last5Desc = await chatContext.getLastSummaries(5);
-        const summariesAsc = (last5Desc || [])
-          .slice()
-          .reverse()
-          .map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
+        const summariesAsc = (last5Desc || []).slice().reverse();
 
         if (summariesAsc.length === 0) {
-          await reportInfo(message.channel, "No summaries available yet.", "SUMMARY");
+          await setReplyAsWebhookEmbed(
+            message,
+            "No summaries available yet.",
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
         } else {
-          await postSummariesIndividually(message.channel, summariesAsc, null);
+          const combined = summariesAsc
+            .map((r, i) => `**Summary ${i + 1}/${summariesAsc.length} — ${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`)
+            .join("\n\n");
+
+          await setReplyAsWebhookEmbed(
+            message,
+            combined,
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
         }
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_POST", { emit: "channel" });
       }
 
-      try {
-        await chatContext.bumpCursorToCurrentMax();
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_BUMP", { emit: "channel" });
+      try { await chatContext.bumpCursorToCurrentMax(); } catch (e) {
+        await reportError(e, message.channel, "CMD_SUMMARIZE_BUMP");
       }
 
       try {
-        await chatContext.collapseToSystemAndLastSummary();        
+        await chatContext.collapseToSystemAndLastSummary();
+        await reportInfo(message.channel, "RAM context collapsed to: **System + last summary**.", "SUMMARY");
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE", { emit: "channel" });
         await reportInfo(message.channel, "RAM context collapse failed (kept full memory).", "SUMMARY");
       }
 
-      try {
-        await reportInfo(message.channel, "**Summary completed.**", "SUMMARY");
-      } catch {}
+      try { await reportInfo(message.channel, "**Summary completed.**", "SUMMARY"); } catch {}
       return;
     }
+
 
     // Normal flow: explicit trigger
     if (message.author?.bot || message.webhookId) return;
