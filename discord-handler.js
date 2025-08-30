@@ -39,7 +39,15 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     await setMessageReaction(message, "⏳");
 
-    const channelMeta = getChannelConfig(message.channelId);
+    // Effective channel (threads → parent)
+    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
+    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
+
+    const channelMeta = getChannelConfig(effectiveChannelId);
+    if (!channelMeta) {
+      await setMessageReaction(message, "❌");
+      return;
+    }
 
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const isSpeakerMsg = !!message.webhookId;
@@ -56,10 +64,6 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
 
     // Disable auto-continue for speaker mode
     const sequenceLimit = isSpeakerMsg ? 1 : 1000;
-
-    // Effective channel id (threads → parent)
-    const inThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
-    const effectiveChannelId = inThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
 
     // If speaker-triggered (voice), allow TTS for a short time window on this channel
     if (isSpeakerMsg) markTTSAllowedForChannel(effectiveChannelId);
@@ -255,4 +259,5 @@ module.exports = {
   getProcessAIRequest,
   setVoiceChannel,
   setTTS,
+  markTTSAllowedForChannel, // exported for testing if needed
 };
