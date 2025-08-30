@@ -1,4 +1,6 @@
-// aiCore.js — refactored v2.0 (pendingUser injection, safe logging, strict auto-continue guard)
+// aiCore.js — refactored v2.0
+// Chat loop with tool-calls, safe logging, strict auto-continue guard.
+// NEW: pendingUser working-copy + post-commit of user + tool messages with original timestamp.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -27,12 +29,12 @@ function cleanOpenAIName(role, name) {
 
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
- * @param {Context} context_orig
- * @param {number} tokenlimit
- * @param {number} sequenceLimit
- * @param {string} model
+ * @param {Context} context_orig          // persistent channel context (DB-backed)
+ * @param {number}  tokenlimit
+ * @param {number}  sequenceLimit
+ * @param {string}  model
  * @param {string|null} apiKey
- * @param {object|null} pendingUser  // { name, content, timestamp } — injected only into working copy
+ * @param {object}  options               // { pendingUser?: {name, content, timestamp} }
  */
 async function getAIResponse(
   context_orig,
@@ -40,13 +42,16 @@ async function getAIResponse(
   sequenceLimit = 1000,
   model = "gpt-4o",
   apiKey = null,
-  pendingUser = null
+  options = {}
 ) {
   let responseMessage = "";
+  let usedAnyTool = false;
+  const pendingUser = options?.pendingUser || null;
+
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
-    // Working copies (do NOT mutate context_orig)
+    // Working copies (reply context + tool-handover), MUST carry channelId for tools like getHistory
     const context = new Context(
       "",
       "",
@@ -87,25 +92,22 @@ async function getAIResponse(
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`
     });
 
-    // Inject the *ephemeral* user message (ONLY into working copy)
-    if (pendingUser && String(pendingUser.content || "").trim()) {
-      context.messages.push({
-        role: "user",
-        content: String(pendingUser.content).trim(),
-        name: pendingUser.name ? pendingUser.name : undefined,
-        // keep timestamp on our side; API does not accept it, but we don't send it.
-        timestamp: pendingUser.timestamp || Date.now(),
-      });
+    // If we have a pending user-turn, PUT IT ONLY INTO THE WORKING COPY (not into context_orig yet!)
+    if (pendingUser && pendingUser.content) {
+      const safeName = cleanOpenAIName("user", pendingUser.name || "user");
+      const msg = { role: "user", content: pendingUser.content };
+      if (safeName) msg.name = safeName;
+      context.messages.push(msg);
+      handoverContext.messages.push({ ...msg }); // tools may peek the same working sequence
     }
 
-    let hasToolCalls = false;
+    const toolCommits = []; // { name: fnName, content: string }
     let continueResponse = false;
     let sequenceCounter = 0;
 
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
     do {
-      // Prepare messages for API
       const messagesToSend = context.messages.map((m) => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
@@ -138,7 +140,7 @@ async function getAIResponse(
       const aiMessage = choice.message;
       const finishReason = choice.finish_reason;
 
-      hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
+      const hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
 
       if (aiMessage.tool_calls) {
         context.messages.push({
@@ -153,6 +155,7 @@ async function getAIResponse(
 
       // Tool execution
       if (hasToolCalls) {
+        usedAnyTool = true;
         for (const toolCall of aiMessage.tool_calls) {
           const fnName = toolCall?.function?.name;
           const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
@@ -168,6 +171,8 @@ async function getAIResponse(
               tool_call_id: toolCall.id,
               content: out,
             });
+            // record for commit later
+            toolCommits.push({ name: fnName || "tool", content: out });
           };
 
           if (!toolFunction) {
@@ -177,14 +182,14 @@ async function getAIResponse(
           }
 
           try {
-            // Provide runtime with channel_id to tools (e.g., getHistory)
+            // Runtime with channel_id for getHistory etc.
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
             const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
-            await reportError(toolError, null, `TOOL_${fnName.toUpperCase()}`);
-            replyTool({ error: emsg, tool: fnName });
+            await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
+            replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
           }
         }
       }
@@ -208,7 +213,25 @@ async function getAIResponse(
       } else {
         continueResponse = false;
       }
-    } while (hasToolCalls || continueResponse);
+    } while (usedAnyTool || continueResponse); // keep looping until tools resolved (and optional continue)
+
+    // === Post-commit to the persistent context in correct temporal order ===
+    // 1) The pending user message (always commit it, tools or not), with original timestamp
+    if (pendingUser && pendingUser.content) {
+      try {
+        await context_orig.add("user", pendingUser.name || "user", pendingUser.content, pendingUser.timestamp || Date.now());
+      } catch {}
+    }
+    // 2) If tools ran, commit their outputs right after, anchored near original time (+1ms per tool)
+    if (pendingUser && toolCommits.length > 0) {
+      let t0 = (pendingUser.timestamp || Date.now());
+      for (let i = 0; i < toolCommits.length; i++) {
+        const tmsg = toolCommits[i];
+        try {
+          await context_orig.add("tool", tmsg.name || "tool", tmsg.content, t0 + i + 1);
+        } catch {}
+      }
+    }
 
     return responseMessage;
   } catch (err) {

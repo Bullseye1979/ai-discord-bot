@@ -1,4 +1,4 @@
-// bot.js — refactored v3.11 (pendingUser injection for text & voice, preserve original timestamps)
+// bot.js — refactored v3.11 (typed tool-calls restored, per-message reactions, presence, one-shot BUSY gate, tool-flow commit)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -21,10 +21,11 @@ const {
   sendChunked,
   resetTTSPlayer,
   resetRecordingFlag,
+  setMessageReaction,
 } = require("./discord-helper.js");
 
 const { reportError, reportInfo, reportWarn } = require("./error.js");
-const { getToolRegistry } = require("./tools.js"); // voice block toolset
+const { getToolRegistry } = require("./tools.js"); // block toolset
 
 const client = new Client({
   intents: [
@@ -40,6 +41,20 @@ const contextStorage = new Map();
 const guildTextChannels = new Map();    // guildId -> textChannelId (for TTS/transcripts)
 const voiceBusy = new Map();            // channelId -> boolean (busy while LLM+TTS runs)
 const busyNoticeSent = new Map();       // channelId -> boolean (BUSY notice already shown during this busy period)
+
+// ==== Presence counter (⏳ while >0 active tasks; ✅ when idle) ====
+let _activeTasks = 0;
+function incPresence() {
+  _activeTasks++;
+  try { setBotPresence(client, "⌛ Working", "online"); } catch {}
+}
+function decPresence() {
+  _activeTasks = Math.max(0, _activeTasks - 1);
+  try {
+    if (_activeTasks === 0) setBotPresence(client, "✅ Ready", "online");
+    else setBotPresence(client, "⌛ Working", "online");
+  } catch {}
+}
 
 /** Ensure a Context instance for a channel, rebuilding when config signature changes */
 function ensureChatContextForChannel(channelId, storage, channelMeta) {
@@ -185,8 +200,8 @@ async function deleteAllMessages(channel) {
   }
 }
 
-/** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate; pendingUser) */
-async function handleVoiceTranscriptDirect(evt, client, storage) {
+/** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate) */
+async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {
   let ch = null;
   let chatContext = null;
   try {
@@ -205,7 +220,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       });
     }
 
-    // Block selection for voice
+    // Block selection for voice (speaker OR user id)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const speakerNameLower = String(evt.speaker || "").trim().toLowerCase();
     const userId = String(evt.userId || "").trim();
@@ -267,8 +282,9 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
         : def;
     })();
 
-    // mark busy *before* any await — ensures strict gating
+    // mark busy + presence *before* any await — ensures strict gating + presence
     voiceBusy.set(evt.channelId, true);
+    incPresence();
 
     const sequenceLimit = 1;
     const instrBackup = chatContext.instructions;
@@ -279,34 +295,18 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
           (chatContext.instructions || "") + "\n\n" + add;
     } catch {}
 
-    // Build pendingUser for VOICE (do NOT persist yet)
-    const pendingUser = {
-      name: evt.speaker || "user",
-      content: String(evt.text || "").trim(),
-      timestamp: typeof evt.startedAtMs === "number" ? evt.startedAtMs : Date.now(),
-    };
-
     let replyText = await getAIResponse(
       chatContext,
       tokenlimit,
       sequenceLimit,
       effectiveModel,
       effectiveApiKey,
-      pendingUser // <<< inject ephemeral voice user message
+      { pendingUser: pendingUserTurn } // pass pending user-turn for working copy + commit after
     );
     replyText = (replyText || "").trim();
     if (!replyText) return;
 
-    // Persist in DB with ORIGINAL user timestamp, then assistant with "now"
     try {
-      if (pendingUser.content) {
-        await chatContext.add(
-          "user",
-          pendingUser.name || "user",
-          pendingUser.content,
-          pendingUser.timestamp || Date.now()
-        );
-      }
       await chatContext.add(
         "assistant",
         channelMeta.botname || "AI",
@@ -348,11 +348,12 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
   } catch (err) {
     await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT", { emit: "channel" });
   } finally {
-    // End of busy period → allow next voice, reset the one-shot BUSY flag.
+    // End of busy period → allow next voice, reset the one-shot BUSY flag, presence --
     try {
       voiceBusy.set(evt.channelId, false);
       busyNoticeSent.delete(evt.channelId);
     } catch {}
+    decPresence();
   }
 }
 
@@ -427,13 +428,19 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // We will log normal user chatter AFTER we decide it's NOT a trigger.
-    // This prevents adding "pending" requests to the DB before the model/tool finished.
-    // (So we intentionally skip setAddUserMessage here.)
+    // We only store non-trigger normal chat into context immediately.
+    // Triggered AI turns will be passed as pendingUser to getAIResponse and committed after tools finish.
+    const authorId = String(message.author?.id || "");
+    const norm = (rawText || "").toLowerCase();
+    const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
+    const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
+
+    if (!isCommand && !isTrigger && !message.author?.bot && !message.webhookId) {
+      await setAddUserMessage(message, chatContext);
+    }
 
     // Consent quick-commands
     {
-      const authorId = String(message.author?.id || "");
       const lower = rawText.toLowerCase();
 
       if (lower.startsWith("+consent_chat")) {
@@ -517,21 +524,12 @@ client.on("messageCreate", async (message) => {
     if (rawText.startsWith("!joinvc")) {
       try {
         let gm = null;
-        try {
-          gm = await message.guild.members.fetch(message.author.id);
-        } catch {}
+        try { gm = await message.guild.members.fetch(message.author.id); } catch {}
         const vc = gm?.voice?.channel || message.member?.voice?.channel;
-        if (!vc) {
-          await reportInfo(message.channel, "Join a voice channel first.", "VOICE");
-          return;
-        }
+        if (!vc) { await reportInfo(message.channel, "Join a voice channel first.", "VOICE"); return; }
 
         const old = getVoiceConnection(message.guild.id);
-        if (old) {
-          try {
-            old.destroy();
-          } catch {}
-        }
+        if (old) { try { old.destroy(); } catch {} }
 
         resetRecordingFlag(message.guild.id);
         resetTTSPlayer(message.guild.id);
@@ -580,11 +578,16 @@ client.on("messageCreate", async (message) => {
               return; // do NOT log this utterance, do NOT queue anything
             }
 
-            // Not busy → strip trigger and run pipeline (do NOT persist user yet)
+            // Not busy → prepare pending user-turn (do NOT write to context yet)
             const textForLog = stripLeadingName(evt.text, TRIGGER);
+            const pendingUserTurn = {
+              name: evt.speaker || "user",
+              content: (textForLog || "").trim(),
+              timestamp: evt.startedAtMs || Date.now(),
+            };
 
-            // run the full voice pipeline (sets busy and clears it on completion)
-            await handleVoiceTranscriptDirect({ ...evt, text: textForLog }, client, contextStorage);
+            // run the full voice pipeline (sets busy/presence and commits after tools finish)
+            await handleVoiceTranscriptDirect({ ...evt, text: textForLog }, client, contextStorage, pendingUserTurn);
 
             // one-shot notice is reset at end of busy period (also in finally of handler)
             busyNoticeSent.delete(evt.channelId);
@@ -594,11 +597,7 @@ client.on("messageCreate", async (message) => {
         });
       } catch (e) {
         await reportError(e, message.channel, "CMD_JOINVC", { emit: "channel" });
-        await reportInfo(
-          message.channel,
-          "Failed to join/move. Check my permissions (Connect/Speak) and try again.",
-          "VOICE"
-        );
+        await reportInfo(message.channel, "Failed to join/move. Check my permissions (Connect/Speak) and try again.", "VOICE");
       }
       return;
     }
@@ -608,9 +607,7 @@ client.on("messageCreate", async (message) => {
       try {
         const conn = getVoiceConnection(message.guild.id);
         if (conn) {
-          try {
-            conn.destroy();
-          } catch {}
+          try { conn.destroy(); } catch {}
           guildTextChannels.delete(message.guild.id);
           await reportInfo(message.channel, "Left the voice channel.", "VOICE");
         } else {
@@ -643,7 +640,11 @@ client.on("messageCreate", async (message) => {
           (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
 
         if (!createdNew) {
-          await reportInfo(message.channel, "No messages to summarize yet.", "SUMMARY");
+          await setReplyAsWebhookEmbed(
+            message,
+            "No messages to summarize yet.",
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
           return;
         }
       } catch (e) {
@@ -694,73 +695,95 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // ===== Normal flow: explicit trigger =====
+    // Normal flow: explicit trigger (typed chat)
     if (message.author?.bot || message.webhookId) return;
-    const authorId = String(message.author?.id || "");
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
-    const norm = (rawText || "").toLowerCase();
-    const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
+    if (!isTrigger) return;
 
-    // If NOT a trigger: now we can add this as normal user chatter to context immediately.
-    if (!isTrigger) {
-      await setAddUserMessage(message, chatContext);
-      return;
-    }
+    // Reactions + presence
+    await setMessageReaction(message, "⏳");
+    incPresence();
 
-    // Strip the trigger name for the model
-    const visibleUserName =
-      message.member?.displayName || message.author?.username || "user";
-    const userTextForModel = stripLeadingName(rawText, channelMeta.name || "");
+    // Block selection for typed chat — by user id
+    let effectiveModel = channelMeta.model || "gpt-4o";
+    let effectiveApiKey = channelMeta.apikey || null;
 
-    // pendingUser for TEXT (do NOT persist yet)
-    const pendingUser = {
-      name: visibleUserName,
-      content: String(userTextForModel || "").trim(),
-      timestamp: typeof message.createdTimestamp === "number" ? message.createdTimestamp : Date.now(),
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const pickBlockForUser = () => {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
+        if (!us.length) continue;
+        if (us.includes("*") && !wildcard) wildcard = b;
+        if (authorId && us.includes(authorId) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
     };
+    const matchingBlock = pickBlockForUser();
+
+    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
+    } else {
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+    if (matchingBlock?.model)  effectiveModel  = matchingBlock.model;
+    if (matchingBlock?.apikey) effectiveApiKey = matchingBlock.apikey;
 
     const tokenlimit = (() => {
-      const raw = (channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat);
+      const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
       const v = Number(raw);
       const def = 4096;
-      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+      return Number.isFinite(v) && v > 0
+        ? Math.max(32, Math.min(8192, Math.floor(v)))
+        : def;
     })();
 
-    const output = await getAIResponse(
-      chatContext,
-      tokenlimit,
-      1000,
-      channelMeta.model || "gpt-4o",
-      channelMeta.apikey || null,
-      pendingUser // <<< inject ephemeral text user message
-    );
+    // typed: use chatAppend only
+    const instrBackup = chatContext.instructions;
+    try {
+      const add = (channelMeta.chatAppend || "").trim();
+      if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
+    } catch {}
 
-    if (output && String(output).trim()) {
-      // Persist in DB using ORIGINAL user timestamp, then assistant with "now"
-      try {
-        if (pendingUser.content) {
-          await chatContext.add(
-            "user",
-            pendingUser.name || "user",
-            pendingUser.content,
-            pendingUser.timestamp || Date.now()
-          );
-        }
-        await chatContext.add(
-          "assistant",
-          channelMeta?.botname || "AI",
-          output,
-          Date.now()
-        );
-      } catch {}
+    try {
+      const textForLog = stripLeadingName(rawText, triggerName);
+      const pendingUserTurn = {
+        name: message.member?.displayName || message.author?.username || "user",
+        content: (textForLog || "").trim(),
+        timestamp: message.createdTimestamp || Date.now(),
+      };
 
-      await setReplyAsWebhookEmbed(message, output, {
-        botname: channelMeta.botname,
-        color: 0x00b3ff,
-      });
+      const output = await getAIResponse(
+        chatContext,
+        tokenlimit,
+        1000,
+        effectiveModel,
+        effectiveApiKey,
+        { pendingUser: pendingUserTurn }
+      );
+
+      if (output && String(output).trim()) {
+        await setReplyAsWebhookEmbed(message, output, {
+          botname: channelMeta.botname,
+          color: 0x00b3ff,
+        });
+        await chatContext.add("assistant", channelMeta?.botname || "AI", output);
+        await setMessageReaction(message, "✅");
+      } else {
+        await reportInfo(message.channel, "No output produced.", "AI");
+        await setMessageReaction(message, "❌");
+      }
+    } catch (err) {
+      await reportError(err, message?.channel, "ON_MESSAGE_CREATE_TYPED", { emit: "channel" });
+      try { await setMessageReaction(message, "❌"); } catch {}
+    } finally {
+      try { chatContext.instructions = instrBackup; } catch {}
+      decPresence();
     }
   } catch (err) {
     await reportError(err, message?.channel, "ON_MESSAGE_CREATE", { emit: "channel" });
@@ -772,10 +795,9 @@ function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
-    setBotPresence(client, "✅ Started", "online");
+    setBotPresence(client, "✅ Ready", "online");
     initCron(client, contextStorage);
   } catch (err) {
-    // no channel available here; still mark emit: "channel" for consistency
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }
 }
@@ -786,7 +808,6 @@ client.once("clientReady", onClientReadyOnce);
   try {
     await client.login(process.env.DISCORD_TOKEN);
   } catch (err) {
-    // no channel available here; still mark emit: "channel" for consistency
     reportError(err, null, "LOGIN", { emit: "channel" });
   }
 })();
