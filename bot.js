@@ -1,4 +1,4 @@
-// bot.js — refactored v3.7
+// bot.js — refactored v3.6 (FIX: import getProcessAIRequest)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -24,7 +24,9 @@ const {
   postSummariesIndividually,
 } = require("./discord-helper.js");
 const { reportError } = require("./error.js");
-const { getToolRegistry } = require("./tools.js"); // ⬅️ NEU: für Block-/Tool-Overrides im Voice-Pfad
+
+// ✅ fehlte im Refactor
+const { getProcessAIRequest } = require("./discord-handler.js");
 
 const client = new Client({
   intents: [
@@ -170,42 +172,14 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
     }
 
-    // --- Block-/Tool-Selection für Voice ---
-    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-    const speakerName = String(evt.speaker || "").trim().toLowerCase();
-
-    function pickBlockForSpeaker() {
-      let exact = null, wildcard = null;
-      for (const b of blocks) {
-        const sp = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).trim().toLowerCase()) : [];
-        if (!sp.length) continue;
-        if (sp.includes("*") && !wildcard) wildcard = b;
-        if (speakerName && sp.includes(speakerName) && !exact) exact = b;
-      }
-      return exact || wildcard || null;
-    }
-
-    const matchingBlock = pickBlockForSpeaker();
-
-    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
-      chatContext.tools = blockTools;
-      chatContext.toolRegistry = blockRegistry;
-    } else {
-      chatContext.tools = channelMeta.tools;
-      chatContext.toolRegistry = channelMeta.toolRegistry;
-    }
-
-    // Tokenlimit & Sequenz
     const tokenlimit = (() => {
       const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
       const v = Number(raw);
       const def = 1024;
       return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
     })();
-    const sequenceLimit = 1;
 
-    // Speech-Append
+    const sequenceLimit = 1;
     const instrBackup = chatContext.instructions;
     try {
       const add = (channelMeta.speechAppend || "").trim();
@@ -214,16 +188,13 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
 
     voiceBusy.set(evt.channelId, true);
 
-    // Modell / API-Key aus Block respektieren
-    const useModel  = (matchingBlock && matchingBlock.model)  || channelMeta.model || undefined;
-    const useApiKey = (matchingBlock && matchingBlock.apikey) || channelMeta.apikey || null;
-
-    let replyText = await getAIResponse(
+    let replyText = "";
+    replyText = await getAIResponse(
       chatContext,
       tokenlimit,
       sequenceLimit,
-      useModel,
-      useApiKey
+      channelMeta.model || undefined,
+      channelMeta.apikey || null
     );
     replyText = (replyText || "").trim();
     if (!replyText) return;
@@ -300,6 +271,11 @@ client.on("messageCreate", async (message) => {
 
     if (typeof chatContext.setUserWindow === "function") {
       chatContext.setUserWindow(parsedWindow, { prunePerTwoNonUser: true });
+      console.log("[CTX] setUserWindow", {
+        channel: baseChannelId,
+        rawWindow,
+        effective: chatContext._maxUserMessages
+      });
     }
 
     const rawText = (message.content || "").trim();

@@ -1,8 +1,7 @@
-// history.js — refactored v1.2
+// history.js — clean v1.2
 // Run a flexible READ-ONLY MySQL SELECT over the channel history (context_log, summaries only).
 
 const mysql = require("mysql2/promise");
-const { reportError } = require("./error.js");
 
 let pool = null;
 
@@ -16,7 +15,7 @@ async function getPool() {
       database: process.env.DB_NAME,
       waitForConnections: true,
       connectionLimit: 5,
-      charset: "utf8mb4",
+      charset: "utf8mb4"
     });
   }
   return pool;
@@ -27,11 +26,25 @@ function compileNamed(sql, bindings) {
   const values = [];
   const cleaned = String(sql || "").replace(/;+\s*$/, "");
   const out = cleaned.replace(/:(\w+)/g, (_, name) => {
-    if (!(name in bindings)) throw new Error(`Missing binding for :${name}`);
+    if (!(name in bindings)) {
+      throw new Error(`Missing binding for :${name}`);
+    }
     values.push(bindings[name]);
     return "?";
   });
-  return /\blimit\s+\d+/i.test(out) ? { sql: out, values } : { sql: `${out} LIMIT 200`, values };
+  // LIMIT ergänzen, wenn fehlend
+  if (!/\blimit\s+\d+(\s*,\s*\d+)?\s*$/i.test(out)) return { sql: `${out} LIMIT 200`, values };
+  return { sql: out, values };
+}
+
+/** Ensures there's an ORDER BY timestamp ASC, putting it before LIMIT when needed. */
+function ensureOrderByTimestamp(sql) {
+  if (/\border\s+by\b/i.test(sql)) return sql; // bereits vorhanden
+  const limitMatch = sql.match(/\blimit\s+\d+(\s*,\s*\d+)?\s*$/i);
+  if (limitMatch) {
+    return sql.replace(limitMatch[0], `ORDER BY timestamp ASC ${limitMatch[0]}`);
+  }
+  return `${sql} ORDER BY timestamp ASC`;
 }
 
 /** Truncates long string fields in result rows. */
@@ -53,8 +66,8 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     if (!sql) throw new Error("SQL missing");
 
     let channelId = "";
-    if (runtime?.channel_id) channelId = String(runtime.channel_id).trim();
-    else if (ctxOrUndefined?.channelId) channelId = String(ctxOrUndefined.channelId).trim();
+    if (runtime && runtime.channel_id) channelId = String(runtime.channel_id).trim();
+    else if (ctxOrUndefined && ctxOrUndefined.channelId) channelId = String(ctxOrUndefined.channelId).trim();
     if (!channelId) throw new Error("channel_id missing");
 
     const lowered = sql.toLowerCase();
@@ -65,7 +78,10 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     if (!/:channel_id\b/.test(sql)) throw new Error("Query must include :channel_id in WHERE");
 
     const bindings = { channel_id: channelId, ...extra };
-    const { sql: compiled, values } = compileNamed(sql, bindings);
+    let { sql: compiled, values } = compileNamed(sql, bindings);
+
+    // Immer nach timestamp sortieren (vor LIMIT, wenn vorhanden)
+    compiled = ensureOrderByTimestamp(compiled);
 
     const db = await getPool();
     const [rows] = await db.execute(compiled, values);
@@ -78,8 +94,6 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     return JSON.stringify({ rowCount: safe.length, rows: safe });
   } catch (err) {
-    // Kein Channel-Objekt im Tool-Kontext – nur zentrale Meldung.
-    await reportError(err, null, "HISTORY_TOOL", "ERROR");
     return JSON.stringify({ error: `[ERROR]: ${err?.message || String(err)}` });
   }
 }

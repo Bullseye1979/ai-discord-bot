@@ -1,5 +1,5 @@
 // aiCore.js — refactored v1.9
-// Chat loop with tool-calls, strict auto-continue guard, centralized error reporting.
+// Chat loop with tool-calls, safe logging, strict auto-continue guard.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -46,10 +46,11 @@ async function getAIResponse(
     if (tokenlimit == null) tokenlimit = 4096;
 
     // Arbeitskopien des Kontexts (Antwort-Kontext + Handover für Tools)
-    const context = new Context("", "", context_orig.tools, context_orig.toolRegistry);
+    const context = new Context("", "", context_orig.tools, context_orig.toolRegistry, context_orig.channelId, { persistToDB: false, skipInitialSummaries: true });
     context.messages = [...context_orig.messages];
 
-    const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry);
+    // ⬅️ WICHTIG: Handover-Kontext mit channelId, damit Tools (z.B. getHistory) channel_id bekommen
+    const handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry, context_orig.channelId, { persistToDB: false, skipInitialSummaries: true });
     handoverContext.messages = [...context_orig.messages];
 
     const toolRegistry = context.toolRegistry;
@@ -104,7 +105,7 @@ async function getAIResponse(
           headers: { Authorization: `Bearer ${authKey}`, "Content-Type": "application/json" },
         });
       } catch (err) {
-        await reportError(err, null, "OPENAI_CHAT", "ERROR");
+        await reportError(err, null, "OPENAI_CHAT");
         throw err;
       }
 
@@ -125,7 +126,7 @@ async function getAIResponse(
         responseMessage += (aiMessage.content || "").trim();
       }
 
-      // Tool-Ausführung (gezielt gekapselt pro Tool)
+      // Tool-Ausführung
       if (hasToolCalls) {
         for (const toolCall of aiMessage.tool_calls) {
           const fnName = toolCall?.function?.name;
@@ -145,18 +146,17 @@ async function getAIResponse(
           };
 
           if (!toolFunction) {
-            const msg = `Tool '${fnName}' not available or arguments invalid.`;
-            await reportError(new Error(msg), null, "TOOL_MISSING", "WARN");
-            replyTool(`[ERROR]: ${msg}`);
+            const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
+            replyTool(msg);
             continue;
           }
 
           try {
-            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse);
+            // ⬅️ handoverContext enthält channelId → Tools können channel_id nutzen
+            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, { channel_id: context_orig.channelId });
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
-            await reportError(toolError, null, "TOOL_EXEC", "ERROR");
             replyTool({ error: emsg, tool: fnName });
           }
         }
@@ -185,8 +185,7 @@ async function getAIResponse(
 
     return responseMessage;
   } catch (err) {
-    await reportError(err, null, "GET_AI_RESPONSE", "ERROR");
-    // Fehler an Aufrufer weitergeben, damit der äußere Handler korrekt reagieren kann
+    await reportError(err, null, "GET_AI_RESPONSE");
     throw err;
   }
 }
