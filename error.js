@@ -1,108 +1,201 @@
-// error.js — v2.0
-// Zentrale Meldungs-Funktion mit Leveln (INFO, WARN, ERROR, FATAL).
-// Optionaler Channel-Output (embedfrei, chunk-sicher), kompakte Console-Log Ausgabe.
+// error.js — v2.0 (colored embeds for info/warn/error, console + optional channel)
+// Usage examples:
+//   await reportInfo(message.channel, "Connected", "VOICE");
+//   await reportWarn(message.channel, "Rate limited, retrying …", "HTTP");
+//   await reportError(err, message.channel, "CMD_JOINVC", { emit: "channel" });
 
-const LEVELS = ["INFO", "WARN", "ERROR", "FATAL"];
-const ICON = { INFO: "ℹ️", WARN: "⚠️", ERROR: "❌", FATAL: "💥" };
+const util = require("util");
 
-// lazy import, um Zyklen zu vermeiden
-function ensureHelper() {
+// Discord brand-ish colors
+const COLORS = {
+  info: 0x57F287,   // green
+  warn: 0xFAA61A,   // orange
+  error: 0xED4245,  // red
+};
+
+// Redaction of secrets in strings
+function redact(s) {
   try {
-    // Nur wenn wir in den Channel posten wollen:
-    // sendChunked ist robust für 2000-char Limits
-    // NICHT am Modul-Top importieren -> sonst Zirkularabhängigkeiten möglich.
-    const { sendChunked } = require("./discord-helper.js");
-    return { sendChunked };
+    let t = String(s ?? "");
+    const patterns = [
+      /Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*/gi,
+      /OPENAI_API_KEY\s*=\s*[A-Za-z0-9\-\._~]+/gi,
+      /apikey\s*[:=]\s*["']?[A-Za-z0-9\-\._~]+["']?/gi,
+      /authorization\s*[:=]\s*["']?Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*["']?/gi,
+      /password\s*[:=]\s*["'][^"']+["']/gi,
+      /pass(word)?\b[^:\n]*:\s*[^,\n]+/gi,
+    ];
+    for (const re of patterns) t = t.replace(re, "[redacted]");
+    return t;
   } catch {
-    return { sendChunked: null };
+    return String(s ?? "");
   }
 }
 
-/** Baut eine kompakte Textzeile für den Channel. */
-function formatForChannel(level, tag, text) {
-  const L = LEVELS.includes(level) ? level : "INFO";
-  const icon = ICON[L] || "";
-  const t = tag ? `[${tag}]` : "";
-  return `${icon} **${L}** ${t} ${text}`.trim();
+function toShortString(obj, max = 1200) {
+  try {
+    if (obj instanceof Error) {
+      const base = `${obj.name}: ${obj.message}\n${obj.stack || ""}`;
+      const s = redact(base);
+      return s.length > max ? s.slice(0, max) + "…" : s;
+    }
+    if (typeof obj === "string") {
+      const s = redact(obj);
+      return s.length > max ? s.slice(0, max) + "…" : s;
+    }
+    const s = redact(util.inspect(obj, { depth: 2, breakLength: 120 }));
+    return s.length > max ? s.slice(0, max) + "…" : s;
+  } catch {
+    return String(obj ?? "");
+  }
 }
 
-/** Extrahiert aus Error/axios-Fehlern eine kurze Konsolenmeldung. */
-function toConsoleLine(level, tag, errOrText) {
-  const L = LEVELS.includes(level) ? level : "INFO";
-  const base = tag ? `[${tag}]` : "";
-  if (errOrText instanceof Error) {
-    const msg = errOrText.message || String(errOrText);
-    return `${L} ${base} ${msg}`;
+function buildEmbed({ level, tag, title, body, fields }) {
+  const color =
+    level === "info" ? COLORS.info :
+    level === "warn" ? COLORS.warn :
+    COLORS.error;
+
+  const emoji =
+    level === "info" ? "🟢" :
+    level === "warn" ? "🟠" :
+    "🔴";
+
+  const safeTitle = title || `${emoji} ${tag || level.toUpperCase()}`;
+  const embed = {
+    color,
+    title: safeTitle,
+    description: body ? String(body) : undefined,
+    timestamp: new Date().toISOString(),
+  };
+
+  if (Array.isArray(fields) && fields.length) {
+    embed.fields = fields
+      .filter(f => f && f.name && f.value)
+      .slice(0, 20)
+      .map(f => ({ name: String(f.name).slice(0, 256), value: String(f.value).slice(0, 1024) }));
   }
-  if (typeof errOrText === "object") {
-    try { return `${L} ${base} ${JSON.stringify(errOrText).slice(0, 1000)}`; }
-    catch { return `${L} ${base} ${String(errOrText)}`; }
+
+  return embed;
+}
+
+async function sendEmbed(channel, embed) {
+  if (!channel) return;
+  try {
+    await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  } catch {
+    // Fallback to plain text if embeds fail
+    const lines = [
+      `**${embed.title || "Notice"}**`,
+      embed.description || "",
+      ...(embed.fields || []).map(f => `• **${f.name}:** ${f.value}`),
+    ].filter(Boolean);
+    try { await channel.send(lines.join("\n")); } catch {}
   }
-  return `${L} ${base} ${String(errOrText)}`;
 }
 
 /**
- * Zentrale Reporting-Funktion.
- * @param {Error|string|object|null} err  - Fehlerobjekt ODER bereits formatierter Text (für INFO)
- * @param {object|null} channel           - Discord.js Channel-Objekt (optional)
- * @param {string|null} tag               - Kurzer Kontext (z.B. "CMD_JOINVC")
- * @param {("INFO"|"WARN"|"ERROR"|"FATAL")} level  - Standard: "ERROR"
- * @param {string|null} overrideText      - Wenn gesetzt, dieser Text wird in den Channel gepostet
+ * Report an INFO message (green embed)
+ * @param {TextBasedChannel|null} channel
+ * @param {string} text
+ * @param {string} tag
+ * @param {{emit?: 'channel'|'console'|'both', details?: any, title?: string}} opts
  */
-async function reportError(err, channel = null, tag = null, level = "ERROR", overrideText = null) {
-  const L = LEVELS.includes(level) ? level : "ERROR";
+async function reportInfo(channel, text, tag = "INFO", opts = {}) {
+  const emit = opts.emit || (channel ? "both" : "console");
+  const body = toShortString(text);
 
-  // 1) Console (kompakt, einmalig zentral)
-  try {
-    const line = toConsoleLine(L, tag, err ?? overrideText ?? "");
-    // Eine schlanke Ausgabe reicht, stacktraces nur bei FATAL:
-    if (L === "FATAL" && err && err.stack) {
-      console.error(line, "\n", err.stack);
-    } else if (L === "ERROR" || L === "WARN") {
-      console.warn(line);
-    } else {
-      console.log(line);
-    }
-  } catch {}
+  if (emit === "console" || emit === "both") {
+    // Keep console concise
+    console.log(`[INFO][${tag}] ${body}`);
+    if (opts.details) console.log(`[INFO][${tag}][details]`, toShortString(opts.details));
+  }
 
-  // 2) Optional in den Channel posten
-  try {
-    if (channel && typeof channel.send === "function") {
-      const { sendChunked } = ensureHelper();
-      const messageText =
-        overrideText != null
-          ? String(overrideText)
-          : (err instanceof Error ? (err.message || String(err)) : String(err ?? ""));
-
-      if (messageText && messageText.trim()) {
-        const payload = formatForChannel(L, tag, messageText.trim());
-        if (sendChunked) {
-          await sendChunked(channel, payload);
-        } else {
-          await channel.send(payload);
-        }
-      }
-    }
-  } catch {
-    // Channel-Fehler bei der Meldung werden still geschluckt, um Schleifen zu vermeiden.
+  if ((emit === "channel" || emit === "both") && channel) {
+    const fields = [];
+    if (opts.details) fields.push({ name: "Details", value: "```" + toShortString(opts.details, 900) + "```" });
+    const embed = buildEmbed({
+      level: "info",
+      tag,
+      title: opts.title || null,
+      body,
+      fields,
+    });
+    await sendEmbed(channel, embed);
   }
 }
 
-/** Bequeme Helfer für normale Channel-Ausgaben */
-async function reportInfo(channel, text, tag = "INFO") {
-  return reportError(text, channel, tag, "INFO");
+/**
+ * Report a WARNING (orange embed)
+ * @param {TextBasedChannel|null} channel
+ * @param {string} text
+ * @param {string} tag
+ * @param {{emit?: 'channel'|'console'|'both', details?: any, title?: string}} opts
+ */
+async function reportWarn(channel, text, tag = "WARN", opts = {}) {
+  const emit = opts.emit || (channel ? "both" : "console");
+  const body = toShortString(text);
+
+  if (emit === "console" || emit === "both") {
+    console.warn(`[WARN][${tag}] ${body}`);
+    if (opts.details) console.warn(`[WARN][${tag}][details]`, toShortString(opts.details));
+  }
+
+  if ((emit === "channel" || emit === "both") && channel) {
+    const fields = [];
+    if (opts.details) fields.push({ name: "Details", value: "```" + toShortString(opts.details, 900) + "```" });
+    const embed = buildEmbed({
+      level: "warn",
+      tag,
+      title: opts.title || null,
+      body,
+      fields,
+    });
+    await sendEmbed(channel, embed);
+  }
 }
-async function reportWarn(channel, text, tag = "WARN") {
-  return reportError(text, channel, tag, "WARN");
-}
-async function reportFatal(err, channel, tag = "FATAL") {
-  return reportError(err, channel, tag, "FATAL");
+
+/**
+ * Report an ERROR/FATAL (red embed)
+ * @param {Error|string|any} err
+ * @param {TextBasedChannel|null} channel
+ * @param {string} tag
+ * @param {{emit?: 'channel'|'console'|'both', fatal?: boolean, title?: string, details?: any}} opts
+ */
+async function reportError(err, channel, tag = "ERROR", opts = {}) {
+  const emit = opts.emit || (channel ? "both" : "console");
+  const isFatal = !!opts.fatal;
+
+  const message = err instanceof Error ? err.message : (typeof err === "string" ? err : "");
+  const stack = err instanceof Error ? err.stack : null;
+
+  const body = toShortString(message || err);
+  const details = opts.details || stack || null;
+
+  if (emit === "console" || emit === "both") {
+    const line = `[${isFatal ? "FATAL" : "ERROR"}][${tag}] ${body}`;
+    isFatal ? console.error(line) : console.error(line);
+    if (details) console.error(`[${isFatal ? "FATAL" : "ERROR"}][${tag}][details]`, toShortString(details));
+  }
+
+  if ((emit === "channel" || emit === "both") && channel) {
+    const fields = [];
+    if (details) fields.push({ name: isFatal ? "Stack/Details" : "Details", value: "```" + toShortString(details, 900) + "```" });
+
+    const embed = buildEmbed({
+      level: "error",
+      tag: isFatal ? (tag || "FATAL") : tag,
+      title: opts.title || null,
+      body,
+      fields,
+    });
+
+    await sendEmbed(channel, embed);
+  }
 }
 
 module.exports = {
-  reportError,
   reportInfo,
   reportWarn,
-  reportFatal,
-  LEVELS,
+  reportError,
 };
