@@ -23,39 +23,42 @@ const _avatarInFlight = new Map();
 const queueMap = new Map();
 const playerMap = new Map();
 
-/* Build a concise visual prompt from persona text */
-async function buildVisualPromptFromPersona(personaText) {
-  const { getAI } = require("./aiService.js");
-  const ctx = {
-    messages: [
-      {
-        role: "system",
-        content:
-          "Convert an assistant persona into ONE concise visual prompt for a square avatar. " +
-          "Be concrete: vibe/age, outfit, colors, expression, background. No text/logos/frames/brands. " +
-          "End with 'square portrait, centered, neutral background, soft lighting'. ~80 words max."
-      },
-      {
-        role: "user",
-        content: "Persona:\n" + (personaText || "").trim() + "\n\nCreate the avatar prompt now."
-      }
-    ]
-  };
-  const prompt = (await getAI(ctx, 180, "gpt-4o"))?.trim();
-  return prompt || "Friendly character portrait, square portrait, centered, neutral background, soft lighting";
+// Hilfsfunktion: baut eine HTTP/HTTPS-URL für Webhook/Embed (keine relativen /documents Pfade!)
+function buildPublicAvatarUrl(channelId) {
+  const base = (process.env.PUBLIC_BASE_URL || "https://ralfreschke.de").replace(/\/$/, "");
+  return `${base}/documents/avatars/${channelId}.png`;
 }
 
-/* Stop and dispose the TTS player for a guild */
-function resetTTSPlayer(guildId) {
-  try {
-    const p = playerMap.get(guildId);
-    if (p) {
-      try { p.stop(true); } catch {}
-      playerMap.delete(guildId);
-    }
-  } catch (err) {
-    reportError(err, null, "RESET_TTS_PLAYER");
-  }
+/* Build a concise visual prompt from persona text */
+async function buildVisualPromptFromPersona(personaText, channelMeta = {}) {
+  const { getAI } = require("./aiService.js");
+  const botname = (channelMeta?.botname || channelMeta?.name || "bot").toString().trim();
+  const sys = [
+    "You convert an assistant persona + bot/channel context into ONE concise visual prompt",
+    "for a DISCORD BOT AVATAR / ICON.",
+    "Hard rules:",
+    "- style: flat vector illustration, clean lines, high contrast, iconic silhouette",
+    "- composition: square, head-and-shoulders (centered), neutral background",
+    "- mood: friendly, trustworthy; readable at 64–128 px",
+    "- color: cohesive limited palette; avoid harsh gradients",
+    "- NO: text, letters, numbers, watermarks, logos, brand marks, frames, UI mockups",
+    "- output ~80 words max, in English",
+    "End with: 'square avatar, centered, flat vector, high contrast, no text, neutral background'."
+  ].join("\n");
+
+  const user = [
+    `Bot name: ${botname}`,
+    personaText ? `Persona:\n${personaText.trim()}` : "Persona: (not provided)",
+    "Create the final avatar prompt now."
+  ].join("\n\n");
+
+  const ctx = { messages: [{ role: "system", content: sys }, { role: "user", content: user }] };
+  const prompt = (await getAI(ctx, 220, "gpt-4o-mini"))?.trim();
+  return (
+    prompt ||
+    `Minimal, friendly ${botname} mascot head-and-shoulders, cohesive limited colors, clean vector lines; ` +
+    `square avatar, centered, flat vector, high contrast, no text, neutral background`
+  );
 }
 
 /* Clear internal recording flag to arm capture on next join */
@@ -72,45 +75,28 @@ async function ensureChannelAvatar(channelId, channelMeta) {
   try {
     const dir = path.join(__dirname, "documents", "avatars");
     const file = path.join(dir, `${channelId}.png`);
-    if (fs.existsSync(file)) {
-      const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-      return base ? `${base}/documents/avatars/${channelId}.png` : `https://ralfreschke.de/documents/avatars/${channelId}.png`;
-    }
+    const sidecar = path.join(dir, `${channelId}.prompt.txt`);
 
+    await fs.promises.mkdir(dir, { recursive: true });
+
+    // Falls bereits vorhanden → URL zurück
+    if (fs.existsSync(file)) return buildPublicAvatarUrl(channelId);
+
+    // Persona evtl. leer → trotzdem einen guten Bot-Avatar erzeugen
     const persona = (channelMeta?.persona || "").trim();
-    if (!persona) {
-      const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-      return base ? `${base}/documents/avatars/default.png` : `https://ralfreschke.de/documents/avatars/default.png`;
-    }
+    const visualPrompt = await buildVisualPromptFromPersona(persona, channelMeta);
 
-    if (_avatarInFlight.has(channelId)) {
-      await _avatarInFlight.get(channelId);
-      const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-      const exists = fs.existsSync(file);
-      return base
-        ? `${base}/documents/avatars/${exists ? channelId : "default"}.png`
-        : `https://ralfreschke.de/documents/avatars/${exists ? channelId : "default"}.png`;
-    }
+    // Prompt neben der PNG speichern (Debug / Nachvollziehbarkeit)
+    try { await fs.promises.writeFile(sidecar, visualPrompt, "utf8"); } catch {}
 
-    const p = (async () => {
-      await fs.promises.mkdir(dir, { recursive: true });
-      const visualPrompt = await buildVisualPromptFromPersona(persona);
-      const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
-      const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
-      await fs.promises.writeFile(file, Buffer.from(res.data));
-    })();
+    const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
+    const res = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    await fs.promises.writeFile(file, Buffer.from(res.data));
 
-    _avatarInFlight.set(channelId, p);
-    await p;
-    _avatarInFlight.delete(channelId);
-
-    const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-    return base ? `${base}/documents/avatars/${channelId}.png` : `https://ralfreschke.de/documents/avatars/${channelId}.png`;
+    return buildPublicAvatarUrl(channelId);
   } catch (err) {
-    _avatarInFlight.delete(channelId);
     reportError(err, null, "ENSURE_CHANNEL_AVATAR");
-    const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-    return base ? `${base}/documents/avatars/default.png` : `https://ralfreschke.de/documents/avatars/default.png`;
+    return buildPublicAvatarUrl("default");
   }
 }
 
