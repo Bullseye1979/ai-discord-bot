@@ -1,6 +1,5 @@
-// bot.js — v3.9 (BUSY once-per-phase + yellow, color-coded embeds via error.js)
-// Commands: !context, !summarize, !purge-db, !joinvc, !leavevc.
-// Voice transcripts → AI reply + TTS. Cron support. Static /documents.
+// bot.js — refactored v3.9 (ready→clientReady fix + strict one-shot BUSY gate)
+// Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
@@ -25,6 +24,7 @@ const {
   postSummariesIndividually,
 } = require("./discord-helper.js");
 const { reportError, reportInfo } = require("./error.js");
+const { getToolRegistry } = require("./tools.js"); // voice block toolset
 
 const client = new Client({
   intents: [
@@ -37,18 +37,10 @@ const client = new Client({
 });
 
 const contextStorage = new Map();
-const guildTextChannels = new Map(); // guildId -> textChannelId (for TTS/transcripts)
-const voiceBusy = new Map();         // channelId -> boolean
+const guildTextChannels = new Map();    // guildId -> textChannelId (for TTS/transcripts)
+const voiceBusy = new Map();            // channelId -> boolean (busy while LLM+TTS runs)
+const busyNoticeSent = new Map();       // channelId -> boolean (have we shown the yellow BUSY embed this busy period?)
 
-// NEW: BUSY announcement is shown only once per busy phase
-const busyAnnounced = new Map();     // channelId -> boolean
-const BUSY_TEXT =
-  "🔊 **I'm currently speaking a response.**\n" +
-  "I can handle only one voice request per channel at a time to keep things clear. " +
-  "Please wait a moment — as soon as I'm done, I'll listen again and take the next input.\n\n" +
-  "_Tip:_ You don't need to repeat your question.";
-
-/** Ensure a Context instance for a channel, rebuilding when config signature changes */
 function ensureChatContextForChannel(channelId, storage, channelMeta) {
   try {
     const key = `channel:${channelId}`;
@@ -86,12 +78,10 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
     return storage.get(key).ctx;
   } catch (err) {
     reportError(err, null, "ENSURE_CHAT_CONTEXT");
-    const ctx = new Context("", "", [], {}, channelId);
-    return ctx;
+    return new Context("", "", [], {}, channelId);
   }
 }
 
-/** If the first word equals trigger name (case-insensitive) */
 function firstWordEqualsName(text, triggerName) {
   if (!triggerName) return false;
   const t = String(triggerName).trim().toLowerCase();
@@ -100,7 +90,6 @@ function firstWordEqualsName(text, triggerName) {
   return first === t;
 }
 
-/** Strip a leading trigger name + optional punctuation */
 function stripLeadingName(text, triggerName) {
   if (!triggerName) return String(text || "").trim();
   const esc = triggerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -124,7 +113,6 @@ function isChannelAdmin(channelMeta, userId) {
   return ids.includes(String(userId));
 }
 
-/** Delete all non-pinned messages in a channel */
 async function deleteAllMessages(channel) {
   try {
     const me = channel.guild.members.me;
@@ -150,27 +138,21 @@ async function deleteAllMessages(channel) {
       beforeId = oldest.id;
     }
   } catch (err) {
-    await reportError(err, channel, "DELETE_ALL_MESSAGES", { details: "Failed to clear channel." });
+    await reportError(err, channel, "DELETE_ALL_MESSAGES", { emit: "channel", details: "Failed to clear channel." });
     throw err;
   }
 }
 
-/** Voice transcript → AI reply → webhook post → optional TTS */
+/** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate) */
 async function handleVoiceTranscriptDirect(evt, client, storage) {
   let ch = null;
   let chatContext = null;
   try {
     ch = await client.channels.fetch(evt.channelId).catch(() => null);
-    if (!ch) { return; }
+    if (!ch) return;
 
-    // If busy: show BUSY only once per busy phase (yellow embed)
-    if (voiceBusy.get(evt.channelId)) {
-      if (!busyAnnounced.get(evt.channelId)) {
-        await reportInfo(ch, BUSY_TEXT, "BUSY"); // colored yellow in error.js
-        busyAnnounced.set(evt.channelId, true);
-      }
-      return;
-    }
+    // If already busy, ignore silently (notice is sent in the listener once per period)
+    if (voiceBusy.get(evt.channelId)) return;
 
     const channelMeta = getChannelConfig(evt.channelId);
     chatContext = ensureChatContextForChannel(evt.channelId, storage, channelMeta);
@@ -179,7 +161,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
     }
 
-    // Optional block selection for voice (speaker/user-based overrides)
+    // Block selection for voice
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const speakerNameLower = String(evt.speaker || "").trim().toLowerCase();
     const userId = String(evt.userId || "").trim();
@@ -211,7 +193,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
     let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
 
     if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-      const { tools: blockTools, registry: blockRegistry } = require("./tools.js").getToolRegistry(matchingBlock.tools);
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
       chatContext.toolRegistry = blockRegistry;
     } else {
@@ -219,13 +201,15 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    // Token limit for voice mode
     const tokenlimit = (() => {
       const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
       const v = Number(raw);
       const def = 1024;
       return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
     })();
+
+    // mark busy *before* any await — ensures strict gating
+    voiceBusy.set(evt.channelId, true);
 
     const sequenceLimit = 1;
     const instrBackup = chatContext.instructions;
@@ -234,10 +218,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
     } catch {}
 
-    voiceBusy.set(evt.channelId, true);
-
-    let replyText = "";
-    replyText = await getAIResponse(
+    let replyText = await getAIResponse(
       chatContext,
       tokenlimit,
       sequenceLimit,
@@ -255,7 +236,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       const msgShim = { channel: ch };
       await setReplyAsWebhookEmbed(msgShim, replyText, { botname: channelMeta.botname || "AI" });
     } catch (e) {
-      await reportError(e, ch, "VOICE_WEBHOOK_SEND");
+      await reportError(e, ch, "VOICE_WEBHOOK_SEND", { emit: "channel" });
       try { await reportInfo(ch, replyText, "FALLBACK"); } catch {}
     }
 
@@ -265,16 +246,17 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
         await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
       }
     } catch (e) {
-      await reportError(e, ch, "VOICE_TTS");
+      await reportError(e, ch, "VOICE_TTS", { emit: "channel" });
     } finally {
       try { chatContext.instructions = instrBackup; } catch {}
     }
   } catch (err) {
-    await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT");
+    await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT", { emit: "channel" });
   } finally {
-    // End of busy phase → reset both flags
-    voiceBusy.set(evt.channelId, false);
-    busyAnnounced.delete(evt.channelId);
+    // End of busy period → allow next voice, reset the one-shot BUSY flag
+    try {
+      voiceBusy.set((chatContext?.channelId || null) ?? null, false);
+    } catch {}
   }
 }
 
@@ -375,7 +357,7 @@ client.on("messageCreate", async (message) => {
         await deleteAllMessages(message.channel);
         await reportInfo(message.channel, "Channel cleared.", "MAINTENANCE");
       } catch (e) {
-        await reportError(e, message.channel, "CMD_CLEAR_CHANNEL");
+        await reportError(e, message.channel, "CMD_CLEAR_CHANNEL", { emit: "channel" });
         await reportInfo(message.channel, "I lack permissions (Manage Messages + Read Message History).", "MAINTENANCE");
       }
       return;
@@ -394,7 +376,7 @@ client.on("messageCreate", async (message) => {
         const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
         await reportInfo(message.channel, ok ? "Cron reloaded for this channel." : "No crontab defined for this channel.", "CRON");
       } catch (e) {
-        await reportError(e, message.channel, "CMD_RELOAD_CRON");
+        await reportError(e, message.channel, "CMD_RELOAD_CRON", { emit: "channel" });
         await reportInfo(message.channel, "Failed to reload cron for this channel.", "CRON");
       }
       return;
@@ -410,7 +392,7 @@ client.on("messageCreate", async (message) => {
           "MAINTENANCE"
         );
       } catch (e) {
-        await reportError(e, message.channel, "CMD_PURGE_DB");
+        await reportError(e, message.channel, "CMD_PURGE_DB", { emit: "channel" });
         await reportInfo(message.channel, "Failed to purge database entries for this channel.", "MAINTENANCE");
       }
       return;
@@ -440,7 +422,7 @@ client.on("messageCreate", async (message) => {
         guildTextChannels.set(message.guild.id, message.channel.id);
         await reportInfo(message.channel, `Connected to **${vc.name}**. Transcripts & TTS are now bound here.`, "VOICE");
 
-        // Voice listener — do NOT send BUSY here; let handleVoiceTranscriptDirect manage the one-time BUSY notice.
+        // voice listener
         setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
           try {
             const channelMeta = getChannelConfig(evt.channelId);
@@ -453,26 +435,47 @@ client.on("messageCreate", async (message) => {
             const TRIGGER = (channelMeta.name || "").trim();
             const invoked = firstWordEqualsName(evt.text, TRIGGER);
 
-            const textForLog = invoked ? stripLeadingName(evt.text, TRIGGER) : evt.text;
+            if (!invoked) return;
+
+            // Strict busy gate:
+            if (voiceBusy.get(evt.channelId)) {
+              if (!busyNoticeSent.get(evt.channelId)) {
+                const ch = await client.channels.fetch(evt.channelId).catch(() => null);
+                if (ch) {
+                  await reportInfo(
+                    ch,
+                    "I’m already answering someone. Please wait until I finish speaking — then try again. Thanks for your patience! 😊",
+                    "BUSY"
+                  );
+                  busyNoticeSent.set(evt.channelId, true); // one-shot during this busy period
+                }
+              }
+              return; // do NOT log this utterance, do NOT queue anything
+            }
+
+            // Not busy → now we log the invoked utterance
+            const textForLog = stripLeadingName(evt.text, TRIGGER);
             try {
               await chatContext.add("user", evt.speaker, (textForLog || "").trim(), evt.startedAtMs);
             } catch (e) {
               await reportError(e, null, "VOICE_LOG_CONTEXT");
             }
 
-            if (!invoked) return;
-
+            // run the full voice pipeline (will set busy and clear it on completion)
             await handleVoiceTranscriptDirect(
               { ...evt, text: textForLog },
               client,
               contextStorage
             );
+
+            // Reset the one-shot BUSY notice at the end of busy period (done in handleVoiceTranscriptDirect finally)
+            busyNoticeSent.delete(evt.channelId);
           } catch (err) {
-            await reportError(err, null, "VOICE_LISTENING_CALLBACK");
+            await reportError(err, null, "VOICE_LISTENING_CALLBACK", { emit: "channel" });
           }
         });
       } catch (e) {
-        await reportError(e, message.channel, "CMD_JOINVC");
+        await reportError(e, message.channel, "CMD_JOINVC", { emit: "channel" });
         await reportInfo(message.channel, "Failed to join/move. Check my permissions (Connect/Speak) and try again.", "VOICE");
       }
       return;
@@ -490,7 +493,7 @@ client.on("messageCreate", async (message) => {
           await reportInfo(message.channel, "Not connected to a voice channel.", "VOICE");
         }
       } catch (e) {
-        await reportError(e, message.channel, "CMD_LEAVEVC");
+        await reportError(e, message.channel, "CMD_LEAVEVC", { emit: "channel" });
       }
       return;
     }
@@ -520,7 +523,7 @@ client.on("messageCreate", async (message) => {
           return;
         }
       } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_RUN");
+        await reportError(e, message.channel, "CMD_SUMMARIZE_RUN", { emit: "channel" });
         await reportInfo(message.channel, "Summary failed.", "SUMMARY");
         return;
       }
@@ -539,7 +542,7 @@ client.on("messageCreate", async (message) => {
           await postSummariesIndividually(message.channel, summariesAsc, null);
         }
       } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_POST");
+        await reportError(e, message.channel, "CMD_SUMMARIZE_POST", { emit: "channel" });
       }
 
       try { await chatContext.bumpCursorToCurrentMax(); } catch (e) {
@@ -550,7 +553,7 @@ client.on("messageCreate", async (message) => {
         await chatContext.collapseToSystemAndLastSummary();
         await reportInfo(message.channel, "RAM context collapsed to: **System + last summary**.", "SUMMARY");
       } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE");
+        await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE", { emit: "channel" });
         await reportInfo(message.channel, "RAM context collapse failed (kept full memory).", "SUMMARY");
       }
 
@@ -569,7 +572,6 @@ client.on("messageCreate", async (message) => {
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
     if (!isTrigger) return;
 
-    // Token limit for chat mode
     const tokenlimit = (() => {
       const raw = (channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat);
       const v = Number(raw);
@@ -590,29 +592,34 @@ client.on("messageCreate", async (message) => {
       await chatContext.add("assistant", channelMeta?.botname || "AI", output);
     }
   } catch (err) {
-    await reportError(err, message?.channel, "ON_MESSAGE_CREATE");
+    await reportError(err, message?.channel, "ON_MESSAGE_CREATE", { emit: "channel" });
   }
 });
 
-// Startup
-(async () => {
-  try {
-    await client.login(process.env.DISCORD_TOKEN);
-  } catch (err) {
-    reportError(err, null, "LOGIN", { fatal: true });
-  }
-})();
-
-// NOTE (Discord.js v15 deprecation): use 'clientReady' going forward.
-// Keep 'ready' for current compatibility; migrate when upgrading discord.js.
-client.once("ready", () => {
+// ==== Ready handler (deprecation-safe) ====
+function onClientReadyOnce() {
+  if (onClientReadyOnce._ran) return;
+  onClientReadyOnce._ran = true;
   try {
     setBotPresence(client, "✅ Started", "online");
     initCron(client, contextStorage);
   } catch (err) {
-    reportError(err, null, "READY_INIT");
+    reportError(err, null, "READY_INIT", { emit: "console" });
   }
-});
+}
+// New name (v14+ future): clientReady
+client.once("clientReady", onClientReadyOnce);
+// Back-compat for current versions:
+client.once("ready", onClientReadyOnce);
+
+// ==== Startup ====
+(async () => {
+  try {
+    await client.login(process.env.DISCORD_TOKEN);
+  } catch (err) {
+    reportError(err, null, "LOGIN", { emit: "console" });
+  }
+})();
 
 // Static /documents
 const expressApp = express();
