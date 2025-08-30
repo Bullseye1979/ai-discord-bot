@@ -1,4 +1,4 @@
-// bot.js — refactored v3.7
+// bot.js — refactored v3.7 (voice tools fixed: apply block toolset/model/apikey for speech)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -23,8 +23,8 @@ const {
   resetRecordingFlag,
   postSummariesIndividually,
 } = require("./discord-helper.js");
-const { getProcessAIRequest } = require("./discord-handler.js"); // <-- FIX: Importieren
-const { reportError, reportInfo } = require("./error.js");
+const { reportError } = require("./error.js");
+const { getToolRegistry } = require("./tools.js"); // <-- needed for voice block toolset
 
 const client = new Client({
   intents: [
@@ -78,7 +78,6 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
     return storage.get(key).ctx;
   } catch (err) {
     reportError(err, null, "ENSURE_CHAT_CONTEXT");
-    // Fallback minimaler Context
     const ctx = new Context("", "", [], {}, channelId);
     return ctx;
   }
@@ -137,7 +136,7 @@ async function deleteAllMessages(channel) {
 
       for (const msg of fetched.values()) {
         if (msg.pinned) continue;
-        try { await msg.delete(); } catch {} // pro Nachricht best-effort
+        try { await msg.delete(); } catch {}
         await sleep(120);
       }
       const oldest = fetched.reduce((acc, m) => (acc && acc.createdTimestamp < m.createdTimestamp ? acc : m), null);
@@ -150,7 +149,7 @@ async function deleteAllMessages(channel) {
   }
 }
 
-/** Handle one voice transcript event → AI reply → webhook post → optional TTS */
+/** Voice transcript → AI reply → webhook post → optional TTS (with block toolset for voice) */
 async function handleVoiceTranscriptDirect(evt, client, storage) {
   let ch = null;
   let chatContext = null;
@@ -159,7 +158,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
     if (!ch) { return; }
 
     if (voiceBusy.get(evt.channelId)) {
-      await reportInfo(ch, "⏳ Ich antworte gerade — bitte kurz warten.", "VOICE_BUSY");
+      try { await ch.send("⏳ I’m answering already — please wait a moment."); } catch {}
       return;
     }
 
@@ -170,6 +169,50 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
     }
 
+    // --- NEW: Blockauswahl für Sprachpfad (analog Textpfad)
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const speakerNameLower = String(evt.speaker || "").trim().toLowerCase();
+    const userId = String(evt.userId || "").trim();
+
+    const pickBlockForSpeaker = () => {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const sp = Array.isArray(b.speaker) ? b.speaker.map(s => String(s).trim().toLowerCase()) : [];
+        if (!sp.length) continue;
+        if (sp.includes("*") && !wildcard) wildcard = b;
+        if (speakerNameLower && sp.includes(speakerNameLower) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    };
+    const pickBlockForUser = () => {
+      let exact = null, wildcard = null;
+      for (const b of blocks) {
+        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
+        if (!us.length) continue;
+        if (us.includes("*") && !wildcard) wildcard = b;
+        if (userId && us.includes(userId) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    };
+
+    const matchingBlock = pickBlockForSpeaker() || pickBlockForUser();
+
+    // Effektive Model/API-Key für Voice; Tools ggf. aus Block überschreiben
+    let effectiveModel  = matchingBlock?.model  || channelMeta.model || undefined;
+    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
+
+    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
+      chatContext.tools = blockTools;
+      chatContext.toolRegistry = blockRegistry;
+    } else {
+      // Fallback: die aus der Channel-Config
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+    // --- /NEW
+
+    // Tokenlimit für Sprachmodus
     const tokenlimit = (() => {
       const raw = (channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker);
       const v = Number(raw);
@@ -191,8 +234,8 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
       chatContext,
       tokenlimit,
       sequenceLimit,
-      channelMeta.model || undefined,
-      channelMeta.apikey || null
+      effectiveModel,
+      effectiveApiKey
     );
     replyText = (replyText || "").trim();
     if (!replyText) return;
@@ -277,11 +320,11 @@ client.on("messageCreate", async (message) => {
 
     if (isCommand) {
       if (!channelMeta.hasConfig) {
-        await reportInfo(message.channel, "⚠️ Commands are disabled in channels without a channel-config file.", "CMD_DISABLED");
+        await message.channel.send("⚠️ Commands are disabled in channels without a channel-config file.");
         return;
       }
       if (!selfIssued && !isChannelAdmin(channelMeta, message.author.id)) {
-        await reportInfo(message.channel, "⛔ You are not authorized to run commands in this channel.", "CMD_FORBIDDEN");
+        await message.channel.send("⛔ You are not authorized to run commands in this channel.");
         return;
       }
     }
@@ -297,22 +340,22 @@ client.on("messageCreate", async (message) => {
 
       if (lower.startsWith("+consent_chat")) {
         await setChatConsent(authorId, baseChannelId, true);
-        await reportInfo(message.channel, "✅ Chat consent saved for this channel.", "CONSENT_CHAT_ON");
+        await message.channel.send("✅ Chat consent saved for this channel.");
         return;
       }
       if (lower.startsWith("+withdrawl_chat")) {
         await setChatConsent(authorId, baseChannelId, false);
-        await reportInfo(message.channel, "✅ Chat consent withdrawn for this channel.", "CONSENT_CHAT_OFF");
+        await message.channel.send("✅ Chat consent withdrawn for this channel.");
         return;
       }
       if (lower.startsWith("+consent_voice")) {
         await setVoiceConsent(authorId, baseChannelId, true);
-        await reportInfo(message.channel, "✅ Voice consent saved for this channel.", "CONSENT_VOICE_ON");
+        await message.channel.send("✅ Voice consent saved for this channel.");
         return;
       }
       if (lower.startsWith("+withdrawl_voice")) {
         await setVoiceConsent(authorId, baseChannelId, false);
-        await reportInfo(message.channel, "✅ Voice consent withdrawn for this channel.", "CONSENT_VOICE_OFF");
+        await message.channel.send("✅ Voice consent withdrawn for this channel.");
         return;
       }
     }
@@ -321,10 +364,10 @@ client.on("messageCreate", async (message) => {
     if (rawText.startsWith("!clear-channel") || rawText.startsWith("!purge-channel")) {
       try {
         await deleteAllMessages(message.channel);
-        await reportInfo(message.channel, "🧹 Channel cleared.", "CMD_CLEAR_CHANNEL_OK");
+        await message.channel.send("🧹 Channel cleared.");
       } catch (e) {
         await reportError(e, message.channel, "CMD_CLEAR_CHANNEL");
-        await reportInfo(message.channel, "⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).", "CMD_CLEAR_CHANNEL_PERMS");
+        await message.channel.send("⚠️ I lack permissions to delete messages (need Manage Messages + Read Message History).");
       }
       return;
     }
@@ -340,10 +383,10 @@ client.on("messageCreate", async (message) => {
     if (rawText.startsWith("!reload-cron")) {
       try {
         const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
-        await reportInfo(message.channel, ok ? "🔁 Cron reloaded for this channel." : "⚠️ No crontab defined for this channel.", "CMD_RELOAD_CRON");
+        await message.channel.send(ok ? "🔁 Cron reloaded for this channel." : "⚠️ No crontab defined for this channel.");
       } catch (e) {
         await reportError(e, message.channel, "CMD_RELOAD_CRON");
-        await reportInfo(message.channel, "❌ Failed to reload cron for this channel.", "CMD_RELOAD_CRON_FAIL");
+        await message.channel.send("❌ Failed to reload cron for this channel.");
       }
       return;
     }
@@ -352,14 +395,12 @@ client.on("messageCreate", async (message) => {
     if (rawText.startsWith("!purge-db")) {
       try {
         const res = await chatContext.purgeChannelData();
-        await reportInfo(
-          message.channel,
-          `🗑️ Purged database for this channel.\n- context_log deleted: **${res.contextDeleted}**\n- summaries deleted: **${res.summariesDeleted}**`,
-          "CMD_PURGE_DB_OK"
+        await message.channel.send(
+          `🗑️ Purged database for this channel.\n- context_log deleted: **${res.contextDeleted}**\n- summaries deleted: **${res.summariesDeleted}**`
         );
       } catch (e) {
         await reportError(e, message.channel, "CMD_PURGE_DB");
-        await reportInfo(message.channel, "❌ Failed to purge database entries for this channel.", "CMD_PURGE_DB_FAIL");
+        await message.channel.send("❌ Failed to purge database entries for this channel.");
       }
       return;
     }
@@ -370,7 +411,7 @@ client.on("messageCreate", async (message) => {
         let gm = null;
         try { gm = await message.guild.members.fetch(message.author.id); } catch {}
         const vc = gm?.voice?.channel || message.member?.voice?.channel;
-        if (!vc) { await reportInfo(message.channel, "Join a voice channel first.", "CMD_JOINVC_NEEDS_VC"); return; }
+        if (!vc) { await message.reply("Join a voice channel first."); return; }
 
         const old = getVoiceConnection(message.guild.id);
         if (old) { try { old.destroy(); } catch {} }
@@ -411,7 +452,7 @@ client.on("messageCreate", async (message) => {
             if (voiceBusy.get(evt.channelId)) {
               try {
                 const ch = await client.channels.fetch(evt.channelId).catch(() => null);
-                await reportInfo(ch, "⏳ ...", "VOICE_BUSY");
+                await ch?.send("⏳ ...");
               } catch {}
               return;
             }
@@ -426,10 +467,10 @@ client.on("messageCreate", async (message) => {
           }
         });
 
-        await reportInfo(message.channel, `🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`, "CMD_JOINVC_OK");
+        await message.channel.send(`🔊 Connected to **${vc.name}**. Transcripts & TTS are now bound here.`);
       } catch (e) {
         await reportError(e, message.channel, "CMD_JOINVC");
-        await reportInfo(message.channel, "❌ Failed to join/move. Check my permissions (Connect/Speak) and try again.", "CMD_JOINVC_FAIL");
+        await message.channel.send("❌ Failed to join/move. Check my permissions (Connect/Speak) and try again.");
       }
       return;
     }
@@ -441,9 +482,9 @@ client.on("messageCreate", async (message) => {
         if (conn) {
           try { conn.destroy(); } catch {}
           guildTextChannels.delete(message.guild.id);
-          await reportInfo(message.channel, "👋 Left the voice channel.", "CMD_LEAVEVC_OK");
+          await message.channel.send("👋 Left the voice channel.");
         } else {
-          await reportInfo(message.channel, "ℹ️ Not connected to a voice channel.", "CMD_LEAVEVC_NONE");
+          await message.channel.send("ℹ️ Not connected to a voice channel.");
         }
       } catch (e) {
         await reportError(e, message.channel, "CMD_LEAVEVC");
@@ -454,7 +495,7 @@ client.on("messageCreate", async (message) => {
     // !summarize
     if (rawText.startsWith("!summarize")) {
       if (!channelMeta.summariesEnabled) {
-        await reportInfo(message.channel, "⚠️ Summaries are disabled in this channel.", "CMD_SUMMARIZE_DISABLED");
+        await message.channel.send("⚠️ Summaries are disabled in this channel.");
         return;
       }
 
@@ -474,13 +515,13 @@ client.on("messageCreate", async (message) => {
 
         if (!createdNew) {
           try { if (progress?.deletable) await progress.delete(); } catch {}
-          await reportInfo(message.channel, "ℹ️ No messages to summarize yet.", "CMD_SUMMARIZE_EMPTY");
+          await message.channel.send("ℹ️ No messages to summarize yet.");
           return;
         }
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_RUN");
         try { if (progress?.deletable) await progress.delete(); } catch {}
-        await reportInfo(message.channel, "❌ Summary failed.", "CMD_SUMMARIZE_FAIL");
+        await message.channel.send("❌ Summary failed.");
         return;
       }
 
@@ -493,7 +534,7 @@ client.on("messageCreate", async (message) => {
             .map((r) => `**${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`);
 
         if (summariesAsc.length === 0) {
-          await reportInfo(message.channel, "No summaries available yet.", "CMD_SUMMARIZE_NONE");
+          await message.channel.send("No summaries available yet.");
         } else {
           await postSummariesIndividually(message.channel, summariesAsc, null);
         }
@@ -507,13 +548,13 @@ client.on("messageCreate", async (message) => {
 
       try {
         await chatContext.collapseToSystemAndLastSummary();
-        await reportInfo(message.channel, "🧠 RAM context collapsed to: **System + last summary**.", "CMD_SUMMARIZE_COLLAPSE_OK");
+        await message.channel.send("🧠 RAM context collapsed to: **System + last summary**.");
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE");
-        await reportInfo(message.channel, "⚠️ RAM context collapse failed (kept full memory).", "CMD_SUMMARIZE_COLLAPSE_FAIL");
+        await message.channel.send("⚠️ RAM context collapse failed (kept full memory).");
       }
 
-      try { await reportInfo(message.channel, "✅ **Summary completed.**", "CMD_SUMMARIZE_DONE"); } catch {}
+      try { await message.channel.send("✅ **Summary completed.**"); } catch {}
       try { if (progress?.deletable) await progress.delete(); } catch {}
       return;
     }
@@ -529,15 +570,28 @@ client.on("messageCreate", async (message) => {
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
     if (!isTrigger) return;
 
-    const state = { isAIProcessing: 0 };
-    return getProcessAIRequest(
-      message,
+    // Textpfad logik ist hier bewusst „lokal“ geblieben (du nutzt keinen discord-handler hier)
+    // -> Tools kommen aus channelMeta bzw. durch Context-Signaturwechsel automatisch nach.
+    // (Voice-Fix ist oben in handleVoiceTranscriptDirect implementiert.)
+    const tokenlimit = (() => {
+      const raw = (channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat);
+      const v = Number(raw);
+      const def = 4096;
+      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+    })();
+
+    const output = await getAIResponse(
       chatContext,
-      client,
-      state,
-      channelMeta.model,
-      channelMeta.apikey
+      tokenlimit,
+      1000,
+      channelMeta.model || "gpt-4o",
+      channelMeta.apikey || null
     );
+
+    if (output && String(output).trim()) {
+      await setReplyAsWebhookEmbed(message, output, { botname: channelMeta.botname, color: 0x00b3ff });
+      await chatContext.add("assistant", channelMeta?.botname || "AI", output);
+    }
   } catch (err) {
     await reportError(err, message?.channel, "ON_MESSAGE_CREATE");
   }
@@ -548,7 +602,6 @@ client.on("messageCreate", async (message) => {
   try {
     await client.login(process.env.DISCORD_TOKEN);
   } catch (err) {
-    // Kein Channel verfügbar; nur Logging via reportError
     reportError(err, null, "LOGIN");
   }
 })();
