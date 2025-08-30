@@ -1,6 +1,4 @@
-// aiCore.js — refactored v2.1
-// Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// Fixes first-try getHistory over voice by injecting :channel_id into SQL AND bindings.
+// aiCore.js — refactored v2.0 (pendingUser injection, safe logging, strict auto-continue guard)
 
 require("dotenv").config();
 const axios = require("axios");
@@ -27,50 +25,6 @@ function cleanOpenAIName(role, name) {
   return s;
 }
 
-/** getHistory: ensure :channel_id in SQL + ORDER BY + LIMIT */
-function fixupGetHistorySql(sql) {
-  let out = String(sql || "").trim().replace(/\s*;+\s*$/g, "");
-  if (!out) return out;
-
-  if (!/:channel_id\b/i.test(out)) {
-    // add WHERE/AND channel_id filter
-    out += /\bwhere\b/i.test(out)
-      ? " AND channel_id = :channel_id"
-      : " WHERE channel_id = :channel_id";
-  }
-  if (!/\border\s+by\b/i.test(out)) {
-    out += " ORDER BY timestamp ASC";
-  }
-  if (!/\blimit\s+\d+/i.test(out)) {
-    out += " LIMIT 200";
-  }
-  return out;
-}
-
-/** getHistory: ensure args.arguments JSON has sql+bindings.channel_id */
-function fixupGetHistoryArgs(toolFn, runtime, ctxChannelId) {
-  const safeChannelId =
-    (runtime && runtime.channel_id) ||
-    ctxChannelId ||
-    null;
-
-  const argsObj =
-    typeof toolFn.arguments === "string"
-      ? (toolFn.arguments ? JSON.parse(toolFn.arguments) : {})
-      : (toolFn.arguments || {});
-
-  argsObj.sql = fixupGetHistorySql(argsObj.sql || "");
-  if (!argsObj.bindings || typeof argsObj.bindings !== "object") {
-    argsObj.bindings = {};
-  }
-  // Hard inject binding so the tool never complains on first try
-  if (safeChannelId && !argsObj.bindings.channel_id) {
-    argsObj.bindings.channel_id = String(safeChannelId);
-  }
-
-  return { ...toolFn, arguments: JSON.stringify(argsObj) };
-}
-
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
  * @param {Context} context_orig
@@ -78,19 +32,21 @@ function fixupGetHistoryArgs(toolFn, runtime, ctxChannelId) {
  * @param {number} sequenceLimit
  * @param {string} model
  * @param {string|null} apiKey
+ * @param {object|null} pendingUser  // { name, content, timestamp } — injected only into working copy
  */
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
   sequenceLimit = 1000,
   model = "gpt-4o",
-  apiKey = null
+  apiKey = null,
+  pendingUser = null
 ) {
   let responseMessage = "";
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
-    // Arbeitskopien (channelId mitgeben!)
+    // Working copies (do NOT mutate context_orig)
     const context = new Context(
       "",
       "",
@@ -113,7 +69,7 @@ async function getAIResponse(
 
     const toolRegistry = context.toolRegistry;
 
-    // Systemzusammensetzung
+    // Compose system
     try {
       const sysParts = [];
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
@@ -124,12 +80,23 @@ async function getAIResponse(
       }
     } catch {}
 
-    // Zeit-Hinweis
+    // Time hint
     const nowUtc = new Date().toISOString();
     context.messages.unshift({
       role: "system",
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`
     });
+
+    // Inject the *ephemeral* user message (ONLY into working copy)
+    if (pendingUser && String(pendingUser.content || "").trim()) {
+      context.messages.push({
+        role: "user",
+        content: String(pendingUser.content).trim(),
+        name: pendingUser.name ? pendingUser.name : undefined,
+        // keep timestamp on our side; API does not accept it, but we don't send it.
+        timestamp: pendingUser.timestamp || Date.now(),
+      });
+    }
 
     let hasToolCalls = false;
     let continueResponse = false;
@@ -138,7 +105,7 @@ async function getAIResponse(
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
     do {
-      // Nachrichten für API
+      // Prepare messages for API
       const messagesToSend = context.messages.map((m) => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
@@ -184,7 +151,7 @@ async function getAIResponse(
         responseMessage += (aiMessage.content || "").trim();
       }
 
-      // Tool-Ausführung
+      // Tool execution
       if (hasToolCalls) {
         for (const toolCall of aiMessage.tool_calls) {
           const fnName = toolCall?.function?.name;
@@ -204,34 +171,20 @@ async function getAIResponse(
           };
 
           if (!toolFunction) {
-            replyTool(`[ERROR]: Tool '${fnName}' not available or arguments invalid.`);
+            const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
+            replyTool(msg);
             continue;
           }
 
           try {
-            // Robust channel_id best-effort
-            const runtime = {
-              channel_id:
-                context_orig.channelId ??
-                context.channelId ??
-                handoverContext.channelId ??
-                null
-            };
-
-            // Fixups speziell für getHistory
-            let toolFnToCall = toolCall.function || { name: fnName, arguments: "{}" };
-            if (fnName === "getHistory") {
-              toolFnToCall = fixupGetHistoryArgs(toolFnToCall, runtime, runtime.channel_id);
-            } else if (typeof toolFnToCall.arguments === "undefined") {
-              toolFnToCall = { ...toolFnToCall, arguments: "{}" };
-            }
-
-            const toolResult = await toolFunction(toolFnToCall, handoverContext, getAIResponse, runtime);
+            // Provide runtime with channel_id to tools (e.g., getHistory)
+            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
-            await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
-            replyTool({ error: emsg, tool: fnName || "unknown" });
+            await reportError(toolError, null, `TOOL_${fnName.toUpperCase()}`);
+            replyTool({ error: emsg, tool: fnName });
           }
         }
       }

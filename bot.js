@@ -1,4 +1,4 @@
-// bot.js — refactored v3.11 (message reactions + global busy presence)
+// bot.js — refactored v3.11 (pendingUser injection for text & voice, preserve original timestamps)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -21,7 +21,6 @@ const {
   sendChunked,
   resetTTSPlayer,
   resetRecordingFlag,
-  setMessageReaction, // ← reactions helper
 } = require("./discord-helper.js");
 
 const { reportError, reportInfo, reportWarn } = require("./error.js");
@@ -41,21 +40,6 @@ const contextStorage = new Map();
 const guildTextChannels = new Map();    // guildId -> textChannelId (for TTS/transcripts)
 const voiceBusy = new Map();            // channelId -> boolean (busy while LLM+TTS runs)
 const busyNoticeSent = new Map();       // channelId -> boolean (BUSY notice already shown during this busy period)
-
-// ===== Global in-flight operations → presence =====
-let activeOps = 0;
-function updatePresence() {
-  try {
-    if (!client?.user) return;
-    if (activeOps > 0) {
-      setBotPresence(client, `⏳ Working (${activeOps})`, "dnd");
-    } else {
-      setBotPresence(client, "✅ Ready", "online");
-    }
-  } catch {}
-}
-function beginOp() { activeOps++; updatePresence(); }
-function endOp()   { if (activeOps > 0) activeOps--; updatePresence(); }
 
 /** Ensure a Context instance for a channel, rebuilding when config signature changes */
 function ensureChatContextForChannel(channelId, storage, channelMeta) {
@@ -201,7 +185,7 @@ async function deleteAllMessages(channel) {
   }
 }
 
-/** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate) */
+/** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate; pendingUser) */
 async function handleVoiceTranscriptDirect(evt, client, storage) {
   let ch = null;
   let chatContext = null;
@@ -283,9 +267,8 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
         : def;
     })();
 
-    // mark busy *before* any await — ensures strict gating, and bump presence
+    // mark busy *before* any await — ensures strict gating
     voiceBusy.set(evt.channelId, true);
-    beginOp();
 
     const sequenceLimit = 1;
     const instrBackup = chatContext.instructions;
@@ -296,17 +279,34 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
           (chatContext.instructions || "") + "\n\n" + add;
     } catch {}
 
+    // Build pendingUser for VOICE (do NOT persist yet)
+    const pendingUser = {
+      name: evt.speaker || "user",
+      content: String(evt.text || "").trim(),
+      timestamp: typeof evt.startedAtMs === "number" ? evt.startedAtMs : Date.now(),
+    };
+
     let replyText = await getAIResponse(
       chatContext,
       tokenlimit,
       sequenceLimit,
       effectiveModel,
-      effectiveApiKey
+      effectiveApiKey,
+      pendingUser // <<< inject ephemeral voice user message
     );
     replyText = (replyText || "").trim();
     if (!replyText) return;
 
+    // Persist in DB with ORIGINAL user timestamp, then assistant with "now"
     try {
+      if (pendingUser.content) {
+        await chatContext.add(
+          "user",
+          pendingUser.name || "user",
+          pendingUser.content,
+          pendingUser.timestamp || Date.now()
+        );
+      }
       await chatContext.add(
         "assistant",
         channelMeta.botname || "AI",
@@ -348,12 +348,11 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
   } catch (err) {
     await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT", { emit: "channel" });
   } finally {
-    // End of busy period → allow next voice, reset the one-shot BUSY flag, drop presence
+    // End of busy period → allow next voice, reset the one-shot BUSY flag.
     try {
       voiceBusy.set(evt.channelId, false);
       busyNoticeSent.delete(evt.channelId);
     } catch {}
-    endOp();
   }
 }
 
@@ -428,9 +427,9 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    if (!message.author?.bot && !message.webhookId) {
-      await setAddUserMessage(message, chatContext);
-    }
+    // We will log normal user chatter AFTER we decide it's NOT a trigger.
+    // This prevents adding "pending" requests to the DB before the model/tool finished.
+    // (So we intentionally skip setAddUserMessage here.)
 
     // Consent quick-commands
     {
@@ -581,13 +580,8 @@ client.on("messageCreate", async (message) => {
               return; // do NOT log this utterance, do NOT queue anything
             }
 
-            // Not busy → now we log the invoked utterance
+            // Not busy → strip trigger and run pipeline (do NOT persist user yet)
             const textForLog = stripLeadingName(evt.text, TRIGGER);
-            try {
-              await chatContext.add("user", evt.speaker, (textForLog || "").trim(), evt.startedAtMs);
-            } catch (e) {
-              await reportError(e, null, "VOICE_LOG_CONTEXT", { emit: "channel" });
-            }
 
             // run the full voice pipeline (sets busy and clears it on completion)
             await handleVoiceTranscriptDirect({ ...evt, text: textForLog }, client, contextStorage);
@@ -700,134 +694,73 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Normal flow: explicit trigger
+    // ===== Normal flow: explicit trigger =====
     if (message.author?.bot || message.webhookId) return;
     const authorId = String(message.author?.id || "");
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    const norm = (rawText || "").toLowerCase();
     const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
+    const norm = (rawText || "").toLowerCase();
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
-    if (!isTrigger) return;
 
-    // ---- block-based overrides for TYPING (matches voice behavior) ----
-    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-    const userId = String(message.author?.id || "").trim();
-
-    function pickBlockForUser() {
-      let exact = null, wildcard = null;
-      for (const b of blocks) {
-        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
-        if (!us.length) continue;
-        if (us.includes("*") && !wildcard) wildcard = b;
-        if (userId && us.includes(userId) && !exact) exact = b;
-      }
-      return exact || wildcard || null;
+    // If NOT a trigger: now we can add this as normal user chatter to context immediately.
+    if (!isTrigger) {
+      await setAddUserMessage(message, chatContext);
+      return;
     }
 
-    const matchingBlock = pickBlockForUser();
+    // Strip the trigger name for the model
+    const visibleUserName =
+      message.member?.displayName || message.author?.username || "user";
+    const userTextForModel = stripLeadingName(rawText, channelMeta.name || "");
 
-    let effectiveModel  = matchingBlock?.model  || channelMeta.model || "gpt-4o";
-    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
-
-    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
-      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
-      chatContext.tools = blockTools;
-      chatContext.toolRegistry = blockRegistry;
-    } else {
-      chatContext.tools = channelMeta.tools;
-      chatContext.toolRegistry = channelMeta.toolRegistry;
-    }
-    // ---- /overrides ----
+    // pendingUser for TEXT (do NOT persist yet)
+    const pendingUser = {
+      name: visibleUserName,
+      content: String(userTextForModel || "").trim(),
+      timestamp: typeof message.createdTimestamp === "number" ? message.createdTimestamp : Date.now(),
+    };
 
     const tokenlimit = (() => {
-      const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
+      const raw = (channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat);
       const v = Number(raw);
       const def = 4096;
-      return Number.isFinite(v) && v > 0
-        ? Math.max(32, Math.min(8192, Math.floor(v)))
-        : def;
+      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
     })();
 
-    // Optional strict hint if no summaries exist
-    try {
-      const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
-      if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
-        chatContext.__instr_backup = chatContext.instructions;
-        chatContext.instructions = (chatContext.instructions || "") +
-          "\n\n[STRICT RULE] There is no existing conversation summary. Do not assume one. " +
-          "Base your answer only on the visible messages. If asked about a past summary, say there is none yet.";
-      }
-    } catch {}
+    const output = await getAIResponse(
+      chatContext,
+      tokenlimit,
+      1000,
+      channelMeta.model || "gpt-4o",
+      channelMeta.apikey || null,
+      pendingUser // <<< inject ephemeral text user message
+    );
 
-    // Apply chatAppend (like speechAppend in voice)
-    const instrBackup = chatContext.instructions;
-    try {
-      const add = (channelMeta.chatAppend || "").trim();
-      if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
-    } catch {}
-
-    // (Optional) nudge if images attached
-    try {
-      const imageUrls = [];
-      if (message.attachments?.size > 0) {
-        for (const att of message.attachments.values()) {
-          const ct = (att.contentType || att.content_type || "").toLowerCase();
-          const isImageCT  = ct.startsWith("image/");
-          const isImageExt = /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || att.filename || att.url || "");
-          if ((isImageCT || isImageExt) && att.url) imageUrls.push(att.url);
+    if (output && String(output).trim()) {
+      // Persist in DB using ORIGINAL user timestamp, then assistant with "now"
+      try {
+        if (pendingUser.content) {
+          await chatContext.add(
+            "user",
+            pendingUser.name || "user",
+            pendingUser.content,
+            pendingUser.timestamp || Date.now()
+          );
         }
-      }
-      if (imageUrls.length) {
-        const hasGetImageTool =
-          Array.isArray(chatContext.tools) &&
-          chatContext.tools.some(t => (t.function?.name || t.name) === "getImage");
-        const hint =
-          "\n\n[IMAGE UPLOAD]\n" +
-          imageUrls.map(u => `- ${u}`).join("\n") +
-          "\nTask: Describe what is shown in these images." +
-          (hasGetImageTool ? " You may use the `getImage` tool." : "");
-        chatContext.instructions = (chatContext.instructions || "") + hint;
-      }
-    } catch {}
+        await chatContext.add(
+          "assistant",
+          channelMeta?.botname || "AI",
+          output,
+          Date.now()
+        );
+      } catch {}
 
-    // >>> Reactions + presence around the actual AI call <<<
-    await setMessageReaction(message, "⏳");
-    beginOp();
-    try {
-      const output = await getAIResponse(
-        chatContext,
-        tokenlimit,
-        1000,
-        effectiveModel,
-        effectiveApiKey
-      );
-
-      // restore instructions if we touched them
-      try { chatContext.instructions = instrBackup ?? chatContext.instructions; } catch {}
-      try { if (typeof chatContext.__instr_backup === "string") {
-        chatContext.instructions = chatContext.__instr_backup;
-        delete chatContext.__instr_backup;
-      }} catch {}
-
-      const txt = (output || "").trim();
-      if (txt) {
-        await setReplyAsWebhookEmbed(message, txt, {
-          botname: channelMeta.botname,
-          color: 0x00b3ff,
-        });
-        await chatContext.add("assistant", channelMeta?.botname || "AI", txt);
-        await setMessageReaction(message, "✅");
-      } else {
-        await setMessageReaction(message, "❌");
-        await reportInfo(message.channel, "No output produced.", "AI");
-      }
-    } catch (err) {
-      await setMessageReaction(message, "❌");
-      throw err; // outer catch will reportError
-    } finally {
-      endOp();
+      await setReplyAsWebhookEmbed(message, output, {
+        botname: channelMeta.botname,
+        color: 0x00b3ff,
+      });
     }
   } catch (err) {
     await reportError(err, message?.channel, "ON_MESSAGE_CREATE", { emit: "channel" });
@@ -839,7 +772,7 @@ function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
-    setBotPresence(client, "✅ Ready", "online"); // start in ready state
+    setBotPresence(client, "✅ Started", "online");
     initCron(client, contextStorage);
   } catch (err) {
     // no channel available here; still mark emit: "channel" for consistency
