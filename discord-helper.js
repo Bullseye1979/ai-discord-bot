@@ -1,5 +1,6 @@
-// discord-helper.js — refactored v2.2
-// Minimal helper set for Discord bot: config loading, webhook replies (with chunked embeds), TTS, voice capture, and small utilities.
+// discord-helper.js — refactored v3.0
+// Helfer für Discord-Bot: Channel-Config laden (nur per-channel JSON),
+// Webhook-Replies (chunked/Embeds), TTS, Voice-Capture, kleine Utilities.
 
 const fs = require("fs");
 const os = require("os");
@@ -23,42 +24,66 @@ const _avatarInFlight = new Map();
 const queueMap = new Map();
 const playerMap = new Map();
 
-// Hilfsfunktion: baut eine HTTP/HTTPS-URL für Webhook/Embed (keine relativen /documents Pfade!)
-function buildPublicAvatarUrl(channelId) {
-  const base = (process.env.PUBLIC_BASE_URL || "https://ralfreschke.de").replace(/\/$/, "");
-  return `${base}/documents/avatars/${channelId}.png`;
+/** HTTP/HTTPS Basis für öffentliche Links (Dokumente/Avatare) */
+function publicBase() {
+  const base = (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/$/, "");
+  return base || "https://ralfreschke.de";
 }
 
-/* Build a concise visual prompt from persona text */
+/** Avatar-URL konstruieren (immer http/https; nie relative Pfade) */
+function buildPublicAvatarUrl(channelId) {
+  return `${publicBase()}/documents/avatars/${channelId}.png`;
+}
+
+/* Avatar-Prompt aus Persona/Context erzeugen – gezielt als Discord-Bot-Icon */
 async function buildVisualPromptFromPersona(personaText, channelMeta = {}) {
-  const { getAI } = require("./aiService.js");
-  const botname = (channelMeta?.botname || channelMeta?.name || "bot").toString().trim();
-  const sys = [
-    "You convert an assistant persona + bot/channel context into ONE concise visual prompt",
-    "for a DISCORD BOT AVATAR / ICON.",
-    "Hard rules:",
-    "- style: flat vector illustration, clean lines, high contrast, iconic silhouette",
-    "- composition: square, head-and-shoulders (centered), neutral background",
-    "- mood: friendly, trustworthy; readable at 64–128 px",
-    "- color: cohesive limited palette; avoid harsh gradients",
-    "- NO: text, letters, numbers, watermarks, logos, brand marks, frames, UI mockups",
-    "- output ~80 words max, in English",
-    "End with: 'square avatar, centered, flat vector, high contrast, no text, neutral background'."
-  ].join("\n");
+  try {
+    const { getAI } = require("./aiService.js");
+    const botname = (channelMeta?.botname || channelMeta?.name || "bot").toString().trim();
 
-  const user = [
-    `Bot name: ${botname}`,
-    personaText ? `Persona:\n${personaText.trim()}` : "Persona: (not provided)",
-    "Create the final avatar prompt now."
-  ].join("\n\n");
+    const sys = [
+      "You convert an assistant persona + bot/channel context into ONE concise visual prompt",
+      "for a DISCORD BOT AVATAR / ICON.",
+      "Hard rules:",
+      "- style: flat vector illustration, clean lines, high contrast, iconic silhouette",
+      "- composition: square, head-and-shoulders (centered), neutral background",
+      "- mood: friendly, trustworthy; readable at 64–128 px",
+      "- color: cohesive limited palette; avoid harsh gradients",
+      "- NO: text, letters, numbers, watermarks, logos, brand marks, frames, UI mockups",
+      "- output ~80 words max, in English",
+      "End with: 'square avatar, centered, flat vector, high contrast, no text, neutral background'."
+    ].join("\n");
 
-  const ctx = { messages: [{ role: "system", content: sys }, { role: "user", content: user }] };
-  const prompt = (await getAI(ctx, 220, "gpt-4o-mini"))?.trim();
-  return (
-    prompt ||
-    `Minimal, friendly ${botname} mascot head-and-shoulders, cohesive limited colors, clean vector lines; ` +
-    `square avatar, centered, flat vector, high contrast, no text, neutral background`
-  );
+    const user = [
+      `Bot name: ${botname}`,
+      personaText ? `Persona:\n${personaText.trim()}` : "Persona: (not provided)",
+      "Create the final avatar prompt now."
+    ].join("\n\n");
+
+    const ctx = { messages: [{ role: "system", content: sys }, { role: "user", content: user }] };
+    const prompt = (await getAI(ctx, 220, "gpt-4o-mini"))?.trim();
+    return (
+      prompt ||
+      `Minimal, friendly ${botname} mascot head-and-shoulders, cohesive limited colors, clean vector lines; ` +
+      `square avatar, centered, flat vector, high contrast, no text, neutral background`
+    );
+  } catch (err) {
+    await reportError(err, null, "BUILD_AVATAR_PROMPT");
+    return `Minimal, friendly bot mascot head-and-shoulders, cohesive limited colors, clean vector lines; square avatar, centered, flat vector, high contrast, no text, neutral background`;
+  }
+}
+
+/* Stop and dispose the TTS player for a guild */
+function resetTTSPlayer(guildId) {
+  try {
+    const p = playerMap.get(guildId);
+    if (p) {
+      try { p.stop(true); } catch {}
+      playerMap.delete(guildId);
+    }
+  } catch (err) {
+    reportError(err, null, "RESET_TTS_PLAYER");
+  }
 }
 
 /* Clear internal recording flag to arm capture on next join */
@@ -79,14 +104,12 @@ async function ensureChannelAvatar(channelId, channelMeta) {
 
     await fs.promises.mkdir(dir, { recursive: true });
 
-    // Falls bereits vorhanden → URL zurück
     if (fs.existsSync(file)) return buildPublicAvatarUrl(channelId);
 
-    // Persona evtl. leer → trotzdem einen guten Bot-Avatar erzeugen
     const persona = (channelMeta?.persona || "").trim();
     const visualPrompt = await buildVisualPromptFromPersona(persona, channelMeta);
 
-    // Prompt neben der PNG speichern (Debug / Nachvollziehbarkeit)
+    // Prompt neben der PNG speichern (zur Nachvollziehbarkeit)
     try { await fs.promises.writeFile(sidecar, visualPrompt, "utf8"); } catch {}
 
     const imageUrl = await getAIImage(visualPrompt, "1024x1024", "dall-e-3");
@@ -95,149 +118,82 @@ async function ensureChannelAvatar(channelId, channelMeta) {
 
     return buildPublicAvatarUrl(channelId);
   } catch (err) {
-    reportError(err, null, "ENSURE_CHANNEL_AVATAR");
+    _avatarInFlight.delete(channelId);
+    await reportError(err, null, "ENSURE_CHANNEL_AVATAR");
     return buildPublicAvatarUrl("default");
   }
 }
 
-/* Load default persona/config from channel-config/default.json */
-function getDefaultPersona() {
-  try {
-    const defaultPath = path.join(__dirname, "channel-config", "default.json");
-    const data = fs.readFileSync(defaultPath, "utf8");
-    const json = JSON.parse(data);
-    return {
-      persona: json.persona || "",
-      instructions: json.instructions || "",
-      voice: json.voice || "",
-      name: json.name || "",
-      botname: json.botname || "",
-      selectedTools: json.tools || [],
-      blocks: Array.isArray(json.blocks) ? json.blocks : [],
-      summaryPrompt: json.summaryPrompt || json.summary_prompt || "",
-      admins: Array.isArray(json.admins) ? json.admins : [],
-      chatAppend: json.chatAppend || json.chatPrompt || json.chat_prompt || json.prompt_chat || "",
-      speechAppend: json.speechAppend || json.speechPrompt || json.speech_prompt || json.prompt_speech || "",
-      max_user_messages: json.max_user_messages ?? json.maxUserMessages ?? null,
-      max_tokens_chat: json.max_tokens_chat ?? json.maxTokensChat,
-      max_tokens_speaker: json.max_tokens_speaker ?? json.maxTokensSpeaker,
-    };
-  } catch (err) {
-    // Silent default fallback
-    return {
-      persona: "", instructions: "", voice: "", name: "", botname: "",
-      selectedTools: [], blocks: [], summaryPrompt: "", admins: [],
-      chatAppend: "", speechAppend: "",
-      max_user_messages: null, max_tokens_chat: undefined, max_tokens_speaker: undefined,
-    };
-  }
-}
-
-/* Load merged channel config (default + per-channel JSON) */
+/* Channel-Config NUR aus channel-config/<channelId>.json laden (kein default.json) */
 function getChannelConfig(channelId) {
   try {
     const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
-    const def = getDefaultPersona();
-
-    let persona = def.persona || "";
-    let instructions = def.instructions || "";
-    let voice = def.voice || "";
-    let name = def.name || "";
-    let botname = def.botname || "AI";
-    let selectedTools = def.selectedTools || def.tools || [];
-    let blocks = Array.isArray(def.blocks) ? def.blocks : [];
-    let summaryPrompt = def.summaryPrompt || def.summary_prompt || "";
-    let max_user_messages = (Number.isFinite(Number(def.max_user_messages)) && Number(def.max_user_messages) >= 0)
-      ? Number(def.max_user_messages)
-      : null;
-    let admins = Array.isArray(def.admins) ? def.admins.map(String) : [];
-
-    let max_tokens_chat = (Number.isFinite(Number(def.max_tokens_chat)) && Number(def.max_tokens_chat) > 0)
-      ? Math.floor(Number(def.max_tokens_chat)) : 4096;
-    let max_tokens_speaker = (Number.isFinite(Number(def.max_tokens_speaker)) && Number(def.max_tokens_speaker) > 0)
-      ? Math.floor(Number(def.max_tokens_speaker)) : 1024;
-
-    let chatAppend = typeof def.chatAppend === "string" ? def.chatAppend.trim() : "";
-    let speechAppend = typeof def.speechAppend === "string" ? def.speechAppend.trim() : "";
-
     const hasConfigFile = fs.existsSync(configPath);
-    if (hasConfigFile) {
-      const raw = fs.readFileSync(configPath, "utf8");
-      const cfg = JSON.parse(raw);
-
-      if (typeof cfg.voice === "string") voice = cfg.voice;
-      if (typeof cfg.botname === "string") botname = cfg.botname;
-      if (typeof cfg.name === "string") name = cfg.name;
-      if (typeof cfg.persona === "string") persona = cfg.persona;
-      if (typeof cfg.instructions === "string") instructions = cfg.instructions;
-      if (Array.isArray(cfg.tools)) selectedTools = cfg.tools;
-      if (Array.isArray(cfg.blocks)) blocks = cfg.blocks;
-
-      if (typeof cfg.summaryPrompt === "string") summaryPrompt = cfg.summaryPrompt;
-      else if (typeof cfg.summary_prompt === "string") summaryPrompt = cfg.summary_prompt;
-
-      const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
-      if (rawMax === null || rawMax === undefined || rawMax === "") {
-        max_user_messages = null;
-      } else {
-        const n = Number(rawMax);
-        max_user_messages = (Number.isFinite(n) && n >= 0) ? Math.floor(n) : null;
-      }
-
-      const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
-      if (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "") {
-        const n = Number(rawTokChat);
-        if (Number.isFinite(n) && n > 0) max_tokens_chat = Math.floor(n);
-      }
-      const rawTokSpk = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
-      if (rawTokSpk !== undefined && rawTokSpk !== null && rawTokSpk !== "") {
-        const n = Number(rawTokSpk);
-        if (Number.isFinite(n) && n > 0) max_tokens_speaker = Math.floor(n);
-      }
-
-      if (Array.isArray(cfg.admins)) admins = cfg.admins.map(String);
-
-      const cfgChatAppend = cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
-      const cfgSpeechAppend = cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
-
-      if (typeof cfgChatAppend === "string") chatAppend = cfgChatAppend.trim();
-      if (typeof cfgSpeechAppend === "string") speechAppend = cfgSpeechAppend.trim();
+    if (!hasConfigFile) {
+      return {
+        name: "", botname: "AI", voice: "", persona: "",
+        avatarUrl: buildPublicAvatarUrl("default"),
+        instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
+        max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
+        max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
+      };
     }
+
+    const raw = fs.readFileSync(configPath, "utf8");
+    const cfg = JSON.parse(raw);
+
+    const persona = typeof cfg.persona === "string" ? cfg.persona : "";
+    const instructions = typeof cfg.instructions === "string" ? cfg.instructions : "";
+    const voice = typeof cfg.voice === "string" ? cfg.voice : "";
+    const name = typeof cfg.name === "string" ? cfg.name : "";
+    const botname = typeof cfg.botname === "string" ? cfg.botname : "AI";
+    const selectedTools = Array.isArray(cfg.tools) ? cfg.tools : [];
+    const blocks = Array.isArray(cfg.blocks) ? cfg.blocks : [];
+
+    const summaryPrompt = (typeof cfg.summaryPrompt === "string" && cfg.summaryPrompt) ||
+                          (typeof cfg.summary_prompt === "string" && cfg.summary_prompt) || "";
+
+    const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
+    const max_user_messages =
+      (rawMax === null || rawMax === undefined || rawMax === "")
+        ? null
+        : (Number.isFinite(Number(rawMax)) && Number(rawMax) >= 0 ? Math.floor(Number(rawMax)) : null);
+
+    const rawTokChat = (cfg.max_tokens_chat ?? cfg.maxTokensChat);
+    const max_tokens_chat =
+      (rawTokChat !== undefined && rawTokChat !== null && rawTokChat !== "" && Number(rawTokChat) > 0)
+        ? Math.floor(Number(rawTokChat)) : 4096;
+
+    const rawTokSpk = (cfg.max_tokens_speaker ?? cfg.maxTokensSpeaker);
+    const max_tokens_speaker =
+      (rawTokSpk !== undefined && rawTokSpk !== null && rawTokSpk !== "" && Number(rawTokSpk) > 0)
+        ? Math.floor(Number(rawTokSpk)) : 1024;
+
+    const admins = Array.isArray(cfg.admins) ? cfg.admins.map(String) : [];
+
+    const cfgChatAppend = cfg.chatAppend ?? cfg.chatPrompt ?? cfg.chat_prompt ?? cfg.prompt_chat ?? "";
+    const cfgSpeechAppend = cfg.speechAppend ?? cfg.speechPrompt ?? cfg.speech_prompt ?? cfg.prompt_speech ?? "";
+
+    const chatAppend = typeof cfgChatAppend === "string" ? cfgChatAppend.trim() : "";
+    const speechAppend = typeof cfgSpeechAppend === "string" ? cfgSpeechAppend.trim() : "";
 
     const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
 
     const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
-    const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-    const avatarUrl = fs.existsSync(avatarPath)
-      ? (base ? `${base}/documents/avatars/${channelId}.png` : `https://ralfreschke.de/documents/avatars/${channelId}.png`)
-      : (base ? `${base}/documents/avatars/default.png`   : `https://ralfreschke.de/documents/avatars/default.png`);
+    const avatarUrl = fs.existsSync(avatarPath) ? buildPublicAvatarUrl(channelId) : buildPublicAvatarUrl("default");
 
-    const summariesEnabled = !!(hasConfigFile && String(summaryPrompt || "").trim());
+    const summariesEnabled = !!String(summaryPrompt || "").trim();
 
     return {
-      name,
-      botname,
-      voice,
-      persona,
-      avatarUrl,
-      instructions,
-      tools: ctxTools,
-      toolRegistry,
-      blocks,
-      summaryPrompt,
-      max_user_messages,
-      hasConfig: hasConfigFile,
-      summariesEnabled,
-      admins,
-      max_tokens_chat,
-      max_tokens_speaker,
-      chatAppend,
-      speechAppend,
+      name, botname, voice, persona, avatarUrl, instructions,
+      tools: ctxTools, toolRegistry, blocks, summaryPrompt,
+      max_user_messages, hasConfig: true, summariesEnabled, admins,
+      max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
     };
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
     return {
-      name: "", botname: "AI", voice: "", persona: "", avatarUrl: `https://ralfreschke.de/documents/avatars/default.png`,
+      name: "", botname: "AI", voice: "", persona: "", avatarUrl: buildPublicAvatarUrl("default"),
       instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
@@ -394,7 +350,7 @@ async function setMessageReaction(message, emoji) {
   }
 }
 
-/* Reply via webhook with text only (chunked as plain content) */
+/* Reply via webhook mit Text (chunked) */
 async function setReplyAsWebhook(message, content, { botname } = {}) {
   try {
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
@@ -402,8 +358,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrlRaw = await ensureChannelAvatar(effectiveChannelId, meta);
-    const personaAvatarUrl = /^https?:\/\//i.test(personaAvatarUrlRaw) ? personaAvatarUrlRaw : undefined; // ⬅️ sanitize
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || "AI"));
@@ -430,7 +385,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
   }
 }
 
-/* Build a list of URLs (with optional labels) from text */
+/* Build a list of URLs (mit optional Labels) aus Text */
 function collectUrlsWithLabels(text) {
   const out = [];
   const seen = new Set();
@@ -468,6 +423,7 @@ async function pickFirstImageCandidate(list) {
   const withExt = list.find(l => l.isImageExt);
   if (withExt) return withExt;
 
+  // Fallback: Content-Type prüfen
   for (const l of list) {
     try {
       const ct = await headContentType(l.url);
@@ -493,7 +449,7 @@ async function headContentType(url) {
   return null;
 }
 
-/* Normalize text for embed: turn markdown images into ordinary links, reduce spacing */
+/* Normalize text for embed */
 function prepareTextForEmbed(text) {
   let s = String(text || "");
   s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt, url) => {
@@ -504,17 +460,11 @@ function prepareTextForEmbed(text) {
   return s;
 }
 
-/* Heuristic: URL looks like an image by extension */
-function looksLikeImage(u) {
-  return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u);
-}
+/* URL-Heuristiken */
+function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u); }
+function cleanUrl(u) { try { return u.replace(/[),.]+$/g, ""); } catch { return u; } }
 
-/* Light URL cleanup (strip trailing bracket/commas) */
-function cleanUrl(u) {
-  try { return u.replace(/[),.]+$/g, ""); } catch { return u; }
-}
-
-/* Send AI reply as chunked embeds; first embed may include a large image */
+/* Reply als Embeds (chunked) – erstes Embed mit großem Bild wenn passend */
 async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) {
   try {
     if (!aiText || !String(aiText).trim()) return;
@@ -524,8 +474,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
 
     const effectiveChannelId = isThread ? (message.channel.parentId || message.channel.id) : message.channel.id;
     const meta = getChannelConfig(effectiveChannelId);
-    const personaAvatarUrlRaw = await ensureChannelAvatar(effectiveChannelId, meta);
-    const personaAvatarUrl = /^https?:\/\//i.test(personaAvatarUrlRaw) ? personaAvatarUrlRaw : undefined; // ⬅️ sanitize
+    const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
@@ -642,7 +591,7 @@ function getSplitTextToChunks(text, maxChars = 500) {
   return chunks;
 }
 
-/* Capture and transcribe users speaking in a voice channel, then callback with transcript */
+/* Capture und Transkription aus Voice-Kanal – ruft Callback mit Transcript */
 async function setStartListening(connection, guildId, guildTextChannels, client, onTranscript) {
   try {
     if (!connection || !guildId) return;
@@ -906,7 +855,6 @@ async function getSpeech(connection, guildId, text, client, voice) {
 }
 
 module.exports = {
-  getDefaultPersona,
   getChannelConfig,
   setMessageReaction,
   setReplyAsWebhook,
@@ -920,4 +868,6 @@ module.exports = {
   resetRecordingFlag,
   postSummariesIndividually,
   setReplyAsWebhookEmbed,
+  ensureChannelAvatar,           // exportiert für Tests/Debug
+  buildPublicAvatarUrl           // exportiert für saubere URL-Erzeugung
 };
