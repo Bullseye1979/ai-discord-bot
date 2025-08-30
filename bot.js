@@ -1,4 +1,4 @@
-// bot.js — refactored v3.10 (errors to channel, warn on withdrawals, strict one-shot BUSY gate)
+// bot.js — refactored v3.11 (message reactions + global busy presence)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -21,6 +21,7 @@ const {
   sendChunked,
   resetTTSPlayer,
   resetRecordingFlag,
+  setMessageReaction, // ← reactions helper
 } = require("./discord-helper.js");
 
 const { reportError, reportInfo, reportWarn } = require("./error.js");
@@ -40,6 +41,21 @@ const contextStorage = new Map();
 const guildTextChannels = new Map();    // guildId -> textChannelId (for TTS/transcripts)
 const voiceBusy = new Map();            // channelId -> boolean (busy while LLM+TTS runs)
 const busyNoticeSent = new Map();       // channelId -> boolean (BUSY notice already shown during this busy period)
+
+// ===== Global in-flight operations → presence =====
+let activeOps = 0;
+function updatePresence() {
+  try {
+    if (!client?.user) return;
+    if (activeOps > 0) {
+      setBotPresence(client, `⏳ Working (${activeOps})`, "dnd");
+    } else {
+      setBotPresence(client, "✅ Ready", "online");
+    }
+  } catch {}
+}
+function beginOp() { activeOps++; updatePresence(); }
+function endOp()   { if (activeOps > 0) activeOps--; updatePresence(); }
 
 /** Ensure a Context instance for a channel, rebuilding when config signature changes */
 function ensureChatContextForChannel(channelId, storage, channelMeta) {
@@ -267,8 +283,9 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
         : def;
     })();
 
-    // mark busy *before* any await — ensures strict gating
+    // mark busy *before* any await — ensures strict gating, and bump presence
     voiceBusy.set(evt.channelId, true);
+    beginOp();
 
     const sequenceLimit = 1;
     const instrBackup = chatContext.instructions;
@@ -331,11 +348,12 @@ async function handleVoiceTranscriptDirect(evt, client, storage) {
   } catch (err) {
     await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT", { emit: "channel" });
   } finally {
-    // End of busy period → allow next voice, reset the one-shot BUSY flag.
+    // End of busy period → allow next voice, reset the one-shot BUSY flag, drop presence
     try {
       voiceBusy.set(evt.channelId, false);
       busyNoticeSent.delete(evt.channelId);
     } catch {}
+    endOp();
   }
 }
 
@@ -672,6 +690,7 @@ client.on("messageCreate", async (message) => {
 
       try {
         await chatContext.collapseToSystemAndLastSummary();
+        await reportInfo(message.channel, "RAM context collapsed to: **System + last summary**.", "SUMMARY");
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE", { emit: "channel" });
         await reportInfo(message.channel, "RAM context collapse failed (kept full memory).", "SUMMARY");
@@ -731,7 +750,7 @@ client.on("messageCreate", async (message) => {
         : def;
     })();
 
-    // Optional strict hint if no summaries exist (parity with handler ergonomics)
+    // Optional strict hint if no summaries exist
     try {
       const lastSumm = await chatContext.getLastSummaries(1).catch(() => []);
       if (!Array.isArray(lastSumm) || lastSumm.length === 0) {
@@ -773,27 +792,42 @@ client.on("messageCreate", async (message) => {
       }
     } catch {}
 
-    const output = await getAIResponse(
-      chatContext,
-      tokenlimit,
-      1000,
-      effectiveModel,
-      effectiveApiKey
-    );
+    // >>> Reactions + presence around the actual AI call <<<
+    await setMessageReaction(message, "⏳");
+    beginOp();
+    try {
+      const output = await getAIResponse(
+        chatContext,
+        tokenlimit,
+        1000,
+        effectiveModel,
+        effectiveApiKey
+      );
 
-    // restore instructions if we touched them
-    try { chatContext.instructions = instrBackup ?? chatContext.instructions; } catch {}
-    try { if (typeof chatContext.__instr_backup === "string") {
-      chatContext.instructions = chatContext.__instr_backup;
-      delete chatContext.__instr_backup;
-    }} catch {}
+      // restore instructions if we touched them
+      try { chatContext.instructions = instrBackup ?? chatContext.instructions; } catch {}
+      try { if (typeof chatContext.__instr_backup === "string") {
+        chatContext.instructions = chatContext.__instr_backup;
+        delete chatContext.__instr_backup;
+      }} catch {}
 
-    if (output && String(output).trim()) {
-      await setReplyAsWebhookEmbed(message, output, {
-        botname: channelMeta.botname,
-        color: 0x00b3ff,
-      });
-      await chatContext.add("assistant", channelMeta?.botname || "AI", output);
+      const txt = (output || "").trim();
+      if (txt) {
+        await setReplyAsWebhookEmbed(message, txt, {
+          botname: channelMeta.botname,
+          color: 0x00b3ff,
+        });
+        await chatContext.add("assistant", channelMeta?.botname || "AI", txt);
+        await setMessageReaction(message, "✅");
+      } else {
+        await setMessageReaction(message, "❌");
+        await reportInfo(message.channel, "No output produced.", "AI");
+      }
+    } catch (err) {
+      await setMessageReaction(message, "❌");
+      throw err; // outer catch will reportError
+    } finally {
+      endOp();
     }
   } catch (err) {
     await reportError(err, message?.channel, "ON_MESSAGE_CREATE", { emit: "channel" });
@@ -805,7 +839,7 @@ function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
-    setBotPresence(client, "✅ Started", "online");
+    setBotPresence(client, "✅ Ready", "online"); // start in ready state
     initCron(client, contextStorage);
   } catch (err) {
     // no channel available here; still mark emit: "channel" for consistency
