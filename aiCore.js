@@ -1,7 +1,8 @@
-// aiCore.js — refactored v2.1
+// aiCore.js — refactored v2.2
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// NEW (v2.0): pendingUser working-copy + post-commit of user + tool messages with original timestamp.
-// NEW (v2.1): transport hardening (keep-alive + retry + endpoint fallback) + loop guard fix.
+// v2.0: pendingUser working-copy + post-commit of user + tool messages with original timestamp.
+// v2.1: transport hardening (keep-alive + retry + endpoint fallback) + loop guard fix.
+// v2.2: endpoint normalization (/responses -> /chat/completions) + richer error logging.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -49,7 +50,7 @@ const axiosAI = axios.create({
   httpAgent: keepAliveHttpAgent,
   httpsAgent: keepAliveHttpsAgent,
   timeout: 60_000,
-  maxRedirects: 0,                 // avoid redirect chains → "socket hang up"
+  maxRedirects: 0, // avoid redirect chains → fewer "socket hang up"
   maxBodyLength: Infinity,
   maxContentLength: Infinity,
   validateStatus: (s) => s >= 200 && s < 300,
@@ -79,6 +80,19 @@ async function postWithRetry(url, payload, headers, tries = 3) {
 }
 
 /* ---------------------------------------------------------------------------------- */
+
+/** Normalize endpoint to chat-completions if someone pointed to /responses */
+function normalizeEndpoint(raw) {
+  const fallback = "https://api.openai.com/v1/chat/completions";
+  let url = (raw || "").trim();
+  if (!url) return fallback;
+
+  // Common misconfig: Responses API with chat payload
+  if (/\/v1\/responses\/?$/.test(url)) return url.replace(/\/v1\/responses\/?$/, "/v1/chat/completions");
+  // Also handle accidental base-only values
+  if (/\/v1\/?$/.test(url)) return url.replace(/\/v1\/?$/, "/v1/chat/completions");
+  return url;
+}
 
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
@@ -144,13 +158,13 @@ async function getAIResponse(
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
-    // If we have a pending user-turn, PUT IT ONLY INTO THE WORKING COPY (not into context_orig yet!)
+    // Pending user only in working copy (not in persistent context yet)
     if (pendingUser && pendingUser.content) {
       const safeName = cleanOpenAIName("user", pendingUser.name || "user");
       const msg = { role: "user", content: pendingUser.content };
       if (safeName) msg.name = safeName;
       context.messages.push(msg);
-      handoverContext.messages.push({ ...msg }); // tools may peek the same working sequence
+      handoverContext.messages.push({ ...msg });
     }
 
     const toolCommits = []; // { name: fnName, content: string }
@@ -159,7 +173,7 @@ async function getAIResponse(
 
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
-    // loop until tools are resolved (per-turn) or a 'continue' chain is finished
+    // Loop until tools are resolved and optional continue chain done
     let hasToolCalls = false;
     do {
       const messagesToSend = context.messages.map((m) => {
@@ -179,10 +193,9 @@ async function getAIResponse(
         tools: context.tools,
       };
 
-      // Endpoint sanity: fallback to official chat completions if env/config is missing
-      const endpoint =
-        (process.env.OPENAI_API_URL || OPENAI_API_URL || "").trim() ||
-        "https://api.openai.com/v1/chat/completions";
+      // Resolve endpoint
+      const configured = (process.env.OPENAI_API_URL || OPENAI_API_URL || "").trim();
+      const endpoint = normalizeEndpoint(configured) || "https://api.openai.com/v1/chat/completions";
 
       // API Call (with retry)
       let aiResponse;
@@ -193,7 +206,13 @@ async function getAIResponse(
           Connection: "keep-alive",
         });
       } catch (err) {
-        await reportError(err, null, "OPENAI_CHAT");
+        // Enrich error context (status + body) for debugging 400s etc.
+        const details = {
+          endpoint,
+          status: err?.response?.status,
+          data: err?.response?.data,
+        };
+        await reportError(err, null, "OPENAI_CHAT", { details });
         throw err;
       }
 
@@ -225,11 +244,7 @@ async function getAIResponse(
               typeof content === "string" || content == null
                 ? content || ""
                 : (() => {
-                    try {
-                      return JSON.stringify(content);
-                    } catch {
-                      return String(content);
-                    }
+                    try { return JSON.stringify(content); } catch { return String(content); }
                   })();
 
             context.messages.push({
@@ -237,27 +252,17 @@ async function getAIResponse(
               tool_call_id: toolCall.id,
               content: out,
             });
-            // record for commit later
             toolCommits.push({ name: fnName || "tool", content: out });
           };
 
           if (!toolFunction) {
-            const msg = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
-            replyTool(msg);
+            replyTool(`[ERROR]: Tool '${fnName}' not available or arguments invalid.`);
             continue;
           }
 
           try {
-            // Runtime with channel_id for getHistory etc.
-            const runtime = {
-              channel_id: context_orig.channelId || handoverContext.channelId || null,
-            };
-            const toolResult = await toolFunction(
-              toolCall.function,
-              handoverContext,
-              getAIResponse,
-              runtime
-            );
+            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
@@ -286,10 +291,10 @@ async function getAIResponse(
       } else {
         continueResponse = false;
       }
-    } while (hasToolCalls || continueResponse); // <= FIX: evaluate per-iteration result, not a sticky flag
+    } while (hasToolCalls || continueResponse);
 
     // === Post-commit to the persistent context in correct temporal order ===
-    // 1) The pending user message (always commit it), with original timestamp
+    // 1) Commit pending user with original timestamp
     if (pendingUser && pendingUser.content) {
       try {
         await context_orig.add(
@@ -300,7 +305,7 @@ async function getAIResponse(
         );
       } catch {}
     }
-    // 2) If tools ran, commit their outputs right after, anchored near original time (+1ms per tool)
+    // 2) Commit tool outputs right after, anchored to original time (+1ms each)
     if (pendingUser && toolCommits.length > 0) {
       let t0 = pendingUser.timestamp || Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
@@ -313,7 +318,11 @@ async function getAIResponse(
 
     return responseMessage;
   } catch (err) {
-    await reportError(err, null, "GET_AI_RESPONSE");
+    const details = {
+      status: err?.response?.status,
+      data: err?.response?.data,
+    };
+    await reportError(err, null, "GET_AI_RESPONSE", { details });
     throw err;
   }
 }
