@@ -171,6 +171,7 @@ function parseLegacySql(sqlIn) {
 /* ----------------------------- Tool entry ----------------------------- */
 
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
+  console.log("GET HISTORY ENTERED");
   try {
     const rawArgs =
       typeof toolFunction.arguments === "string"
@@ -231,6 +232,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       rows: safe,
     });
   } catch (err) {
+    consloel.log(err);
     return JSON.stringify({ error: `[ERROR]: ${err?.message || String(err)}` });
   }
 }
