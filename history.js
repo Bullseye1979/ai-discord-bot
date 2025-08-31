@@ -1,4 +1,4 @@
-// history.js — v2.2 (structured parts + safe builder + automatic channel filter + console logging)
+// history.js — v2.3 (structured parts + safe builder + automatic channel filter + console logging)
 // READ-ONLY MySQL SELECT over channel history (context_log, summaries).
 // - Structured mode: { select, from, where, bindings } -> wir bauen finalen SQL sicher.
 // - Legacy mode: args.sql -> wir PARSEN "SELECT … FROM … [WHERE …]" und bauen sicher neu.
@@ -44,12 +44,14 @@ function ensureOrderByTimestamp(sql) {
 
 /** Compiles :named placeholders into '?', returns { sql, values }.
  *  Adds LIMIT 200 if missing.
+ *  IMPORTANT: names must start with [A-Za-z_] to avoid matching time literals like "10:00".
  */
 function compileNamed(sql, bindings) {
   const values = [];
   const cleaned = stripTrailingSemicolons(sql);
 
-  const out = cleaned.replace(/:(\w+)/g, (_, name) => {
+  // Only replace tokens like :from, :to, :channel_id — NOT :00, NOT :1, NOT ://
+  const out = cleaned.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_, name) => {
     if (!(name in bindings)) {
       throw new Error(`Missing binding for :${name}`);
     }
@@ -75,7 +77,7 @@ function previewValues(arr, maxLen = 200) {
     return (arr || []).map((v) => {
       if (typeof v === "string") {
         return v.length > maxLen ? v.slice(0, maxLen) + "…" : v;
-      }
+        }
       return v;
     });
   } catch {
@@ -232,7 +234,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       rows: safe,
     });
   } catch (err) {
-    console.log(err);
+    console.error(err);
     return JSON.stringify({ error: `[ERROR]: ${err?.message || String(err)}` });
   }
 }
