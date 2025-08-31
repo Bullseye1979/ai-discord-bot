@@ -1,4 +1,4 @@
-// tools.js — refactored v1.3
+// tools.js — refactored v1.4 (structured getHistory + name normalization)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -9,6 +9,8 @@ const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
 const { getHistory } = require("./history.js");
 const { reportError } = require("./error.js");
+
+// ---- OpenAI tool specs ------------------------------------------------------
 
 const tools = [
   {
@@ -71,7 +73,7 @@ const tools = [
         properties: {
           video_url: { type: "string", description: "YouTube video URL." },
           user_id: { type: "string", description: "User ID or display name." },
-          user_prompt: { type: "string", description: "Original user prompt." }
+          user_prompt: { type: "string", description: "Original natural-language user request." }
         },
         required: ["video_url", "user_id", "user_prompt"]
       }
@@ -112,26 +114,62 @@ const tools = [
       }
     }
   },
+
+  // ==== CHANGED: getHistory now expects structured parts instead of full SQL ====
   {
     type: "function",
     function: {
       name: "getHistory",
-      description: "Use this, to get the history of the chat, when you don’t find the information in the context. Run a READ-ONLY MySQL SELECT over this channel’s history. The model must write the full SELECT. Allowed tables: context_log(id,timestamp,channel_id,role,sender,content) and summaries(id,timestamp,channel_id,summary,last_context_id). Always include a WHERE with :channel_id.",
+      description:
+        "Query the channel’s history (read-only). Provide SQL *parts* only and NOT a full query. " +
+        "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
+        "The channel filter and ORDER BY timestamp are auto-injected.",
       parameters: {
         type: "object",
         properties: {
-          channel_id: { type: "string", description: "Discord channel ID scope." },
-          sql: { type: "string", description: "Single SELECT statement using MySQL + named placeholders (e.g., :channel_id, :day, :from, :to, :who, :kw, :year)." },
+          select: {
+            type: "string",
+            description:
+              "Columns/expressions to select, e.g. `timestamp, role, name, content` or `COUNT(*) AS cnt`."
+          },
+          from: {
+            description:
+              "One allowed table (optionally with alias). Use only `context_log` or `summaries`. Example: `context_log` or `summaries s`.",
+            oneOf: [
+              {
+                type: "string",
+                enum: ["context_log", "summaries", "context_log cl", "summaries s"]
+              },
+              {
+                type: "array",
+                items: {
+                  type: "string",
+                  enum: ["context_log", "summaries"]
+                },
+                minItems: 1,
+                maxItems: 1
+              }
+            ]
+          },
+          where: {
+            type: "string",
+            description:
+              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). " +
+              "Examples: `timestamp >= :sinceTs AND role = 'user'`."
+          },
           bindings: {
             type: "object",
-            description: "Values for named placeholders (except channel_id if given top-level).",
+            description:
+              "Named parameters referenced in `where` (e.g. `{ \"sinceTs\": 1716400000000 }`).",
             additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }] }
           }
         },
-        required: ["sql", "channel_id"]
+        required: ["select", "from"],
+        additionalProperties: false
       }
     }
   },
+
   {
     type: "function",
     function: {
@@ -150,6 +188,8 @@ const tools = [
   }
 ];
 
+// ---- Runtime registry (implementation functions) ----------------------------
+
 const fullToolRegistry = {
   getWebpage,
   getImage,
@@ -161,6 +201,21 @@ const fullToolRegistry = {
   getHistory
 };
 
+/** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
+function normalizeToolName(name) {
+  if (!name) return "";
+  const raw = String(name).trim();
+  if (!raw) return "";
+
+  // Quick alias
+  if (raw.toLowerCase() === "gethistory") return "getHistory";
+
+  // Case-insensitive match to known keys
+  const keys = Object.keys(fullToolRegistry);
+  const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
+  return hit || raw;
+}
+
 /** Build a filtered tool list and callable registry for a given allowlist */
 function getToolRegistry(toolNames = []) {
   try {
@@ -169,28 +224,30 @@ function getToolRegistry(toolNames = []) {
       return { tools: [], registry: {} };
     }
 
-    // Stabil: Reihenfolge wie angefordert, Duplikate entfernen
+    // Normalize names, keep order, drop duplicates
     const seen = new Set();
-    const wanted = toolNames.filter((n) => {
-      const key = String(n || "");
-      if (!key) return false;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const wanted = toolNames
+      .map((n) => normalizeToolName(n))
+      .filter((n) => {
+        const key = String(n || "");
+        if (!key) return false;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
-    // Warnung für unbekannte Tools
+    // Warn for unknown tools
     for (const name of wanted) {
       if (!fullToolRegistry[name]) {
         reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
       }
     }
 
-    // Gefilterte OpenAI-Tool-JSONs (nur vorhandene)
+    // Filter OpenAI tool specs to requested/available set
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
 
-    // Aufrufbares Registry
+    // Build callable registry
     const registry = {};
     for (const name of availableNames) {
       registry[name] = fullToolRegistry[name];
