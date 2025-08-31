@@ -158,7 +158,7 @@ const tools = [
           where: {
             type: "string",
             description:
-              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). Use mariadb-compatible syntax" +
+              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). Use mariadb-compatible syntax. When looking for text, only search for nouns." +
               "Examples: `timestamp >= :sinceTs AND role = 'user'`."
           },
           bindings: {
