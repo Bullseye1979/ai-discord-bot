@@ -364,6 +364,35 @@ function prepareTextForEmbed(text) {
 function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u); }
 function cleanUrl(u) { try { return u.replace(/[),.]+$/g, ""); } catch { return u; } }
 
+/** NEW: TTS-Text so vorbereiten, dass keine Links vorgelesen werden.
+ *  - Bilder-Markdown:  ![Alt](url)  →  "Alt" (oder "Bild" wenn Alt leer)
+ *  - Links-Markdown:   [Label](url) →  "Label"
+ *  - nackte URLs:      http(s)://…   →  entfernt
+ */
+function prepareTextForTTS(text) {
+  if (!text) return "";
+  let s = String(text);
+
+  // 1) Bilder: nur Alt lesen
+  s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt) => {
+    const a = (alt || "").trim();
+    return a || "";
+  });
+
+  // 2) Links: nur Label lesen
+  s = s.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label) => {
+    return (label || "").trim();
+  });
+
+  // 3) nackte URLs komplett entfernen
+  s = s.replace(/https?:\/\/[^\s)]+/g, "");
+
+  // 4) Überzählige Klammern/Reste und Whitespace säubern
+  s = s.replace(/[ \t]+/g, " ").replace(/\s*\(\s*\)\s*/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+
+  return s;
+}
+
 /** Reply via webhook plain text (chunked), mit Avatar-Update und Versioning */
 async function setReplyAsWebhook(message, content, { botname } = {}) {
   try {
@@ -675,7 +704,11 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
 async function getSpeech(connection, guildId, text, client, voice) {
   try {
     if (!connection || !text?.trim()) return;
-    const chunks = getSplitTextToChunks(text);
+
+    // WICHTIG: Links/URLs entfernen, nur Alt-/Link-Text vorlesen
+    const prepared = prepareTextForTTS(text);
+
+    const chunks = getSplitTextToChunks(prepared);
 
     return setEnqueueTTS(guildId, async () => {
       let player = playerMap.get(guildId);
