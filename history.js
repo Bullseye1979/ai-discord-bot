@@ -52,6 +52,7 @@ function truncate(s, n = 1200) {
 
 /** Tool entry: executes a safe SELECT over context_log/summaries scoped to the provided channel_id. */
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
+  console.log("GET HISTORY CALLED");
   try {
     const args =
       typeof toolFunction.arguments === "string"
