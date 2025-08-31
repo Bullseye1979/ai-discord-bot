@@ -1,10 +1,15 @@
-// aiCore.js — refactored v2.2
+// aiCore.js — refactored v2.7
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// v2.0: pendingUser working-copy + post-commit of user + tool messages with original timestamp.
-// v2.1: transport hardening (keep-alive + retry + endpoint fallback) + loop guard fix.
-// v2.2: endpoint normalization (/responses -> /chat/completions) + richer error logging.
+// v2.0: pendingUser working-copy + post-commit with original timestamp.
+// v2.3: prune orphan historical `tool` msgs when building payload.
+// v2.4: PERSIST tool results as `assistant` (or `system`) messages with a clear wrapper.
+// v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
+// v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
+// v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
 
 require("dotenv").config();
+const fs = require("fs"); // (kept if you later want file-based priming again)
+const path = require("path");
 const axios = require("axios");
 const http = require("http");
 const https = require("https");
@@ -50,7 +55,7 @@ const axiosAI = axios.create({
   httpAgent: keepAliveHttpAgent,
   httpsAgent: keepAliveHttpsAgent,
   timeout: 60_000,
-  maxRedirects: 0, // avoid redirect chains → fewer "socket hang up"
+  maxRedirects: 0,
   maxBodyLength: Infinity,
   maxContentLength: Infinity,
   validateStatus: (s) => s >= 200 && s < 300,
@@ -81,17 +86,75 @@ async function postWithRetry(url, payload, headers, tries = 3) {
 
 /* ---------------------------------------------------------------------------------- */
 
-/** Normalize endpoint to chat-completions if someone pointed to /responses */
 function normalizeEndpoint(raw) {
   const fallback = "https://api.openai.com/v1/chat/completions";
   let url = (raw || "").trim();
   if (!url) return fallback;
-
-  // Common misconfig: Responses API with chat payload
   if (/\/v1\/responses\/?$/.test(url)) return url.replace(/\/v1\/responses\/?$/, "/v1/chat/completions");
-  // Also handle accidental base-only values
   if (/\/v1\/?$/.test(url)) return url.replace(/\/v1\/?$/, "/v1/chat/completions");
   return url;
+}
+
+/** Remove orphan historical tool messages; keep only those that pair with a just-previous assistant.tool_calls */
+function pruneOrphanToolMessages(msgs) {
+  const out = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+
+    if (m.role === "tool") {
+      const prev = out[out.length - 1];
+      const ok =
+        prev &&
+        prev.role === "assistant" &&
+        Array.isArray(prev.tool_calls) &&
+        prev.tool_calls.some((tc) => tc && tc.id && tc.id === m.tool_call_id);
+
+      if (!ok) continue; // drop historical/orphan tool message from payload
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+/* -------------------- Tool result persistence as assistant/system -------------------- */
+
+const TOOL_PERSIST_ROLE = (process.env.TOOL_PERSIST_ROLE || "assistant").toLowerCase() === "system"
+  ? "system"
+  : "assistant";
+
+const MAX_TOOL_PERSIST_CHARS = Math.max(
+  500,
+  Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 3000))
+);
+
+/** Produce a compact, parseable wrapper for tool results */
+function formatToolResultForPersistence(toolName, content) {
+  const header = `[TOOL_RESULT:${(toolName || "unknown").trim()}]`;
+  // ensure the payload is a string (raw JSON or text)
+  let payloadStr;
+  if (typeof content === "string") {
+    payloadStr = content;
+  } else {
+    try { payloadStr = JSON.stringify(content); } catch { payloadStr = String(content); }
+  }
+
+  const looksJSON = /^\s*[\[{]/.test((payloadStr || "").trim());
+  let body = looksJSON
+    ? `${header}\n${payloadStr}`
+    : `${header}\n\`\`\`\n${payloadStr}\n\`\`\``;
+
+  // Hard cap to avoid giant blobs (e.g., long PDF text)
+  if (body.length > MAX_TOOL_PERSIST_CHARS) {
+    const tail = "\n…[truncated]";
+    body = body.slice(0, MAX_TOOL_PERSIST_CHARS - tail.length) + tail;
+  }
+  return body;
+}
+
+/* -------------------- Simple global priming from ENV -------------------- */
+
+function loadEnvPriming() {
+  return (process.env.STANDARDPRIMING || "").trim();
 }
 
 /**
@@ -117,7 +180,7 @@ async function getAIResponse(
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
-    // Working copies (reply context + tool-handover), MUST carry channelId for tools like getHistory
+    // Working copies (reply context + tool-handover)
     const context = new Context(
       "",
       "",
@@ -140,9 +203,11 @@ async function getAIResponse(
 
     const toolRegistry = context.toolRegistry;
 
-    // Compose system
+    // Compose system: "General rules:\n{STANDARDPRIMING}" → channel persona → channel instructions
     try {
       const sysParts = [];
+      const priming = loadEnvPriming();
+      if (priming) sysParts.push(`General rules:\n${priming}`);
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
       if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
       const sysCombined = sysParts.join("\n\n").trim();
@@ -151,14 +216,14 @@ async function getAIResponse(
       }
     } catch {}
 
-    // Time hint
+    // Time hint (separate system line)
     const nowUtc = new Date().toISOString();
     context.messages.unshift({
       role: "system",
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
-    // Pending user only in working copy (not in persistent context yet)
+    // Pending user only in working copy (not yet persisted)
     if (pendingUser && pendingUser.content) {
       const safeName = cleanOpenAIName("user", pendingUser.name || "user");
       const msg = { role: "user", content: pendingUser.content };
@@ -176,7 +241,10 @@ async function getAIResponse(
     // Loop until tools are resolved and optional continue chain done
     let hasToolCalls = false;
     do {
-      const messagesToSend = context.messages.map((m) => {
+      // do not feed orphan historical tool messages to the API
+      const safeMsgs = pruneOrphanToolMessages(context.messages);
+
+      const messagesToSend = safeMsgs.map((m) => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
         if (safeName) out.name = safeName;
@@ -206,7 +274,6 @@ async function getAIResponse(
           Connection: "keep-alive",
         });
       } catch (err) {
-        // Enrich error context (status + body) for debugging 400s etc.
         const details = {
           endpoint,
           status: err?.response?.status,
@@ -243,9 +310,7 @@ async function getAIResponse(
             const out =
               typeof content === "string" || content == null
                 ? content || ""
-                : (() => {
-                    try { return JSON.stringify(content); } catch { return String(content); }
-                  })();
+                : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
 
             context.messages.push({
               role: "tool",
@@ -305,13 +370,15 @@ async function getAIResponse(
         );
       } catch {}
     }
-    // 2) Commit tool outputs right after, anchored to original time (+1ms each)
+    // 2) Commit tool outputs right after, anchored to original time (+1ms each), as assistant/system
     if (pendingUser && toolCommits.length > 0) {
       let t0 = pendingUser.timestamp || Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
         const tmsg = toolCommits[i];
+        const wrapped = formatToolResultForPersistence(tmsg.name, tmsg.content);
+        const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined; // name ignored for system
         try {
-          await context_orig.add("tool", tmsg.name || "tool", tmsg.content, t0 + i + 1);
+          await context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, t0 + i + 1);
         } catch {}
       }
     }
