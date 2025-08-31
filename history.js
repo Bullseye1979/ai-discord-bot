@@ -1,9 +1,10 @@
-// history.js — v2.1 (structured parts + safe builder + automatic channel filter)
+// history.js — v2.2 (structured parts + safe builder + automatic channel filter + console logging)
 // READ-ONLY MySQL SELECT over channel history (context_log, summaries).
 // - Structured mode: { select, from, where, bindings } -> wir bauen finalen SQL sicher.
 // - Legacy mode: args.sql -> wir PARSEN "SELECT … FROM … [WHERE …]" und bauen sicher neu.
 // - channel_id wird AUTOMATISCH aus ctx.channelId (oder runtime.channel_id) genommen und immer
 //   als zusätzlicher Filter eingefügt (kein :channel_id mehr erforderlich im Prompt).
+// - Loggt den finalen SELECT (mit '?') und die Werte ins Console-Log.
 
 const mysql = require("mysql2/promise");
 
@@ -68,6 +69,20 @@ function truncate(s, n = 1200) {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
+/** Safe console preview of values (avoid huge dumps). */
+function previewValues(arr, maxLen = 200) {
+  try {
+    return (arr || []).map((v) => {
+      if (typeof v === "string") {
+        return v.length > maxLen ? v.slice(0, maxLen) + "…" : v;
+      }
+      return v;
+    });
+  } catch {
+    return arr;
+  }
+}
+
 /* ----------------------------- Sanitizers (structured) ----------------------------- */
 
 const ALLOWED_TABLES = new Set(["context_log", "summaries"]);
@@ -123,7 +138,9 @@ function buildStructuredQuery(parts) {
   const selectPart = sanitizeSelect(parts.select);
   const fromPart = sanitizeFrom(parts.from);
   const wherePart = sanitizeWhere(parts.where);
-  const whereClause = wherePart ? `(${wherePart}) AND (\`channel_id\` = :channel_id)` : `(\`channel_id\` = :channel_id)`;
+  const whereClause = wherePart
+    ? `(${wherePart}) AND (\`channel_id\` = :channel_id)`
+    : `(\`channel_id\` = :channel_id)`;
   let sql = `SELECT ${selectPart} FROM ${fromPart} WHERE ${whereClause}`;
   sql = ensureOrderByTimestamp(sql);
   return sql;
@@ -193,6 +210,10 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     } else {
       throw new Error("No query provided. Use structured parts {select, from, where, bindings} or legacy {sql, bindings}.");
     }
+
+    // ---- Console logging of the final query ----
+    console.log("[getHistory] SQL:", finalSQL);
+    console.log("[getHistory] VALUES:", previewValues(values));
 
     const db = await getPool();
     const [rows] = await db.execute(finalSQL, values);
