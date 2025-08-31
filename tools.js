@@ -127,7 +127,7 @@ const tools = [
         "Allowed columns in context_log: timestamp, role, sender, content "+
         "Required columns: timestamp always has to be included. "+
         "The channel filter and ORDER BY timestamp are auto-injected. "+
-        "Try to restrict the results as less as possible, noise is ok as the result is filtered by AI .",
+        "Try to restrict the results as less as possible, noise is ok as the result is filtered by AI . Use search parameters that bring as much results as possible for a topic.",
       parameters: {
         type: "object",
         properties: {
