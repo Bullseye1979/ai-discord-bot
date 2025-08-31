@@ -1,4 +1,4 @@
-// history.js — clean v1.2
+// history.js — clean v1.3
 // Run a flexible READ-ONLY MySQL SELECT over the channel history (context_log, summaries only).
 
 const mysql = require("mysql2/promise");
@@ -15,16 +15,37 @@ async function getPool() {
       database: process.env.DB_NAME,
       waitForConnections: true,
       connectionLimit: 5,
-      charset: "utf8mb4"
+      charset: "utf8mb4",
     });
   }
   return pool;
 }
 
+/** Strip trailing semicolons */
+function stripTrailingSemicolons(sql) {
+  return String(sql || "").replace(/;+\s*$/g, "");
+}
+
+/**
+ * Ensure an ORDER BY `timestamp` ASC exists (if none present).
+ * If a LIMIT exists already, inject ORDER BY before it.
+ */
+function ensureOrderByTimestamp(sql) {
+  const s = stripTrailingSemicolons(sql);
+  if (/\border\s+by\b/i.test(s)) return s;
+
+  if (/\blimit\b/i.test(s)) {
+    // inject before LIMIT (preserve case of LIMIT by capturing)
+    return s.replace(/\blimit\b/i, "ORDER BY `timestamp` ASC LIMIT");
+  }
+  return `${s} ORDER BY \`timestamp\` ASC`;
+}
+
 /** Compiles named placeholders (:name) into positional (?) and returns { sql, values }. Adds LIMIT if missing. */
 function compileNamed(sql, bindings) {
   const values = [];
-  const cleaned = String(sql || "").replace(/;+\s*$/, "");
+  const cleaned = stripTrailingSemicolons(sql);
+
   const out = cleaned.replace(/:(\w+)/g, (_, name) => {
     if (!(name in bindings)) {
       throw new Error(`Missing binding for :${name}`);
@@ -32,16 +53,12 @@ function compileNamed(sql, bindings) {
     values.push(bindings[name]);
     return "?";
   });
-  if (!/\blimit\s+\d+/i.test(out)) return { sql: `${out} LIMIT 200`, values };
-  return { sql: out, values };
-}
 
-/** Ensure an ORDER BY timestamp ASC exists (if none present). */
-function ensureOrderByTimestamp(sql) {
-  const hasOrder = /\border\s+by\b/i.test(sql);
-  if (hasOrder) return sql;
-  // Wir erzwingen eine stabile Sortierung nach timestamp (ASC)
-  return `${sql} ORDER BY timestamp ASC`;
+  // Add default LIMIT if query has none (accept any form, incl. placeholders)
+  if (!/\blimit\b/i.test(out)) {
+    return { sql: `${out} LIMIT 200`, values };
+  }
+  return { sql: out, values };
 }
 
 /** Truncates long string fields in result rows. */
@@ -57,9 +74,10 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     const args =
       typeof toolFunction.arguments === "string"
         ? JSON.parse(toolFunction.arguments || "{}")
-        : (toolFunction.arguments || {});
+        : toolFunction.arguments || {};
+
     const sqlIn = String(args.sql || "").trim();
-    const extra = (args.bindings && typeof args.bindings === "object") ? args.bindings : {};
+    const extra = args.bindings && typeof args.bindings === "object" ? args.bindings : {};
 
     if (!sqlIn) throw new Error("SQL missing");
 
@@ -76,8 +94,10 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     }
     if (!/:channel_id\b/.test(sqlIn)) throw new Error("Query must include :channel_id in WHERE");
 
-    // ORDER BY timestamp erzwingen, falls fehlend
+    // Erzwinge stabiles ORDER BY (vor LIMIT, falls vorhanden)
     const sqlOrdered = ensureOrderByTimestamp(sqlIn);
+
+    // Named placeholders kompilieren
     const bindings = { channel_id: channelId, ...extra };
     const { sql: compiled, values } = compileNamed(sqlOrdered, bindings);
 
@@ -86,7 +106,9 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     const safe = (rows || []).map((r) => {
       const obj = {};
-      for (const [k, v] of Object.entries(r)) obj[k] = typeof v === "string" ? truncate(v) : v;
+      for (const [k, v] of Object.entries(r)) {
+        obj[k] = typeof v === "string" ? truncate(v) : v;
+      }
       return obj;
     });
 
