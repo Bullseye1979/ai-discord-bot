@@ -138,7 +138,7 @@ const tools = [
               "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
               "Allowed columns in summaries: timestamp, summary "+
               "Allowed columns in context_log: timestamp, role, sender, content "+
-              "Required columns: timestamp always has to be included. "+
+              "Required columns: timestamp always has to be included. "
           },
           from: {
             description:
