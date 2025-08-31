@@ -123,14 +123,17 @@ const tools = [
       description:
         "Query the channel’s history (read-only). Provide mariadb-compatible SQL *parts* only and NOT a full query. " +
         "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
-        "The channel filter and ORDER BY timestamp are auto-injected.",
+        "Allowed columns in summaries: timestamp, summary "+
+        "Allowed columns in context_log: timestamp, role, sender, content "+
+        "Required columns: timestamp always has to be included. "+
+        "The channel filter and ORDER BY timestamp are auto-injected. ",
       parameters: {
         type: "object",
         properties: {
           select: {
             type: "string",
             description:
-              "Columns/expressions to select, e.g. `timestamp, role, name, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format"
+              "Columns/expressions to select, e.g. timestamp, role, sender, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format"
           },
           from: {
             description:
