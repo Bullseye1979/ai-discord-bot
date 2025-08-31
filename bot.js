@@ -656,8 +656,8 @@ client.on("messageCreate", async (message) => {
 
       try {
         // Fetch & render summaries as Persona via webhook embed:
-        const last5Desc = await chatContext.getLastSummaries(5);
-        const summariesAsc = (last5Desc || []).slice().reverse();
+        const lastDesc = await chatContext.getLastSummaries(1);
+        const summariesAsc = (lastDesc || []).slice().reverse();
 
         if (summariesAsc.length === 0) {
           await setReplyAsWebhookEmbed(
