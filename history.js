@@ -232,7 +232,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       rows: safe,
     });
   } catch (err) {
-    consloel.log(err);
+    console.log(err);
     return JSON.stringify({ error: `[ERROR]: ${err?.message || String(err)}` });
   }
 }
