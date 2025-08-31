@@ -134,7 +134,11 @@ const tools = [
           select: {
             type: "string",
             description:
-              "Columns/expressions to select, e.g. timestamp, role, sender, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format"
+              "Columns/expressions to select, e.g. timestamp, role, sender, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format"+
+              "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
+              "Allowed columns in summaries: timestamp, summary "+
+              "Allowed columns in context_log: timestamp, role, sender, content "+
+              "Required columns: timestamp always has to be included. "+
           },
           from: {
             description:
