@@ -121,7 +121,7 @@ const tools = [
     function: {
       name: "getHistory",
       description:
-        "Query the channel’s history (read-only). Provide SQL *parts* only and NOT a full query. " +
+        "Query the channel’s history (read-only). Provide mariadb-compatible SQL *parts* only and NOT a full query. " +
         "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
         "The channel filter and ORDER BY timestamp are auto-injected.",
       parameters: {
@@ -130,7 +130,7 @@ const tools = [
           select: {
             type: "string",
             description:
-              "Columns/expressions to select, e.g. `timestamp, role, name, content` or `COUNT(*) AS cnt`."
+              "Columns/expressions to select, e.g. `timestamp, role, name, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format"
           },
           from: {
             description:
@@ -154,7 +154,7 @@ const tools = [
           where: {
             type: "string",
             description:
-              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). " +
+              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). Use mariadb-compatible syntax" +
               "Examples: `timestamp >= :sinceTs AND role = 'user'`."
           },
           bindings: {
