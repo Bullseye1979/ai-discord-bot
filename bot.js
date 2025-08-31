@@ -1,4 +1,5 @@
-// bot.js — refactored v3.11 (typed tool-calls restored, per-message reactions, presence, one-shot BUSY gate, tool-flow commit)
+// bot.js — refactored v3.12
+// typed tool-calls, per-message reactions, presence, one-shot BUSY gate, tool-flow commit
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
 require('dns').setDefaultResultOrder?.('ipv4first');
@@ -83,7 +84,8 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
         channelMeta.instructions,
         channelMeta.tools,
         channelMeta.toolRegistry,
-        channelId
+        channelId,
+        { persistToDB: true } // ⬅︎ Persistenz erzwingen
       );
       storage.set(key, { ctx, sig: signature });
     } else {
@@ -94,7 +96,8 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
           channelMeta.instructions,
           channelMeta.tools,
           channelMeta.toolRegistry,
-          channelId
+          channelId,
+          { persistToDB: true } // ⬅︎ Persistenz erzwingen
         );
         entry.sig = signature;
       }
@@ -102,7 +105,7 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
     return storage.get(key).ctx;
   } catch (err) {
     reportError(err, null, "ENSURE_CHAT_CONTEXT", { emit: "channel" });
-    return new Context("", "", [], {}, channelId);
+    return new Context("", "", [], {}, channelId, { persistToDB: true });
   }
 }
 
@@ -375,7 +378,8 @@ client.on("messageCreate", async (message) => {
         channelMeta.instructions,
         channelMeta.tools,
         channelMeta.toolRegistry,
-        baseChannelId
+        baseChannelId,
+        { persistToDB: true } // ⬅︎ Persistenz erzwingen (typed chat Pfad)
       );
       contextStorage.set(key, { ctx, sig: signature });
     } else {
@@ -386,7 +390,8 @@ client.on("messageCreate", async (message) => {
           channelMeta.instructions,
           channelMeta.tools,
           channelMeta.toolRegistry,
-          baseChannelId
+          baseChannelId,
+          { persistToDB: true } // ⬅︎ Persistenz erzwingen (Rebuild)
         );
         entry.sig = signature;
       }
@@ -560,9 +565,11 @@ client.on("messageCreate", async (message) => {
             }
 
             const TRIGGER = (channelMeta.name || "").trim();
-            const invoked = firstWordEqualsName(evt.text, TRIGGER);
 
-            // NEU: wenn nicht invoked -> trotzdem in den Kontext loggen (ohne Antwort)
+            // Immer loggen (DB + RAM) — ohne Doppelverarbeitung zu verursachen:
+            // Nur WENN kein Trigger, bleibt dieser Log der einzige Eintrag.
+            // Bei Trigger übernimmt später getAIResponse das Commit (wir loggen hier NICHT).
+            const invoked = firstWordEqualsName(evt.text, TRIGGER);
             if (!invoked) {
               try {
                 await chatContext.add(
@@ -571,13 +578,17 @@ client.on("messageCreate", async (message) => {
                   String(evt.text || "").trim(),
                   evt.startedAtMs || Date.now()
                 );
+                console.log("[VOICE→DB] stored transcript", {
+                  channelId: evt.channelId,
+                  speaker: evt.speaker || "voice",
+                  len: (String(evt.text || "").trim()).length
+                });
               } catch (e) {
                 await reportError(e, null, "VOICE_LOG_CONTEXT_NONINVOKED", { emit: "channel" });
               }
               return; // keine Antwort generieren
             }
 
-            // ALT: nur wenn invoked geht's weiter mit Busy-Gate + Pipeline
             // Strict busy gate:
             if (voiceBusy.get(evt.channelId)) {
               if (!busyNoticeSent.get(evt.channelId)) {
@@ -588,7 +599,7 @@ client.on("messageCreate", async (message) => {
                     "I’m already answering someone. Please wait until I finish speaking — then try again. Thanks for your patience! 😊",
                     "BUSY"
                   );
-                  busyNoticeSent.set(evt.channelId, true);
+                  busyNoticeSent.set(evt.channelId, true); // one-shot during this busy period
                 }
               }
               return; // do NOT log this utterance, do NOT queue anything
@@ -604,6 +615,7 @@ client.on("messageCreate", async (message) => {
 
             // run the full voice pipeline (sets busy/presence and commits after tools finish)
             await handleVoiceTranscriptDirect({ ...evt, text: textForLog }, client, contextStorage, pendingUserTurn);
+
             // one-shot notice is reset at end of busy period (also in finally of handler)
             busyNoticeSent.delete(evt.channelId);
           } catch (err) {
@@ -669,7 +681,7 @@ client.on("messageCreate", async (message) => {
       }
 
       try {
-        // Fetch & render summaries as Persona via webhook embed:
+        // Nur die letzte Summary anzeigen
         const lastDesc = await chatContext.getLastSummaries(1);
         const summariesAsc = (lastDesc || []).slice().reverse();
 
