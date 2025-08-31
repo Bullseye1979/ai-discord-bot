@@ -1,6 +1,7 @@
 // bot.js — refactored v3.11 (typed tool-calls restored, per-message reactions, presence, one-shot BUSY gate, tool-flow commit)
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
+require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
 const express = require("express");
 const path = require("path");

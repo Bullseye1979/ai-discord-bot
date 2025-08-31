@@ -1,9 +1,12 @@
-// aiCore.js — refactored v2.0
+// aiCore.js — refactored v2.1
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// NEW: pendingUser working-copy + post-commit of user + tool messages with original timestamp.
+// NEW (v2.0): pendingUser working-copy + post-commit of user + tool messages with original timestamp.
+// NEW (v2.1): transport hardening (keep-alive + retry + endpoint fallback) + loop guard fix.
 
 require("dotenv").config();
 const axios = require("axios");
+const http = require("http");
+const https = require("https");
 const { OPENAI_API_URL } = require("./config.js");
 const Context = require("./context.js");
 const { reportError } = require("./error.js");
@@ -27,6 +30,56 @@ function cleanOpenAIName(role, name) {
   return s;
 }
 
+/* -------------------- Transport hardening (keep-alive + retry) -------------------- */
+
+const keepAliveHttpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 16,
+  maxFreeSockets: 16,
+  timeout: 30_000,
+});
+const keepAliveHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 16,
+  maxFreeSockets: 16,
+  timeout: 30_000,
+});
+
+const axiosAI = axios.create({
+  httpAgent: keepAliveHttpAgent,
+  httpsAgent: keepAliveHttpsAgent,
+  timeout: 60_000,
+  maxRedirects: 0,                 // avoid redirect chains → "socket hang up"
+  maxBodyLength: Infinity,
+  maxContentLength: Infinity,
+  validateStatus: (s) => s >= 200 && s < 300,
+});
+
+async function postWithRetry(url, payload, headers, tries = 3) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await axiosAI.post(url, payload, { headers });
+    } catch (err) {
+      lastErr = err;
+      const code = err?.code;
+      const msg = String(err?.message || "");
+      const transient =
+        code === "ECONNRESET" ||
+        code === "EPIPE" ||
+        code === "ETIMEDOUT" ||
+        msg.includes("socket hang up") ||
+        msg.includes("ERR_STREAM_PREMATURE_CLOSE");
+
+      if (!transient || i === tries - 1) throw err;
+      await new Promise((r) => setTimeout(r, 300 * Math.pow(2, i))); // 300ms, 600ms, 1200ms
+    }
+  }
+  throw lastErr;
+}
+
+/* ---------------------------------------------------------------------------------- */
+
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
  * @param {Context} context_orig          // persistent channel context (DB-backed)
@@ -45,7 +98,6 @@ async function getAIResponse(
   options = {}
 ) {
   let responseMessage = "";
-  let usedAnyTool = false;
   const pendingUser = options?.pendingUser || null;
 
   try {
@@ -89,7 +141,7 @@ async function getAIResponse(
     const nowUtc = new Date().toISOString();
     context.messages.unshift({
       role: "system",
-      content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`
+      content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
     // If we have a pending user-turn, PUT IT ONLY INTO THE WORKING COPY (not into context_orig yet!)
@@ -107,6 +159,8 @@ async function getAIResponse(
 
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
+    // loop until tools are resolved (per-turn) or a 'continue' chain is finished
+    let hasToolCalls = false;
     do {
       const messagesToSend = context.messages.map((m) => {
         const out = { role: m.role, content: m.content };
@@ -125,11 +179,18 @@ async function getAIResponse(
         tools: context.tools,
       };
 
-      // API Call
+      // Endpoint sanity: fallback to official chat completions if env/config is missing
+      const endpoint =
+        (process.env.OPENAI_API_URL || OPENAI_API_URL || "").trim() ||
+        "https://api.openai.com/v1/chat/completions";
+
+      // API Call (with retry)
       let aiResponse;
       try {
-        aiResponse = await axios.post(OPENAI_API_URL, payload, {
-          headers: { Authorization: `Bearer ${authKey}`, "Content-Type": "application/json" },
+        aiResponse = await postWithRetry(endpoint, payload, {
+          Authorization: `Bearer ${authKey}`,
+          "Content-Type": "application/json",
+          Connection: "keep-alive",
         });
       } catch (err) {
         await reportError(err, null, "OPENAI_CHAT");
@@ -140,7 +201,7 @@ async function getAIResponse(
       const aiMessage = choice.message;
       const finishReason = choice.finish_reason;
 
-      const hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
+      hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
 
       if (aiMessage.tool_calls) {
         context.messages.push({
@@ -155,7 +216,6 @@ async function getAIResponse(
 
       // Tool execution
       if (hasToolCalls) {
-        usedAnyTool = true;
         for (const toolCall of aiMessage.tool_calls) {
           const fnName = toolCall?.function?.name;
           const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
@@ -164,7 +224,13 @@ async function getAIResponse(
             const out =
               typeof content === "string" || content == null
                 ? content || ""
-                : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
+                : (() => {
+                    try {
+                      return JSON.stringify(content);
+                    } catch {
+                      return String(content);
+                    }
+                  })();
 
             context.messages.push({
               role: "tool",
@@ -183,8 +249,15 @@ async function getAIResponse(
 
           try {
             // Runtime with channel_id for getHistory etc.
-            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
+            const runtime = {
+              channel_id: context_orig.channelId || handoverContext.channelId || null,
+            };
+            const toolResult = await toolFunction(
+              toolCall.function,
+              handoverContext,
+              getAIResponse,
+              runtime
+            );
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
@@ -213,18 +286,23 @@ async function getAIResponse(
       } else {
         continueResponse = false;
       }
-    } while (usedAnyTool || continueResponse); // keep looping until tools resolved (and optional continue)
+    } while (hasToolCalls || continueResponse); // <= FIX: evaluate per-iteration result, not a sticky flag
 
     // === Post-commit to the persistent context in correct temporal order ===
-    // 1) The pending user message (always commit it, tools or not), with original timestamp
+    // 1) The pending user message (always commit it), with original timestamp
     if (pendingUser && pendingUser.content) {
       try {
-        await context_orig.add("user", pendingUser.name || "user", pendingUser.content, pendingUser.timestamp || Date.now());
+        await context_orig.add(
+          "user",
+          pendingUser.name || "user",
+          pendingUser.content,
+          pendingUser.timestamp || Date.now()
+        );
       } catch {}
     }
     // 2) If tools ran, commit their outputs right after, anchored near original time (+1ms per tool)
     if (pendingUser && toolCommits.length > 0) {
-      let t0 = (pendingUser.timestamp || Date.now());
+      let t0 = pendingUser.timestamp || Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
         const tmsg = toolCommits[i];
         try {
