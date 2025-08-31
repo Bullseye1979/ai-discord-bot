@@ -561,8 +561,23 @@ client.on("messageCreate", async (message) => {
 
             const TRIGGER = (channelMeta.name || "").trim();
             const invoked = firstWordEqualsName(evt.text, TRIGGER);
-            if (!invoked) return;
 
+            // NEU: wenn nicht invoked -> trotzdem in den Kontext loggen (ohne Antwort)
+            if (!invoked) {
+              try {
+                await chatContext.add(
+                  "user",
+                  evt.speaker || "voice",
+                  String(evt.text || "").trim(),
+                  evt.startedAtMs || Date.now()
+                );
+              } catch (e) {
+                await reportError(e, null, "VOICE_LOG_CONTEXT_NONINVOKED", { emit: "channel" });
+              }
+              return; // keine Antwort generieren
+            }
+
+            // ALT: nur wenn invoked geht's weiter mit Busy-Gate + Pipeline
             // Strict busy gate:
             if (voiceBusy.get(evt.channelId)) {
               if (!busyNoticeSent.get(evt.channelId)) {
@@ -573,7 +588,7 @@ client.on("messageCreate", async (message) => {
                     "I’m already answering someone. Please wait until I finish speaking — then try again. Thanks for your patience! 😊",
                     "BUSY"
                   );
-                  busyNoticeSent.set(evt.channelId, true); // one-shot during this busy period
+                  busyNoticeSent.set(evt.channelId, true);
                 }
               }
               return; // do NOT log this utterance, do NOT queue anything
@@ -589,7 +604,6 @@ client.on("messageCreate", async (message) => {
 
             // run the full voice pipeline (sets busy/presence and commits after tools finish)
             await handleVoiceTranscriptDirect({ ...evt, text: textForLog }, client, contextStorage, pendingUserTurn);
-
             // one-shot notice is reset at end of busy period (also in finally of handler)
             busyNoticeSent.delete(evt.channelId);
           } catch (err) {
