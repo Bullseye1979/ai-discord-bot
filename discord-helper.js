@@ -61,7 +61,7 @@ async function buildAvatarPrompt(channelMeta = {}) {
       "";
 
     const constraints =
-      "\ncentered, portrait, discord avatar" ;
+      "\ncentered, portrait, discord avatar, no text, no logo, no watermark" ;
 
     if (baseFromConfig) {
       const personaLine = persona ? `\n (inspired by persona: ${persona})` : "";
