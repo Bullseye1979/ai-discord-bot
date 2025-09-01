@@ -61,9 +61,7 @@ async function buildAvatarPrompt(channelMeta = {}) {
       "";
 
     const constraints =
-      "Discord BOT avatar / icon; square avatar, centered, readable at 64–128 px; " +
-      "flat or minimal vector style; cohesive limited palette; high contrast; neutral/solid background; " +
-      "no letters; no numbers; no logos; no UI; no watermark";
+      "centered" ;
 
     if (baseFromConfig) {
       const personaLine = persona ? ` (inspired by persona: ${persona.slice(0, 160)})` : "";
