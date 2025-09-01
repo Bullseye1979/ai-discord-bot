@@ -61,10 +61,10 @@ async function buildAvatarPrompt(channelMeta = {}) {
       "";
 
     const constraints =
-      "centered" ;
+      "\ncentered, portrait, discord avatar" ;
 
     if (baseFromConfig) {
-      const personaLine = persona ? ` (inspired by persona: ${persona.slice(0, 160)})` : "";
+      const personaLine = persona ? `\n (inspired by persona: ${persona})` : "";
       return `${baseFromConfig} — for ${botname}; ${constraints}${personaLine ? "; " + personaLine : ""}`;
     }
 
