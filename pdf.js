@@ -1,4 +1,4 @@
-// pdf.js — v3.1 (AI-driven minimal CSS overrides atop a strong Magazine default)
+// pdf.js — v3.3 (Generic PDF generator; AI-merging stylesheet: Base + Prompt → Final CSS; no content assumptions)
 // Generates multi-segment HTML via tools + model and renders to PDF. Returns short preview + absolute PDF URL.
 
 const puppeteer = require("puppeteer");
@@ -14,7 +14,7 @@ const { reportError } = require("./error.js");
 /** CONFIG */
 const MAX_SEGMENTS = 25;
 const IMAGE_SIZE = "1024x1024"; // forwarded to getAIImage if supported
-const MAX_IMAGES = 999;         // set to 1 if du strikt nur ein Bild willst
+const MAX_IMAGES = 999;         // set to a smaller number if you want to limit auto-generated images
 
 /** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "document") {
@@ -45,7 +45,7 @@ async function suggestFilename(originalPrompt, prompt) {
   }
 }
 
-/** Replace {natural language image description} placeholders with generated image URLs. */
+/** Replace {natural language image description} placeholders with generated image URLs (if any). */
 async function resolveImagePlaceholders(html) {
   const matches = [...String(html || "").matchAll(/\{([^}]+)\}/g)];
   const placeholders = matches.map((m) => m[1]);
@@ -66,6 +66,7 @@ async function resolveImagePlaceholders(html) {
       map[desc] = url;
       list.push(`${desc}  :  ${url}`);
     } catch (err) {
+      // Keep placeholder if generation fails, just log as WARN
       await reportError(err, null, "PDF_IMAGE_GEN", "WARN");
     }
   }
@@ -101,11 +102,12 @@ function sanitizeCss(css) {
   return s.trim();
 }
 
-/** Strong Magazine Base CSS (element selectors only). */
+/** Strong, modern magazine-like Base CSS (element selectors only, generic; rounded corners for images). */
 function getBaseMagazineCss() {
   return [
     "@page{size:A4;margin:20mm}",
     "html,body{margin:0;padding:0}",
+    // Default: 2-column magazine look (user prompt can change to single column via style brief)
     "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm}",
     // headings
     "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
@@ -117,10 +119,9 @@ function getBaseMagazineCss() {
     "li{margin:.2rem 0}",
     "blockquote{margin:.8rem 0;padding:.6rem 1rem;border-left:3px solid #0a66c2;color:#555;break-inside:avoid}",
     "hr{border:0;border-top:1px solid #ddd;margin:1rem 0;break-after:avoid}",
-    // images & figures
-    "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid}",
+    // images & figures (generic; no portrait assumption; rounded corners)
+    "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid;border-radius:12px}",
     "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0}",
-    "figure img:first-child{border-radius:50%}", // round portrait by default
     "figcaption{text-align:center;font-size:10pt;opacity:.75}",
     // tables (colored/zebra)
     "table{border-collapse:collapse;width:100%;break-inside:avoid;margin:.6rem 0}",
@@ -134,42 +135,47 @@ function getBaseMagazineCss() {
   ].join("");
 }
 
-/** Ask AI for minimal CSS overrides relative to the base. */
-async function getAiCssOverrides(baseCss, styleBrief) {
-  if (!String(styleBrief || "").trim()) return "";
+/**
+ * Ask the KI to MERGE the Base CSS with the user's style brief and return a FULL final stylesheet.
+ * No deterministic rules; the KI must keep defaults unless explicitly changed by the brief.
+ */
+async function mergeBaseCssWithBrief(baseCss, styleBrief) {
   const req = new Context();
   await req.add(
     "system",
     "",
-    "You are a professional print designer. You receive a strong default CSS (element selectors only) for an A4, magazine-like layout. " +
-      "Your task: produce a MINIMAL CSS PATCH that ONLY changes aspects explicitly requested in the user brief. " +
-      "Do NOT restate defaults. Do NOT remove features not mentioned. " +
-      "Rules:\n" +
-      "- Use ONLY element selectors (html, body, h1,h2,h3,p,ul,ol,li,table,thead,tbody,tr,th,td,blockquote,figure,figcaption,code,pre,img,hr).\n" +
-      "- No classes, no IDs, no @import, no url().\n" +
-      "- Prefer to touch as few properties as possible; keep the default look unless explicitly asked.\n" +
-      "- You may use @page and @media print.\n" +
-      "- Output CSS only (no comments/explanations)."
+    "You are a senior print/CSS designer. You will receive a STRONG DEFAULT CSS for an A4, magazine-like layout " +
+      "and a user style brief describing desired deviations. Your job: produce a SINGLE, FINAL CSS STYLESHEET " +
+      "that starts from the default and applies ONLY the changes explicitly requested by the brief. " +
+      "Keep everything else as in the default. Do NOT invent unrelated changes.\n\n" +
+      "HARD RULES:\n" +
+      "• Use ONLY element selectors (html, body, h1,h2,h3,p,ul,ol,li,table,thead,tbody,tr,th,td,blockquote,figure,figcaption,code,pre,img,hr).\n" +
+      "• No classes, no IDs, no @import, no url().\n" +
+      "• You MAY use @page and @media print.\n" +
+      "• The result must be COMPLETE (not a diff/patch), minified or compact OK, but human-readable is preferred.\n" +
+      "• Images must fit the page (img{max-width:100%;height:auto}) and avoid page-breaks inside figures.\n" +
+      "• Maintain modern magazine look and colored tables by default. Rounded corners for images by default."
   );
   await req.add("assistant", "", `### DEFAULT BASE CSS\n${baseCss}`);
   await req.add(
     "user",
     "",
-    `User style brief:\n${String(styleBrief || "").trim()}\n\nReturn only the minimal CSS overrides (a patch), nothing else.`
+    `User style brief (may be empty):\n${String(styleBrief || "").trim()}\n\nReturn the FINAL COMPLETE CSS only (no comments, no explanations).`
   );
 
-  const raw = await getAI(req, 600, "gpt-4o-mini");
+  const raw = await getAI(req, 1000, "gpt-4o-mini");
   return sanitizeCss(raw || "");
 }
 
-/** Generate final stylesheet: Base + minimal AI overrides derived from the brief. */
+/** Generate final stylesheet purely via KI: Base → KI merges with brief → Final CSS. */
 async function generateStylesheet(styleBrief = "") {
   const baseCss = getBaseMagazineCss();
-  const overrides = await getAiCssOverrides(baseCss, styleBrief);
-  // Always prepend base; overrides come after to take precedence
-  const css = `${baseCss}\n${overrides}`.trim();
+  const finalCss = await mergeBaseCssWithBrief(baseCss, styleBrief);
 
-  // Cache by hash (optional; useful if you want to persist themes)
+  // Minimal safety-net: if KI returned empty/too tiny CSS, fall back to base.
+  const css = (finalCss && finalCss.length > 200) ? finalCss : baseCss;
+
+  // Cache by hash (optional; helpful if you expose themes)
   const hash = crypto.createHash("sha1").update(css).digest("hex").slice(0, 8);
   const documentsDir = path.join(__dirname, "documents");
   const cssDir = path.join(documentsDir, "css");
@@ -209,10 +215,10 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_INPUT — Missing 'prompt', 'original_prompt' or 'user_id'.";
     }
 
-    // Build stylesheet from Base + minimal AI overrides derived from the combined brief
+    // Build stylesheet purely via KI (Base + Prompt merged into final CSS)
     const { css } = await generateStylesheet(`${original_prompt}\n\n${prompt}`);
 
-    // Strong output rules: no inline/class/id; start with a single hero figure (round portrait enforced by CSS)
+    // Strong output rules: no inline/class/id. NO content assumptions (any document).
     const generationContext = new Context(
       "You are a PDF generator that writes final, publish-ready HTML.",
       `### Output (STRICT):
@@ -227,12 +233,9 @@ async function getPDF(toolFunction, context, getAIResponse) {
 - Only append [FINISH] on a new line AFTER the last HTML tag when the document is fully complete.
 
 ### Images:
-- Begin the document with exactly ONE hero figure for the character portrait:
-  <figure>
-    <img src="{ultra-detailed, full-body portrait of a female dhampir rogue, level 1, black hair, pale skin with faint vampiric features (elongated canines), sleek dark leathers, light travel gear, dual daggers sheathed, agile stance, moody town-backdrop hinted softly (Nightstone ruins), dramatic chiaroscuro lighting, realistic fantasy painting, ultra-detailed textures, no text, no watermark, printed poster composition, centered subject}">
-    <figcaption>Character Portrait — Dhampir Rogue (Level 1)</figcaption>
-  </figure>
-- Use further <img src="{...}"> only if necessary. Never mix real URLs and curly braces in a single src.
+- Images are optional. If adding images, use <img src="{...}"> placeholders (no inline styles).
+- Do not mix real URLs and curly-brace descriptions in a single src.
+- Figures should avoid page breaks; images must scale to fit.
 
 ### Consistency:
 - Use only the most recent user prompt for intent.
