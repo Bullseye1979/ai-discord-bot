@@ -1,7 +1,8 @@
-// pdf.js — v3.4
+// pdf.js — v3.5
 // Generic PDF generator; AI-merging stylesheet (Base + Prompt → Final CSS).
 // Robust image handling: improves weak {…} image descriptions before calling getAIImage.
 // No assumptions about content type; images optional; no inline styles/classes/ids in HTML.
+// Ensures 1 cm inner text padding via body{padding:10mm} in the base CSS.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -182,12 +183,15 @@ function sanitizeCss(css) {
   return s.trim();
 }
 
-/** Strong, modern magazine-like Base CSS (element selectors only; rounded corners for images; 2 columns default). */
+/** Strong, modern magazine-like Base CSS (element selectors only; rounded corners for images; 2 columns default).
+ *  Ensures inner text padding of 10mm (1 cm) via body{padding:10mm}.
+ */
 function getBaseMagazineCss() {
   return [
     "@page{size:A4;margin:20mm}",
     "html,body{margin:0;padding:0}",
-    "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm}",
+    // Inner text padding enforced here (10mm = 1cm)
+    "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm;padding:10mm}",
     // headings
     "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
     "h2{font-size:16pt;margin:1.2rem 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
@@ -233,7 +237,8 @@ async function mergeBaseCssWithBrief(baseCss, styleBrief) {
       "• You MAY use @page and @media print.\n" +
       "• The result must be COMPLETE (not a diff/patch), minified or compact OK, but human-readable is preferred.\n" +
       "• Images must fit the page (img{max-width:100%;height:auto}) and avoid page-breaks inside figures.\n" +
-      "• Maintain modern magazine look and colored tables by default. Rounded corners for images by default."
+      "• Maintain modern magazine look and colored tables by default. Rounded corners for images by default.\n" +
+      "• Keep an inner text padding of 10mm on body unless the user explicitly asks to change it."
   );
   await req.add("assistant", "", `### DEFAULT BASE CSS\n${baseCss}`);
   await req.add(
