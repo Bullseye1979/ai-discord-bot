@@ -1,4 +1,4 @@
-// pdf.js — refactored v2.0
+// pdf.js — refactored v2.1
 // Generate a multi-segment HTML document and render it to PDF; returns a short text preview + PDF URL.
 
 const puppeteer = require("puppeteer");
@@ -8,7 +8,6 @@ const crypto = require("crypto");
 
 const Context = require("./context");
 const { getAIImage, getAI } = require("./aiService");
-const { getToolRegistry } = require("./tools.js"); // <-- switched from tools_pdf.js
 const { getPlainFromHTML } = require("./helper.js");
 const { reportError } = require("./error.js");
 
@@ -73,7 +72,6 @@ async function resolveImagePlaceholders(html) {
 /** Remove ALL class/id/style attributes from the generated HTML (global). */
 function sanitizeDesign(html) {
   if (!html) return "";
-  // remove class=..., id=..., style=... on any tag (double/single/no quotes)
   return String(html).replace(/\s+(class|id|style)=(".*?"|'.*?'|[^\s>]+)/gi, "");
 }
 
@@ -83,7 +81,7 @@ function sanitizeCss(css) {
 
   // Block @import and url()
   s = s.replace(/@import[\s\S]*?;?/gi, "");
-  s = s.replace(/url\s*\(\s*['"]?[^)]*\)/gi, ""); // remove any url()
+  s = s.replace(/url\s*\(\s*['"]?[^)]*\)/gi, ""); 
 
   // Remove !important
   s = s.replace(/!important/gi, "");
@@ -93,7 +91,6 @@ function sanitizeCss(css) {
   s = s.replace(/@media(?!\s+print)[^{]+\{[^}]*\}/gi, "");
 
   // Drop rules containing class/id/universal selectors (., #, *).
-  // Rough but effective for LLM CSS.
   s = s.replace(/(^|\})\s*[^@][^{]*[.#\*][^{]*\{[^}]*\}/g, "$1");
 
   return s.trim();
@@ -120,7 +117,7 @@ async function generateStylesheet(styleBrief = "") {
   const rawCss = await getAI(req, 800, "gpt-4o-mini");
   const css = sanitizeCss(rawCss || "");
 
-  // Cache by hash (ensures reproducibility across segments/reruns for same brief)
+  // Cache by hash
   const hash = crypto.createHash("sha1").update(css).digest("hex").slice(0, 8);
   const documentsDir = path.join(__dirname, "documents");
   const cssDir = path.join(documentsDir, "css");
@@ -133,7 +130,6 @@ async function generateStylesheet(styleBrief = "") {
 
 /* ------------------------- Main Tool Entry ------------------------- */
 
-/** Tool entry: build segmented HTML via the model + optional tool calls, then render to PDF. */
 async function getPDF(toolFunction, context, getAIResponse) {
   let browser = null;
   try {
@@ -150,10 +146,9 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_INPUT — Missing 'prompt', 'original_prompt' or 'user_id'.";
     }
 
-    // Build global stylesheet from the combined brief (prompt + original)
+    // Build global stylesheet from prompt+original
     const { css } = await generateStylesheet(`${original_prompt}\n\n${prompt}`);
 
-    // Strict instructions: pure HTML, no classes/ids/inline styles (central stylesheet only)
     const generationContext = new Context(
       "You are a PDF generator that writes final, publish-ready HTML.",
       `### Output (STRICT):
@@ -169,12 +164,12 @@ async function getPDF(toolFunction, context, getAIResponse) {
 - Only append [FINISH] on a new line AFTER the last HTML tag when the document is fully complete.
 
 ### Images:
-- Use <img src="{...}"> placeholders for images (do not embed inline styles or classes).
+- Use <img src="{...}"> placeholders for images (no inline styles, no classes).
 - Do not mix real URLs and curly braces in the same src.
 
 ### Consistency:
 - Use only the most recent user prompt for intent.
-- Use prior context only if it contains directly relevant source material to transform/include (quotes, data, prior chapter).`,
+- Use prior context only if it contains directly relevant source material (quotes, data, prior chapter).`,
       [],
       {},
       null,
@@ -191,7 +186,8 @@ async function getPDF(toolFunction, context, getAIResponse) {
       `Original chat context (use only directly relevant material):\n\n${formattedContext}\n\nOriginal User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}`
     );
 
-    // Build filtered tool registry (no getPDF to avoid recursion)
+    // Lazy require to break circular dependency with tools.js
+    const { getToolRegistry } = require("./tools.js");
     const allowTools = [
       "getWebpage",
       "getImage",
@@ -252,10 +248,8 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
-    // Resolve image placeholders AFTER design sanitization
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
-    // Final HTML wrapper: embed ONLY the generated CSS; no inline styles anywhere
     const styledHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -277,7 +271,6 @@ async function getPDF(toolFunction, context, getAIResponse) {
     browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
     const page = await browser.newPage();
     await page.setContent(styledHtml, { waitUntil: "load" });
-    // No extra margins/headers here — rely on CSS (@page) for layout consistency
     await page.pdf({
       path: pdfPath,
       format: "A4",
@@ -295,7 +288,9 @@ async function getPDF(toolFunction, context, getAIResponse) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
     return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF.";
   } finally {
-    try { await browser?.close(); } catch {}
+    try {
+      await browser?.close();
+    } catch {}
   }
 }
 
