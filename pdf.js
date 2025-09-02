@@ -1,5 +1,7 @@
-// pdf.js — v3.3 (Generic PDF generator; AI-merging stylesheet: Base + Prompt → Final CSS; no content assumptions)
-// Generates multi-segment HTML via tools + model and renders to PDF. Returns short preview + absolute PDF URL.
+// pdf.js — v3.4
+// Generic PDF generator; AI-merging stylesheet (Base + Prompt → Final CSS).
+// Robust image handling: improves weak {…} image descriptions before calling getAIImage.
+// No assumptions about content type; images optional; no inline styles/classes/ids in HTML.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -13,8 +15,8 @@ const { reportError } = require("./error.js");
 
 /** CONFIG */
 const MAX_SEGMENTS = 25;
-const IMAGE_SIZE = "1024x1024"; // forwarded to getAIImage if supported
-const MAX_IMAGES = 999;         // set to a smaller number if you want to limit auto-generated images
+const IMAGE_SIZE = "1024x1024"; // forwarded to getAIImage if supported by your service
+const MAX_IMAGES = 999;         // lower if you want to hard-limit auto image generation per document
 
 /** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "document") {
@@ -45,40 +47,118 @@ async function suggestFilename(originalPrompt, prompt) {
   }
 }
 
+/* ------------------------- Image placeholder handling ------------------------- */
+
+/** Heuristic: is the image description too generic/weak to yield a good result? */
+function isWeakImageDesc(desc) {
+  const s = String(desc || "").trim().toLowerCase();
+  if (!s) return true;
+  const wc = s.split(/\s+/).length;
+  if (wc < 6) return true; // very short → likely weak
+
+  // very generic nouns that often appear without detail
+  const generic = [
+    "image", "picture", "photo", "portrait", "character portrait", "logo",
+    "icon", "banner", "header image", "cover image", "illustration",
+    "diagram", "chart", "graph"
+  ];
+  if (generic.includes(s)) return true;
+
+  for (const g of generic) {
+    if (s === g) return true;
+    // "portrait of", "image of", etc. with very little tail
+    if ((s.startsWith(g + " of ") || s.startsWith(g + " with ")) && wc <= 6) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Expand a vague image idea into a detailed, safe description. */
+async function enhanceImagePrompt(brief, htmlContext) {
+  try {
+    const ctx = new Context();
+    await ctx.add(
+      "system",
+      "",
+      "You transform a vague image idea into a detailed, concrete, safe prompt for a general image generator.\n" +
+        "Rules: 30–90 words. Describe subject, setting, composition, mood, lighting, style/materials. " +
+        "No text/watermarks/logos. No brand names or copyrighted characters.\n" +
+        "Be faithful to the provided HTML context; do not invent proper names. Return the description only."
+    );
+    await ctx.add(
+      "assistant",
+      "",
+      `HTML context (may be truncated):\n${String(htmlContext || "").slice(0, 4000)}`
+    );
+    await ctx.add("user", "", `Expand this into a rich visual prompt:\n"${brief}"`);
+
+    const out = await getAI(ctx, 200, "gpt-4o-mini");
+    const clean = String(out || "").trim();
+    return clean || brief;
+  } catch {
+    return brief;
+  }
+}
+
 /** Replace {natural language image description} placeholders with generated image URLs (if any). */
 async function resolveImagePlaceholders(html) {
-  const matches = [...String(html || "").matchAll(/\{([^}]+)\}/g)];
-  const placeholders = matches.map((m) => m[1]);
-  const map = {};
-  const list = [];
+  const originalMatches = [...String(html || "").matchAll(/\{([^}]+)\}/g)];
+  const originals = originalMatches.map((m) => m[1]);
+  if (!originals.length) return { html, imagelist: "" };
 
-  // Unique & optional limit
-  const unique = [];
-  for (const desc of placeholders) {
-    if (!unique.includes(desc)) unique.push(desc);
+  const uniqueOriginals = [...new Set(originals)];
+  const generationPlan = []; // [{ original, effective, skipped }]
+
+  for (const orig of uniqueOriginals) {
+    let effective = orig;
+    if (isWeakImageDesc(effective)) {
+      const improved = await enhanceImagePrompt(effective, html);
+      if (!isWeakImageDesc(improved)) {
+        effective = improved;
+      } else {
+        generationPlan.push({ original: orig, effective: null, skipped: true });
+        continue;
+      }
+    }
+    generationPlan.push({ original: orig, effective, skipped: false });
   }
-  const targets = unique.slice(0, MAX_IMAGES);
 
-  for (const desc of targets) {
-    if (map[desc]) continue;
+  // Optional hard cap
+  const limitedPlan = generationPlan.slice(0, MAX_IMAGES);
+
+  const urlMap = new Map();  // original placeholder -> final URL
+  const imagelist = [];
+
+  for (const item of limitedPlan) {
+    const { original, effective, skipped } = item;
+    if (skipped) {
+      imagelist.push(`${original}  :  [SKIPPED — insufficient detail]`);
+      continue;
+    }
     try {
-      const url = await getAIImage(desc, IMAGE_SIZE, "dall-e-3");
-      map[desc] = url;
-      list.push(`${desc}  :  ${url}`);
+      const url = await getAIImage(effective, IMAGE_SIZE, "dall-e-3");
+      if (url) {
+        urlMap.set(original, url);
+        imagelist.push(`${effective}  :  ${url}`);
+      } else {
+        imagelist.push(`${effective}  :  [FAILED — no URL returned]`);
+      }
     } catch (err) {
-      // Keep placeholder if generation fails, just log as WARN
       await reportError(err, null, "PDF_IMAGE_GEN", "WARN");
+      imagelist.push(`${effective}  :  [ERROR — generation failed]`);
     }
   }
 
+  // Replace only originals for which we have URLs
   let withImages = html;
-  for (const [desc, url] of Object.entries(map)) {
-    if (!url) continue;
-    const esc = desc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const [orig, url] of urlMap.entries()) {
+    const esc = orig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(`\\{\\s*${esc}\\s*\\}`, "g");
     withImages = withImages.replace(re, url);
   }
-  return { html: withImages, imagelist: list.join("\n") };
+
+  return { html: withImages, imagelist: imagelist.join("\n") };
 }
 
 /* ------------------------- Design Hardening ------------------------- */
@@ -102,12 +182,11 @@ function sanitizeCss(css) {
   return s.trim();
 }
 
-/** Strong, modern magazine-like Base CSS (element selectors only, generic; rounded corners for images). */
+/** Strong, modern magazine-like Base CSS (element selectors only; rounded corners for images; 2 columns default). */
 function getBaseMagazineCss() {
   return [
     "@page{size:A4;margin:20mm}",
     "html,body{margin:0;padding:0}",
-    // Default: 2-column magazine look (user prompt can change to single column via style brief)
     "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm}",
     // headings
     "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
@@ -119,7 +198,7 @@ function getBaseMagazineCss() {
     "li{margin:.2rem 0}",
     "blockquote{margin:.8rem 0;padding:.6rem 1rem;border-left:3px solid #0a66c2;color:#555;break-inside:avoid}",
     "hr{border:0;border-top:1px solid #ddd;margin:1rem 0;break-after:avoid}",
-    // images & figures (generic; no portrait assumption; rounded corners)
+    // images & figures
     "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid;border-radius:12px}",
     "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0}",
     "figcaption{text-align:center;font-size:10pt;opacity:.75}",
@@ -234,6 +313,8 @@ async function getPDF(toolFunction, context, getAIResponse) {
 
 ### Images:
 - Images are optional. If adding images, use <img src="{...}"> placeholders (no inline styles).
+- Each placeholder description MUST be richly detailed (≥ 6 words) and concrete (subject, setting, style, lighting, composition).
+- Avoid generic phrases like "image", "picture", "portrait", or "character portrait" without details.
 - Do not mix real URLs and curly-brace descriptions in a single src.
 - Figures should avoid page breaks; images must scale to fit.
 
@@ -318,7 +399,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
-    // Replace image placeholders AFTER design sanitization
+    // Replace image placeholders AFTER design sanitization (with prompt enhancement for weak descriptors)
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
     const styledHtml = `<!DOCTYPE html>
@@ -355,7 +436,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
     const preview = getPlainFromHTML(htmlWithImages, 2000);
     const imagesNote = imagelist ? `\n\n### Images\n${imagelist}` : "";
 
-    // Angle brackets help Discord render the URL as a clickable link.
+    // Angle brackets help some chat clients render the URL as clickable.
     return `${preview}\n\nPDF: ${publicUrl}\n<${publicUrl}>${imagesNote}`;
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
