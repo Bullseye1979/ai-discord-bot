@@ -1,12 +1,14 @@
-// pdf.js — refactored v1.4
+// pdf.js — refactored v2.0
 // Generate a multi-segment HTML document and render it to PDF; returns a short text preview + PDF URL.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
 const fs = require("fs/promises");
+const crypto = require("crypto");
+
 const Context = require("./context");
 const { getAIImage, getAI } = require("./aiService");
-const { tools, getToolRegistry } = require("./tools_pdf.js");
+const { getToolRegistry } = require("./tools.js"); // <-- switched from tools_pdf.js
 const { getPlainFromHTML } = require("./helper.js");
 const { reportError } = require("./error.js");
 
@@ -31,7 +33,7 @@ async function suggestFilename(originalPrompt, prompt) {
       "",
       `Generate a lowercase filename (<= 40 chars), only letters/numbers/spaces, no extension. Return just the name:\n\n${originalPrompt}\n\n${prompt}`
     );
-    const raw = await getAI(req, 50, "gpt-4o");
+    const raw = await getAI(req, 50, "gpt-4o-mini");
     return normalizeFilename(raw?.trim());
   } catch (err) {
     await reportError(err, null, "PDF_SUGGEST_FILENAME", "WARN");
@@ -66,6 +68,71 @@ async function resolveImagePlaceholders(html) {
   return { html: withImages, imagelist: list.join("\n") };
 }
 
+/* ------------------------- Design Hardening ------------------------- */
+
+/** Remove ALL class/id/style attributes from the generated HTML (global). */
+function sanitizeDesign(html) {
+  if (!html) return "";
+  // remove class=..., id=..., style=... on any tag (double/single/no quotes)
+  return String(html).replace(/\s+(class|id|style)=(".*?"|'.*?'|[^\s>]+)/gi, "");
+}
+
+/** CSS sanitizer: no @import, no url(...), drop rules with class/id/* selectors; allow only element selectors & @page/@media print. */
+function sanitizeCss(css) {
+  let s = String(css || "");
+
+  // Block @import and url()
+  s = s.replace(/@import[\s\S]*?;?/gi, "");
+  s = s.replace(/url\s*\(\s*['"]?[^)]*\)/gi, ""); // remove any url()
+
+  // Remove !important
+  s = s.replace(/!important/gi, "");
+
+  // Remove non-allowed at-rules (keep @page and @media print)
+  s = s.replace(/@(?!page|media)[^{]+\{[^}]*\}/gi, "");
+  s = s.replace(/@media(?!\s+print)[^{]+\{[^}]*\}/gi, "");
+
+  // Drop rules containing class/id/universal selectors (., #, *).
+  // Rough but effective for LLM CSS.
+  s = s.replace(/(^|\})\s*[^@][^{]*[.#\*][^{]*\{[^}]*\}/g, "$1");
+
+  return s.trim();
+}
+
+/** Generate a single, global stylesheet via AI based on the prompt; cache by hash. */
+async function generateStylesheet(styleBrief = "") {
+  const brief = (styleBrief || "").trim();
+
+  const req = new Context();
+  await req.add(
+    "system",
+    "",
+    "You generate a single, self-contained CSS stylesheet for A4 printing that styles ONLY element selectors: " +
+      "html, body, h1, h2, h3, p, ul, ol, li, table, thead, tbody, tr, th, td, blockquote, figure, figcaption, code, pre, img, hr. " +
+      "No classes, no IDs, no @import, no url(). You may use @page and @media print. Prefer CSS variables at :root. Keep it consistent."
+  );
+  await req.add(
+    "user",
+    "",
+    `Design brief (may be empty):\n${brief}\n\nReturn CSS only, no comments.`
+  );
+
+  const rawCss = await getAI(req, 800, "gpt-4o-mini");
+  const css = sanitizeCss(rawCss || "");
+
+  // Cache by hash (ensures reproducibility across segments/reruns for same brief)
+  const hash = crypto.createHash("sha1").update(css).digest("hex").slice(0, 8);
+  const documentsDir = path.join(__dirname, "documents");
+  const cssDir = path.join(documentsDir, "css");
+  await fs.mkdir(cssDir, { recursive: true });
+  const cssPath = path.join(cssDir, `theme-${hash}.css`);
+  await fs.writeFile(cssPath, css);
+
+  return { css, cssPath, hash };
+}
+
+/* ------------------------- Main Tool Entry ------------------------- */
+
 /** Tool entry: build segmented HTML via the model + optional tool calls, then render to PDF. */
 async function getPDF(toolFunction, context, getAIResponse) {
   let browser = null;
@@ -83,28 +150,31 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_INPUT — Missing 'prompt', 'original_prompt' or 'user_id'.";
     }
 
+    // Build global stylesheet from the combined brief (prompt + original)
+    const { css } = await generateStylesheet(`${original_prompt}\n\n${prompt}`);
+
+    // Strict instructions: pure HTML, no classes/ids/inline styles (central stylesheet only)
     const generationContext = new Context(
       "You are a PDF generator that writes final, publish-ready HTML.",
-      `### Output:
+      `### Output (STRICT):
 - Output VALID HTML **inside <body> only** (no <html>/<head> tags).
-- Use rich structure: headings, paragraphs, lists, tables; tasteful styling inlined.
+- **NO inline styles, NO class=, NO id=** anywhere.
+- Use only semantic tags: h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, blockquote, figure, figcaption, img, hr, br, code, pre.
 - Do **not** include explanations or comments—only HTML.
-- No <body> tags in the output.
-- Prefer lots of detailed text; write the full content, not outlines.
+- Prefer rich, complete content (not just outlines).
 
 ### Continuation / Segments:
 - If long, write in natural segments without artificial endings.
 - Never write placeholders like "to be continued".
-- Only append [FINISH] on a new line after the last HTML tag when the document is fully complete.
+- Only append [FINISH] on a new line AFTER the last HTML tag when the document is fully complete.
 
 ### Images:
-- Use <img> with either a real URL (if known) or a curly-brace description as a placeholder, e.g.:
-  <img src="{a blue mountain at sunrise}" style="max-width:90%; border:1px solid #ccc;">
+- Use <img src="{...}"> placeholders for images (do not embed inline styles or classes).
 - Do not mix real URLs and curly braces in the same src.
 
 ### Consistency:
 - Use only the most recent user prompt for intent.
-- Use prior context only if it contains directly relevant source material to transform or include (e.g., quoted data, previous chapter).`,
+- Use prior context only if it contains directly relevant source material to transform/include (quotes, data, prior chapter).`,
       [],
       {},
       null,
@@ -121,6 +191,18 @@ async function getPDF(toolFunction, context, getAIResponse) {
       `Original chat context (use only directly relevant material):\n\n${formattedContext}\n\nOriginal User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}`
     );
 
+    // Build filtered tool registry (no getPDF to avoid recursion)
+    const allowTools = [
+      "getWebpage",
+      "getImage",
+      "getGoogle",
+      "getYoutube",
+      "getLocation",
+      "getHistory",
+      "getImageDescription"
+    ];
+    const { tools: toolSpecs, registry: toolRegistry } = getToolRegistry(allowTools);
+
     let fullHTML = "";
     let persistentToolMessages = [];
     let segmentCount = 0;
@@ -129,8 +211,8 @@ async function getPDF(toolFunction, context, getAIResponse) {
       const segmentCtx = new Context(
         "You generate the next HTML segment.",
         "",
-        tools,
-        getToolRegistry(),
+        toolSpecs,
+        toolRegistry,
         null,
         { skipInitialSummaries: true, persistToDB: false }
       );
@@ -146,7 +228,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       await segmentCtx.add(
         "user",
         "",
-        "Continue immediately after the last segment. Add only new HTML content. Maintain structure, style, and detail."
+        "Continue immediately after the last segment. Add only new HTML content. Maintain structure and detail. No inline styles, classes, or ids."
       );
 
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
@@ -159,12 +241,10 @@ async function getPDF(toolFunction, context, getAIResponse) {
         }
       }
 
-      if (segmentHTML.includes("[FINISH]")) {
-        fullHTML += segmentHTML.replace("[FINISH]", "");
-        break;
-      } else {
-        fullHTML += segmentHTML;
-      }
+      const cleaned = sanitizeDesign(segmentHTML.replace("[FINISH]", ""));
+      fullHTML += cleaned;
+
+      if (segmentHTML.includes("[FINISH]")) break;
       segmentCount++;
     }
 
@@ -172,27 +252,18 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
+    // Resolve image placeholders AFTER design sanitization
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
+    // Final HTML wrapper: embed ONLY the generated CSS; no inline styles anywhere
     const styledHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <style>
-    @page { size: A4; margin: 2cm; }
-    body { font-family: Arial, sans-serif; font-size: 12pt; line-height: 1.6; margin: 0; padding: 0; }
-    h1, h2, h3 { margin-top: 1em; page-break-after: avoid; }
-    p { text-align: justify; }
-    img { max-width: 100%; height: auto; display: block; margin: 10px auto; page-break-inside: avoid; }
-    table, tr, td, th { page-break-inside: avoid; }
-    .content { padding: 2cm; }
-    .page-break { page-break-before: always; }
-  </style>
+  <style>${css}</style>
 </head>
 <body>
-  <div class="content">
-    ${htmlWithImages}
-  </div>
+  ${htmlWithImages}
 </body>
 </html>`;
 
@@ -206,14 +277,11 @@ async function getPDF(toolFunction, context, getAIResponse) {
     browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
     const page = await browser.newPage();
     await page.setContent(styledHtml, { waitUntil: "load" });
+    // No extra margins/headers here — rely on CSS (@page) for layout consistency
     await page.pdf({
       path: pdfPath,
       format: "A4",
-      printBackground: true,
-      displayHeaderFooter: true,
-      footerTemplate:
-        `<div style="width:100%; text-align:center; font-size:10pt; color:#888;">Generated by AI</div>`,
-      margin: { top: "1cm", right: "1cm", bottom: "1.5cm", left: "1cm" },
+      printBackground: true
     });
 
     const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
