@@ -1,4 +1,4 @@
-// pdf.js — refactored v2.1
+// pdf.js — refactored v2.2
 // Generate a multi-segment HTML document and render it to PDF; returns a short text preview + PDF URL.
 
 const puppeteer = require("puppeteer");
@@ -11,7 +11,7 @@ const { getAIImage, getAI } = require("./aiService");
 const { getPlainFromHTML } = require("./helper.js");
 const { reportError } = require("./error.js");
 
-/** Create a filesystem-safe, lowercased filename (max 40 chars, no extension). */
+/** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "document") {
   const base =
     String(s || "")
@@ -81,7 +81,7 @@ function sanitizeCss(css) {
 
   // Block @import and url()
   s = s.replace(/@import[\s\S]*?;?/gi, "");
-  s = s.replace(/url\s*\(\s*['"]?[^)]*\)/gi, ""); 
+  s = s.replace(/url\s*\(\s*['"]?[^)]*\)/gi, "");
 
   // Remove !important
   s = s.replace(/!important/gi, "");
@@ -128,6 +128,40 @@ async function generateStylesheet(styleBrief = "") {
   return { css, cssPath, hash };
 }
 
+/* ------------------------- Placeholder Guard ------------------------- */
+
+// Detects typical placeholder patterns like [Enter ...], {Specify ...}, TODO, etc.
+function containsPlaceholders(s) {
+  if (!s) return false;
+  const str = String(s);
+  const pat1 = /\[(?:enter|specify|list|describe|add|choose|roll)[^[\]]*\]/i;
+  const pat2 = /\{(?:enter|specify|list|describe|add|choose|roll)[^{}]*\}/i;
+  const pat3 = /\[[^[\]]{2,}\]/; // generic [ ... ]
+  const pat4 = /\{[^{}]{2,}\}/;  // generic { ... }
+  const pat5 = /\b(TODO|TBD|PLACEHOLDER)\b/i;
+  return pat1.test(str) || pat2.test(str) || pat3.test(str) || pat4.test(str) || pat5.test(str);
+}
+
+function stripPlaceholders(s) {
+  if (!s) return s;
+  let out = String(s);
+  out = out.replace(/\[[^[\]]+\]/g, "");
+  out = out.replace(/\{[^{}]+\}/g, "");
+  out = out.replace(/\b(TODO|TBD|PLACEHOLDER)\b/gi, "");
+  return out;
+}
+
+/* ------------------------- URL Helper ------------------------- */
+
+function ensureAbsoluteUrl(urlPath) {
+  const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "https://ralfreschke.de").replace(/\/$/, "");
+  if (/^https?:\/\//i.test(urlPath)) return urlPath;
+  if (base) {
+    return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
+  }
+  return urlPath; // relative fallback (Discord rendert evtl. nicht klickbar)
+}
+
 /* ------------------------- Main Tool Entry ------------------------- */
 
 async function getPDF(toolFunction, context, getAIResponse) {
@@ -157,6 +191,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
 - Use only semantic tags: h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, blockquote, figure, figcaption, img, hr, br, code, pre.
 - Do **not** include explanations or comments—only HTML.
 - Prefer rich, complete content (not just outlines).
+- **No placeholders, no TODOs, no bracketed hints** (e.g., [Enter ...], {Specify ...}, TODO).
 
 ### Continuation / Segments:
 - If long, write in natural segments without artificial endings.
@@ -188,6 +223,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
 
     // Lazy require to break circular dependency with tools.js
     const { getToolRegistry } = require("./tools.js");
+    // Allowlist: keine PDF-Rekursion
     const allowTools = [
       "getWebpage",
       "getImage",
@@ -224,7 +260,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       await segmentCtx.add(
         "user",
         "",
-        "Continue immediately after the last segment. Add only new HTML content. Maintain structure and detail. No inline styles, classes, or ids."
+        "Continue immediately after the last segment. Add only new HTML content. Maintain structure and detail. No inline styles, classes, or ids. Do not output placeholders or bracketed hints."
       );
 
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
@@ -237,7 +273,26 @@ async function getPDF(toolFunction, context, getAIResponse) {
         }
       }
 
-      const cleaned = sanitizeDesign(segmentHTML.replace("[FINISH]", ""));
+      // Clean + placeholder guard with one correction pass
+      let cleaned = sanitizeDesign(segmentHTML.replace("[FINISH]", ""));
+      if (containsPlaceholders(cleaned)) {
+        const fixCtx = new Context(
+          "Rewrite the given HTML segment to remove any placeholders.",
+          `Remove all placeholders (e.g., [Enter ...], {Specify ...}, TODO). Output HTML only, same structure, no inline styles/classes/ids.`,
+          [],
+          {},
+          null,
+          { skipInitialSummaries: true, persistToDB: false }
+        );
+        await fixCtx.add("user", "", cleaned);
+        const fixed = await getAI(fixCtx, 600, "gpt-4o-mini");
+        if (fixed && fixed.length > 50 && !containsPlaceholders(fixed)) {
+          cleaned = sanitizeDesign(fixed);
+        } else {
+          cleaned = stripPlaceholders(cleaned);
+        }
+      }
+
       fullHTML += cleaned;
 
       if (segmentHTML.includes("[FINISH]")) break;
@@ -266,6 +321,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
 
     const suggested = await suggestFilename(original_prompt, prompt);
     const filename = normalizeFilename(suggested || "document");
+    const publicPath = `/documents/${filename}.pdf`;
     const pdfPath = path.join(documentsDir, `${filename}.pdf`);
 
     browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
@@ -277,20 +333,18 @@ async function getPDF(toolFunction, context, getAIResponse) {
       printBackground: true
     });
 
-    const base = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-    const publicUrl = `${base || ""}/documents/${filename}.pdf`;
+    const publicUrl = ensureAbsoluteUrl(publicPath);
 
     const preview = getPlainFromHTML(htmlWithImages, 2000);
     const imagesNote = imagelist ? `\n\n### Images\n${imagelist}` : "";
 
-    return `${preview}\n\nPDF: ${publicUrl || `/documents/${filename}.pdf`}${imagesNote}`;
+    // Angle brackets help Discord render the URL as a clickable link.
+    return `${preview}\n\nPDF: ${publicUrl}\n<${publicUrl}>${imagesNote}`;
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
     return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF.";
   } finally {
-    try {
-      await browser?.close();
-    } catch {}
+    try { await browser?.close(); } catch {}
   }
 }
 
