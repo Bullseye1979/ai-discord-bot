@@ -1,4 +1,4 @@
-// pdf.js — refactored v2.2
+// pdf.js — refactored v2.3
 // Generate a multi-segment HTML document and render it to PDF; returns a short text preview + PDF URL.
 
 const puppeteer = require("puppeteer");
@@ -128,38 +128,15 @@ async function generateStylesheet(styleBrief = "") {
   return { css, cssPath, hash };
 }
 
-/* ------------------------- Placeholder Guard ------------------------- */
-
-// Detects typical placeholder patterns like [Enter ...], {Specify ...}, TODO, etc.
-function containsPlaceholders(s) {
-  if (!s) return false;
-  const str = String(s);
-  const pat1 = /\[(?:enter|specify|list|describe|add|choose|roll)[^[\]]*\]/i;
-  const pat2 = /\{(?:enter|specify|list|describe|add|choose|roll)[^{}]*\}/i;
-  const pat3 = /\[[^[\]]{2,}\]/; // generic [ ... ]
-  const pat4 = /\{[^{}]{2,}\}/;  // generic { ... }
-  const pat5 = /\b(TODO|TBD|PLACEHOLDER)\b/i;
-  return pat1.test(str) || pat2.test(str) || pat3.test(str) || pat4.test(str) || pat5.test(str);
-}
-
-function stripPlaceholders(s) {
-  if (!s) return s;
-  let out = String(s);
-  out = out.replace(/\[[^[\]]+\]/g, "");
-  out = out.replace(/\{[^{}]+\}/g, "");
-  out = out.replace(/\b(TODO|TBD|PLACEHOLDER)\b/gi, "");
-  return out;
-}
-
 /* ------------------------- URL Helper ------------------------- */
 
 function ensureAbsoluteUrl(urlPath) {
-  const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "https://ralfreschke.de").replace(/\/$/, "");
+  const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/$/, "");
   if (/^https?:\/\//i.test(urlPath)) return urlPath;
   if (base) {
     return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
   }
-  return urlPath; // relative fallback (Discord rendert evtl. nicht klickbar)
+  return urlPath; // relative fallback
 }
 
 /* ------------------------- Main Tool Entry ------------------------- */
@@ -191,11 +168,10 @@ async function getPDF(toolFunction, context, getAIResponse) {
 - Use only semantic tags: h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, blockquote, figure, figcaption, img, hr, br, code, pre.
 - Do **not** include explanations or comments—only HTML.
 - Prefer rich, complete content (not just outlines).
-- **No placeholders, no TODOs, no bracketed hints** (e.g., [Enter ...], {Specify ...}, TODO).
+- Do not output "to be continued" or similar filler.
 
 ### Continuation / Segments:
 - If long, write in natural segments without artificial endings.
-- Never write placeholders like "to be continued".
 - Only append [FINISH] on a new line AFTER the last HTML tag when the document is fully complete.
 
 ### Images:
@@ -260,7 +236,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       await segmentCtx.add(
         "user",
         "",
-        "Continue immediately after the last segment. Add only new HTML content. Maintain structure and detail. No inline styles, classes, or ids. Do not output placeholders or bracketed hints."
+        "Continue immediately after the last segment. Add only new HTML content. Maintain structure and detail. No inline styles, classes, or ids."
       );
 
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
@@ -273,26 +249,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
         }
       }
 
-      // Clean + placeholder guard with one correction pass
-      let cleaned = sanitizeDesign(segmentHTML.replace("[FINISH]", ""));
-      if (containsPlaceholders(cleaned)) {
-        const fixCtx = new Context(
-          "Rewrite the given HTML segment to remove any placeholders.",
-          `Remove all placeholders (e.g., [Enter ...], {Specify ...}, TODO). Output HTML only, same structure, no inline styles/classes/ids.`,
-          [],
-          {},
-          null,
-          { skipInitialSummaries: true, persistToDB: false }
-        );
-        await fixCtx.add("user", "", cleaned);
-        const fixed = await getAI(fixCtx, 600, "gpt-4o-mini");
-        if (fixed && fixed.length > 50 && !containsPlaceholders(fixed)) {
-          cleaned = sanitizeDesign(fixed);
-        } else {
-          cleaned = stripPlaceholders(cleaned);
-        }
-      }
-
+      const cleaned = sanitizeDesign(segmentHTML.replace("[FINISH]", ""));
       fullHTML += cleaned;
 
       if (segmentHTML.includes("[FINISH]")) break;
@@ -303,6 +260,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
+    // Resolve image placeholders AFTER design sanitization (keine Platzhalter-Entfernung)
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
     const styledHtml = `<!DOCTYPE html>
