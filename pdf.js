@@ -1,4 +1,4 @@
-// pdf.js — refactored v2.3
+// pdf.js — refactored v2.4
 // Generate a multi-segment HTML document and render it to PDF; returns a short text preview + PDF URL.
 
 const puppeteer = require("puppeteer");
@@ -106,7 +106,13 @@ async function generateStylesheet(styleBrief = "") {
     "",
     "You generate a single, self-contained CSS stylesheet for A4 printing that styles ONLY element selectors: " +
       "html, body, h1, h2, h3, p, ul, ol, li, table, thead, tbody, tr, th, td, blockquote, figure, figcaption, code, pre, img, hr. " +
-      "No classes, no IDs, no @import, no url(). You may use @page and @media print. Prefer CSS variables at :root. Keep it consistent."
+      "No classes, no IDs, no @import, no url(). You may use @page and @media print. Prefer CSS variables at :root. Keep it consistent. " +
+      "MUST include: " +
+      "@page{size:A4;margin:20mm;} " +
+      "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid;} " +
+      "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0;} " +
+      "figcaption{text-align:center;font-size:10pt;opacity:.75;} " +
+      "table{border-collapse:collapse;width:100%;} th,td{border:1px solid #ddd;padding:.35rem;}"
   );
   await req.add(
     "user",
@@ -115,7 +121,27 @@ async function generateStylesheet(styleBrief = "") {
   );
 
   const rawCss = await getAI(req, 800, "gpt-4o-mini");
-  const css = sanitizeCss(rawCss || "");
+  const cssAi = sanitizeCss(rawCss || "");
+
+  // small base safety-net to guarantee sane defaults (element selectors only)
+  const cssBase =
+    "@page{size:A4;margin:20mm}" +
+    "html,body{margin:0;padding:0}" +
+    "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111}" +
+    "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25}" +
+    "h2{font-size:16pt;margin:1.2rem 0 .5rem 0;line-height:1.25}" +
+    "h3{font-size:13pt;margin:1rem 0 .4rem 0;line-height:1.25}" +
+    "p{margin:.6rem 0;text-align:justify}" +
+    "ul,ol{margin:.6rem 0 .6rem 1.2rem}" +
+    "li{margin:.2rem 0}" +
+    "blockquote{margin:.8rem 0;padding:.6rem 1rem;border-left:3px solid #0a66c2;color:#555}" +
+    "hr{border:0;border-top:1px solid #ddd;margin:1rem 0}" +
+    "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid}" +
+    "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0}" +
+    "figcaption{text-align:center;font-size:10pt;opacity:.75}" +
+    "table{border-collapse:collapse;width:100%}" +
+    "th,td{border:1px solid #ddd;padding:.35rem}";
+  const css = `${cssBase}\n${cssAi}`.trim();
 
   // Cache by hash
   const hash = crypto.createHash("sha1").update(css).digest("hex").slice(0, 8);
@@ -168,15 +194,19 @@ async function getPDF(toolFunction, context, getAIResponse) {
 - Use only semantic tags: h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, blockquote, figure, figcaption, img, hr, br, code, pre.
 - Do **not** include explanations or comments—only HTML.
 - Prefer rich, complete content (not just outlines).
-- Do not output "to be continued" or similar filler.
+- Do not output templates, TODOs, or bracketed hints. If info is missing, choose a concrete, plausible value and continue (be consistent).
 
 ### Continuation / Segments:
 - If long, write in natural segments without artificial endings.
 - Only append [FINISH] on a new line AFTER the last HTML tag when the document is fully complete.
 
 ### Images:
-- Use <img src="{...}"> placeholders for images (no inline styles, no classes).
-- Do not mix real URLs and curly braces in the same src.
+- Begin the document with exactly ONE hero figure for the character portrait:
+  <figure>
+    <img src="{ultra-detailed, full-body portrait of a female dhampir rogue, level 1, black hair, pale skin with faint vampiric features (elongated canines), sleek dark leathers, light travel gear, dual daggers sheathed, agile stance, moody town-backdrop hinted softly (Nightstone ruins), dramatic chiaroscuro lighting, realistic fantasy painting, ultra-detailed textures, no text, no watermark, printed poster composition, centered subject}">
+    <figcaption>Character Portrait — Dhampir Rogue (Level 1)</figcaption>
+  </figure>
+- Use further <img src="{...}"> only if necessary. Never mix real URLs and curly braces in a single src.
 
 ### Consistency:
 - Use only the most recent user prompt for intent.
@@ -236,7 +266,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       await segmentCtx.add(
         "user",
         "",
-        "Continue immediately after the last segment. Add only new HTML content. Maintain structure and detail. No inline styles, classes, or ids."
+        "Continue immediately after the last segment. Add only new FINAL HTML content. Maintain structure and detail. No inline styles, classes, or ids. Do not output templates or bracketed hints."
       );
 
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
@@ -260,7 +290,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
-    // Resolve image placeholders AFTER design sanitization (keine Platzhalter-Entfernung)
+    // Resolve image placeholders AFTER design sanitization (keine Entfernungslogik)
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
     const styledHtml = `<!DOCTYPE html>
