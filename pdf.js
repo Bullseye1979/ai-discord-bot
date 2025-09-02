@@ -1,8 +1,10 @@
-// pdf.js — v3.5
+// pdf.js — v3.8 (Hardened for aiCore v2.7)
 // Generic PDF generator; AI-merging stylesheet (Base + Prompt → Final CSS).
 // Robust image handling: improves weak {…} image descriptions before calling getAIImage.
 // No assumptions about content type; images optional; no inline styles/classes/ids in HTML.
 // Ensures 1 cm inner text padding via body{padding:10mm} in the base CSS.
+// HARDENING: explicit tools on contexts, env switch to disable tools, debug logs for tool_calls.
+// Compatible with aiCore.getAIResponse(context, tokenlimit, sequenceLimit, model, apiKey?, options?)
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -18,6 +20,7 @@ const { reportError } = require("./error.js");
 const MAX_SEGMENTS = 25;
 const IMAGE_SIZE = "1024x1024"; // forwarded to getAIImage if supported by your service
 const MAX_IMAGES = 999;         // lower if you want to hard-limit auto image generation per document
+const DISABLE_TOOLS_FOR_PDF = process.env.PDF_DISABLE_TOOLS === "1";
 
 /** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "document") {
@@ -342,18 +345,28 @@ async function getPDF(toolFunction, context, getAIResponse) {
       `Original chat context (use only directly relevant material):\n\n${formattedContext}\n\nOriginal User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}`
     );
 
-    // Lazy require to avoid circular dependency with tools.js
-    const { getToolRegistry } = require("./tools.js");
-    const allowTools = [
-      "getWebpage",
-      "getImage",
-      "getGoogle",
-      "getYoutube",
-      "getLocation",
-      "getHistory",
-      "getImageDescription"
-    ];
-    const { tools: toolSpecs, registry: toolRegistry } = getToolRegistry(allowTools);
+    // Tools: allow or disable via ENV
+    let toolSpecs = [];
+    let toolRegistry = {};
+    if (!DISABLE_TOOLS_FOR_PDF) {
+      const { getToolRegistry } = require("./tools.js");
+      const allowTools = [
+        "getWebpage",
+        "getImage",
+        "getGoogle",
+        "getYoutube",
+        "getLocation",
+        "getHistory",
+        "getImageDescription"
+      ];
+      const reg = getToolRegistry(allowTools);
+      toolSpecs = reg.tools;
+      toolRegistry = reg.registry;
+    }
+
+    // Ensure generationContext also carries tools (aiCore reads from context)
+    generationContext.tools = toolSpecs;
+    generationContext.toolRegistry = toolRegistry;
 
     let fullHTML = "";
     let persistentToolMessages = [];
@@ -369,6 +382,9 @@ async function getPDF(toolFunction, context, getAIResponse) {
         { skipInitialSummaries: true, persistToDB: false }
       );
       segmentCtx.messages = [...generationContext.messages];
+      // Redundant attach (some implementations read props directly)
+      segmentCtx.tools = toolSpecs;
+      segmentCtx.toolRegistry = toolRegistry;
 
       if (persistentToolMessages.length > 0) {
         const toolBlock = persistentToolMessages.map((m) => m.content).join("\n\n");
@@ -383,7 +399,20 @@ async function getPDF(toolFunction, context, getAIResponse) {
         "Continue immediately after the last segment. Add only new FINAL HTML content. Maintain structure and detail. No inline styles, classes, or ids. Do not output templates or bracketed hints."
       );
 
+      // Call aiCore.getAIResponse: signature (context, tokenlimit, sequenceLimit, model, apiKey?, options?)
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
+
+      // Debug: if assistant made tool_calls, ensure we see tool replies in the segmentCtx
+      try {
+        const last = segmentCtx.messages[segmentCtx.messages.length - 1];
+        const toolCalls = Array.isArray(last?.tool_calls) ? last.tool_calls.map(t => t.id) : [];
+        if (toolCalls.length) {
+          console.log("[PDF][DEBUG] Assistant tool_calls:", toolCalls);
+          const replies = segmentCtx.messages.filter(m => m.role === "tool").map(m => m.tool_call_id);
+          console.log("[PDF][DEBUG] Tool replies in context:", replies);
+        }
+      } catch {}
+
       if (!segmentHTML || segmentHTML.length < 100) break;
 
       const newToolMsgs = segmentCtx.messages.filter((m) => m.role === "tool");
