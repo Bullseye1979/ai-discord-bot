@@ -1,5 +1,5 @@
-// pdf.js — refactored v2.4
-// Generate a multi-segment HTML document and render it to PDF; returns a short text preview + PDF URL.
+// pdf.js — v3.1 (AI-driven minimal CSS overrides atop a strong Magazine default)
+// Generates multi-segment HTML via tools + model and renders to PDF. Returns short preview + absolute PDF URL.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -10,6 +10,11 @@ const Context = require("./context");
 const { getAIImage, getAI } = require("./aiService");
 const { getPlainFromHTML } = require("./helper.js");
 const { reportError } = require("./error.js");
+
+/** CONFIG */
+const MAX_SEGMENTS = 25;
+const IMAGE_SIZE = "1024x1024"; // forwarded to getAIImage if supported
+const MAX_IMAGES = 999;         // set to 1 if du strikt nur ein Bild willst
 
 /** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "document") {
@@ -42,24 +47,32 @@ async function suggestFilename(originalPrompt, prompt) {
 
 /** Replace {natural language image description} placeholders with generated image URLs. */
 async function resolveImagePlaceholders(html) {
-  const placeholders = [...String(html || "").matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
+  const matches = [...String(html || "").matchAll(/\{([^}]+)\}/g)];
+  const placeholders = matches.map((m) => m[1]);
   const map = {};
   const list = [];
 
+  // Unique & optional limit
+  const unique = [];
   for (const desc of placeholders) {
+    if (!unique.includes(desc)) unique.push(desc);
+  }
+  const targets = unique.slice(0, MAX_IMAGES);
+
+  for (const desc of targets) {
     if (map[desc]) continue;
     try {
-      const url = await getAIImage(desc);
+      const url = await getAIImage(desc, IMAGE_SIZE, "dall-e-3");
       map[desc] = url;
       list.push(`${desc}  :  ${url}`);
     } catch (err) {
-      // Keep placeholder if generation fails, just log as WARN
       await reportError(err, null, "PDF_IMAGE_GEN", "WARN");
     }
   }
 
   let withImages = html;
   for (const [desc, url] of Object.entries(map)) {
+    if (!url) continue;
     const esc = desc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(`\\{\\s*${esc}\\s*\\}`, "g");
     withImages = withImages.replace(re, url);
@@ -69,81 +82,94 @@ async function resolveImagePlaceholders(html) {
 
 /* ------------------------- Design Hardening ------------------------- */
 
-/** Remove ALL class/id/style attributes from the generated HTML (global). */
+/** Remove ALL class/id/style attributes from generated HTML (global). */
 function sanitizeDesign(html) {
   if (!html) return "";
   return String(html).replace(/\s+(class|id|style)=(".*?"|'.*?'|[^\s>]+)/gi, "");
 }
 
-/** CSS sanitizer: no @import, no url(...), drop rules with class/id/* selectors; allow only element selectors & @page/@media print. */
+/** CSS sanitizer: keep only safe rules (element selectors, @page/@media print), no @import/url(), no classes/IDs. */
 function sanitizeCss(css) {
   let s = String(css || "");
-
-  // Block @import and url()
   s = s.replace(/@import[\s\S]*?;?/gi, "");
   s = s.replace(/url\s*\(\s*['"]?[^)]*\)/gi, "");
-
-  // Remove !important
   s = s.replace(/!important/gi, "");
-
-  // Remove non-allowed at-rules (keep @page and @media print)
   s = s.replace(/@(?!page|media)[^{]+\{[^}]*\}/gi, "");
   s = s.replace(/@media(?!\s+print)[^{]+\{[^}]*\}/gi, "");
-
-  // Drop rules containing class/id/universal selectors (., #, *).
+  // Drop rules containing class/id/universal selectors (., #, *)
   s = s.replace(/(^|\})\s*[^@][^{]*[.#\*][^{]*\{[^}]*\}/g, "$1");
-
   return s.trim();
 }
 
-/** Generate a single, global stylesheet via AI based on the prompt; cache by hash. */
-async function generateStylesheet(styleBrief = "") {
-  const brief = (styleBrief || "").trim();
+/** Strong Magazine Base CSS (element selectors only). */
+function getBaseMagazineCss() {
+  return [
+    "@page{size:A4;margin:20mm}",
+    "html,body{margin:0;padding:0}",
+    "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm}",
+    // headings
+    "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
+    "h2{font-size:16pt;margin:1.2rem 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
+    "h3{font-size:13pt;margin:1rem 0 .4rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
+    // text & lists
+    "p{margin:.6rem 0;text-align:justify}",
+    "ul,ol{margin:.6rem 0 .6rem 1.2rem}",
+    "li{margin:.2rem 0}",
+    "blockquote{margin:.8rem 0;padding:.6rem 1rem;border-left:3px solid #0a66c2;color:#555;break-inside:avoid}",
+    "hr{border:0;border-top:1px solid #ddd;margin:1rem 0;break-after:avoid}",
+    // images & figures
+    "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid}",
+    "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0}",
+    "figure img:first-child{border-radius:50%}", // round portrait by default
+    "figcaption{text-align:center;font-size:10pt;opacity:.75}",
+    // tables (colored/zebra)
+    "table{border-collapse:collapse;width:100%;break-inside:avoid;margin:.6rem 0}",
+    "thead th{background:#0a66c2;color:#fff;padding:.45rem .6rem;text-align:left}",
+    "tbody tr:nth-child(even){background:#f6f8fa}",
+    "th,td{border:1px solid #d0d7de;padding:.35rem .5rem;vertical-align:top}",
+    // code/pre
+    "code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10pt}",
+    "pre{white-space:pre-wrap;background:#f8f8f8;border:1px solid #ddd;padding:.6rem}",
+    "figure,table{page-break-inside:avoid}",
+  ].join("");
+}
 
+/** Ask AI for minimal CSS overrides relative to the base. */
+async function getAiCssOverrides(baseCss, styleBrief) {
+  if (!String(styleBrief || "").trim()) return "";
   const req = new Context();
   await req.add(
     "system",
     "",
-    "You generate a single, self-contained CSS stylesheet for A4 printing that styles ONLY element selectors: " +
-      "html, body, h1, h2, h3, p, ul, ol, li, table, thead, tbody, tr, th, td, blockquote, figure, figcaption, code, pre, img, hr. " +
-      "No classes, no IDs, no @import, no url(). You may use @page and @media print. Prefer CSS variables at :root. Keep it consistent. " +
-      "MUST include: " +
-      "@page{size:A4;margin:20mm;} " +
-      "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid;} " +
-      "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0;} " +
-      "figcaption{text-align:center;font-size:10pt;opacity:.75;} " +
-      "table{border-collapse:collapse;width:100%;} th,td{border:1px solid #ddd;padding:.35rem;}"
+    "You are a professional print designer. You receive a strong default CSS (element selectors only) for an A4, magazine-like layout. " +
+      "Your task: produce a MINIMAL CSS PATCH that ONLY changes aspects explicitly requested in the user brief. " +
+      "Do NOT restate defaults. Do NOT remove features not mentioned. " +
+      "Rules:\n" +
+      "- Use ONLY element selectors (html, body, h1,h2,h3,p,ul,ol,li,table,thead,tbody,tr,th,td,blockquote,figure,figcaption,code,pre,img,hr).\n" +
+      "- No classes, no IDs, no @import, no url().\n" +
+      "- Prefer to touch as few properties as possible; keep the default look unless explicitly asked.\n" +
+      "- You may use @page and @media print.\n" +
+      "- Output CSS only (no comments/explanations)."
   );
+  await req.add("assistant", "", `### DEFAULT BASE CSS\n${baseCss}`);
   await req.add(
     "user",
     "",
-    `Design brief (may be empty):\n${brief}\n\nReturn CSS only, no comments.`
+    `User style brief:\n${String(styleBrief || "").trim()}\n\nReturn only the minimal CSS overrides (a patch), nothing else.`
   );
 
-  const rawCss = await getAI(req, 800, "gpt-4o-mini");
-  const cssAi = sanitizeCss(rawCss || "");
+  const raw = await getAI(req, 600, "gpt-4o-mini");
+  return sanitizeCss(raw || "");
+}
 
-  // small base safety-net to guarantee sane defaults (element selectors only)
-  const cssBase =
-    "@page{size:A4;margin:20mm}" +
-    "html,body{margin:0;padding:0}" +
-    "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111}" +
-    "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25}" +
-    "h2{font-size:16pt;margin:1.2rem 0 .5rem 0;line-height:1.25}" +
-    "h3{font-size:13pt;margin:1rem 0 .4rem 0;line-height:1.25}" +
-    "p{margin:.6rem 0;text-align:justify}" +
-    "ul,ol{margin:.6rem 0 .6rem 1.2rem}" +
-    "li{margin:.2rem 0}" +
-    "blockquote{margin:.8rem 0;padding:.6rem 1rem;border-left:3px solid #0a66c2;color:#555}" +
-    "hr{border:0;border-top:1px solid #ddd;margin:1rem 0}" +
-    "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid}" +
-    "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0}" +
-    "figcaption{text-align:center;font-size:10pt;opacity:.75}" +
-    "table{border-collapse:collapse;width:100%}" +
-    "th,td{border:1px solid #ddd;padding:.35rem}";
-  const css = `${cssBase}\n${cssAi}`.trim();
+/** Generate final stylesheet: Base + minimal AI overrides derived from the brief. */
+async function generateStylesheet(styleBrief = "") {
+  const baseCss = getBaseMagazineCss();
+  const overrides = await getAiCssOverrides(baseCss, styleBrief);
+  // Always prepend base; overrides come after to take precedence
+  const css = `${baseCss}\n${overrides}`.trim();
 
-  // Cache by hash
+  // Cache by hash (optional; useful if you want to persist themes)
   const hash = crypto.createHash("sha1").update(css).digest("hex").slice(0, 8);
   const documentsDir = path.join(__dirname, "documents");
   const cssDir = path.join(documentsDir, "css");
@@ -183,9 +209,10 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_INPUT — Missing 'prompt', 'original_prompt' or 'user_id'.";
     }
 
-    // Build global stylesheet from prompt+original
+    // Build stylesheet from Base + minimal AI overrides derived from the combined brief
     const { css } = await generateStylesheet(`${original_prompt}\n\n${prompt}`);
 
+    // Strong output rules: no inline/class/id; start with a single hero figure (round portrait enforced by CSS)
     const generationContext = new Context(
       "You are a PDF generator that writes final, publish-ready HTML.",
       `### Output (STRICT):
@@ -194,7 +221,6 @@ async function getPDF(toolFunction, context, getAIResponse) {
 - Use only semantic tags: h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, blockquote, figure, figcaption, img, hr, br, code, pre.
 - Do **not** include explanations or comments—only HTML.
 - Prefer rich, complete content (not just outlines).
-- Do not output templates, TODOs, or bracketed hints. If info is missing, choose a concrete, plausible value and continue (be consistent).
 
 ### Continuation / Segments:
 - If long, write in natural segments without artificial endings.
@@ -227,9 +253,8 @@ async function getPDF(toolFunction, context, getAIResponse) {
       `Original chat context (use only directly relevant material):\n\n${formattedContext}\n\nOriginal User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}`
     );
 
-    // Lazy require to break circular dependency with tools.js
+    // Lazy require to avoid circular dependency with tools.js
     const { getToolRegistry } = require("./tools.js");
-    // Allowlist: keine PDF-Rekursion
     const allowTools = [
       "getWebpage",
       "getImage",
@@ -245,7 +270,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
     let persistentToolMessages = [];
     let segmentCount = 0;
 
-    while (segmentCount < 25) {
+    while (segmentCount < MAX_SEGMENTS) {
       const segmentCtx = new Context(
         "You generate the next HTML segment.",
         "",
@@ -290,7 +315,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
-    // Resolve image placeholders AFTER design sanitization (keine Entfernungslogik)
+    // Replace image placeholders AFTER design sanitization
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
     const styledHtml = `<!DOCTYPE html>
@@ -312,7 +337,8 @@ async function getPDF(toolFunction, context, getAIResponse) {
     const publicPath = `/documents/${filename}.pdf`;
     const pdfPath = path.join(documentsDir, `${filename}.pdf`);
 
-    browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
+    let browserOpts = { headless: "new", args: ["--no-sandbox"] };
+    browser = await puppeteer.launch(browserOpts);
     const page = await browser.newPage();
     await page.setContent(styledHtml, { waitUntil: "load" });
     await page.pdf({
