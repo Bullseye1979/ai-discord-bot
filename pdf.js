@@ -1,15 +1,26 @@
-// pdf.js — stable renderer v1.0
-// Input: { html, css?, filename?, title?, user_id? } via tool args
-// Output: human-readable string incl. public PDF URL, plain-text preview, and the effective CSS.
-// Guarantees (hard, non-overridable by user CSS): A4, 10mm margins, no table/figure/blockquote/image splits.
+// pdf.js — stable renderer v1.2 (inline images)
+// Input:  { html, css?, filename?, title?, user_id? } via tool args
+// Output: String mit Public-URL, Plaintext-Preview und effektivem CSS.
+// Highlights:
+//  - HART erzwingt: A4, 10mm Ränder, keine Splits bei Tabellen/Figuren/Bildern/Blockquotes.
+//  - Robustes Argument-Parsing (Codefences, Smart Quotes, trailing commas).
+//  - Entfernt <script>-Tags und extrahiert Inhalt aus <body>, falls volle HTML-Seite.
+//  - **Neu**: Lädt http/https <img src="..."> serverseitig und ersetzt sie durch data:URI (Limits).
+//  - Wartet auf Bilder vor PDF-Erzeugung.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
 const fs = require("fs/promises");
+const axios = require("axios");
 const { reportError } = require("./error.js");
 const { getPlainFromHTML } = require("./helper.js");
 
-/* ------------------------- Utilities ------------------------- */
+/* ======================== Config ======================== */
+const INLINE_IMG_MAX_COUNT = Number(process.env.PDF_INLINE_IMG_MAX_COUNT || 32);    // max Bilder
+const INLINE_IMG_MAX_BYTES = Number(process.env.PDF_INLINE_IMG_MAX_BYTES || 5_000_000); // 5MB je Bild
+const INLINE_IMG_TIMEOUT_MS = Number(process.env.PDF_INLINE_IMG_TIMEOUT || 15000);  // 15s timeout pro Bild
+
+/* ======================== Utils ========================= */
 
 /** Strip ``` fences, BOM, normalize quotes/newlines. */
 function cleanseArgString(s) {
@@ -27,7 +38,7 @@ function cleanseArgString(s) {
   return t;
 }
 
-/** Parse tool args safely. Never throw. On failure, return { ok:false, error, raw }. */
+/** Parse tool args safely. Never throw. */
 function safeParseToolArgs(toolFunction) {
   try {
     const a = toolFunction?.arguments;
@@ -36,8 +47,7 @@ function safeParseToolArgs(toolFunction) {
     try {
       const parsed = JSON.parse(raw);
       return { ok: true, args: parsed };
-    } catch (e) {
-      // try to repair trailing commas
+    } catch {
       const repaired = raw.replace(/,\s*([}\]])/g, "$1");
       try {
         const parsed2 = JSON.parse(repaired);
@@ -71,7 +81,6 @@ function extractBody(html) {
   const s = String(html);
   const bodyMatch = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   if (bodyMatch) return bodyMatch[1];
-  // If there's an <html> but no explicit <body>, take everything between <html>…</html> as a fallback
   const htmlMatch = s.match(/<html[^>]*>([\s\S]*?)<\/html>/i);
   if (htmlMatch) return htmlMatch[1];
   return s;
@@ -93,47 +102,45 @@ function ensureAbsoluteUrl(urlPath) {
   return urlPath; // relative fallback
 }
 
-/* ------------------------- Hard CSS (non-overridable) ------------------------- */
+/** Minimal HTML escaper for <title>. */
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/* ============= Hard CSS (nicht überschreibbar) ============= */
 /**
- * Diese Regeln sollen NICHT vom User-Stylesheet überschrieben werden:
- * - A4 Format, 10mm Ränder
- * - Keine Splits in Tabellen, Figures, Blockquotes, Bildern
- * - Grundlegende Bild-Skalierung (fit)
- *
- * Taktiken:
- *  - Sehr hohe Spezifität (html body …)
- *  - !important
- *  - eigenes <style id="hard-rules"> vor dem User-CSS
+ * Nicht überschreibbare Regeln (hohe Spezifität + !important):
+ *  - A4, 10mm Ränder
+ *  - keine Splits in Tabellen, Figuren, Blockquotes, Bildern
+ *  - Bilder auf Seitenbreite skalieren
  */
 function hardCss() {
   return [
     "@page{size:A4;margin:10mm !important}",
     "html, body{margin:0 !important;padding:0 !important}",
-    // Basispadding im Body (zusätzlich zum @page-Margin – hilft innerer Abstand)
     "html body{padding:0 !important}",
-    // Splits verhindern
     "html body table, html body tr, html body td, html body th, html body thead, html body tbody{page-break-inside: avoid !important; break-inside: avoid !important}",
     "html body figure, html body blockquote, html body pre, html body code{page-break-inside: avoid !important; break-inside: avoid !important}",
     "html body img{max-width:100% !important;height:auto !important;display:block !important;page-break-inside: avoid !important; break-inside: avoid !important}",
   ].join("");
 }
 
-/* ------------------------- HTML Document Wrapper ------------------------- */
+/* ============= HTML Document Wrapper ============= */
 
 function buildHtmlDocument(bodyHtml, userCss, title = "Document") {
   const hard = hardCss();
   const safeCss = String(userCss || "");
-
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>${escapeHtml(title || "Document")}</title>
-  <!-- Hard non-overridable rules -->
   <style id="hard-rules">
   ${hard}
   </style>
-  <!-- User stylesheet (may override most but not the hard rules above) -->
   <style id="user-styles">
   ${safeCss}
   </style>
@@ -144,20 +151,112 @@ ${bodyHtml}
 </html>`;
 }
 
-/** Minimal HTML escaper for <title>. */
-function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+/* ============= Image Inlining (Data URI) ============= */
+
+/** Finde http/https IMG-Quellen (keine data:, blob:, file:, keine {platzhalter}). */
+function findRemoteImageSrcs(html) {
+  const out = [];
+  const re = /<img\b[^>]*\bsrc\s*=\s*(['"])(.*?)\1/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const src = (m[2] || "").trim();
+    if (!src) continue;
+    // ignore placeholders in { … }
+    if (/^\{\s*.+\s*\}$/.test(src)) continue;
+    // allow only http(s)
+    if (!/^https?:\/\//i.test(src)) continue;
+    // ignore data:, blob:, file:
+    if (/^(data|blob|file):/i.test(src)) continue;
+    out.push({ src, index: m.index });
+  }
+  return out;
 }
 
-/* ------------------------- Main Tool Entry ------------------------- */
+/** Laden einer Bild-URL → data:URI (Base64), mit Size- und Timeout-Limits. */
+async function fetchImageAsDataUri(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), INLINE_IMG_TIMEOUT_MS);
+
+  try {
+    const res = await axios.get(url, {
+      responseType: "arraybuffer",
+      signal: controller.signal,
+      maxContentLength: INLINE_IMG_MAX_BYTES,
+      timeout: INLINE_IMG_TIMEOUT_MS,
+      headers: {
+        // Manche Hosts verlangen accept header
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (compatible; PDFBot/1.2; +https://example.com)",
+      },
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+
+    const bytes = res.data;
+    if (!bytes || !Buffer.isBuffer(bytes)) {
+      throw new Error("No image bytes");
+    }
+    if (bytes.length > INLINE_IMG_MAX_BYTES) {
+      throw new Error(`Image too large (${bytes.length} bytes)`);
+    }
+
+    // content-type fallback
+    let ct =
+      res.headers["content-type"] ||
+      res.headers["Content-Type"] ||
+      "";
+
+    // Simple sanity fallback by URL extension
+    if (!/^image\//i.test(ct)) {
+      if (/\.png(\?|#|$)/i.test(url)) ct = "image/png";
+      else if (/\.jpe?g(\?|#|$)/i.test(url)) ct = "image/jpeg";
+      else if (/\.gif(\?|#|$)/i.test(url)) ct = "image/gif";
+      else if (/\.webp(\?|#|$)/i.test(url)) ct = "image/webp";
+      else if (/\.svg(\?|#|$)/i.test(url)) ct = "image/svg+xml";
+      else ct = "application/octet-stream";
+    }
+
+    const b64 = Buffer.from(bytes).toString("base64");
+    return `data:${ct};base64,${b64}`;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Ersetzt remote IMG-URLs im HTML durch data:URIs (bis zu Limits). */
+async function inlineImages(html) {
+  const imgs = findRemoteImageSrcs(html);
+  if (imgs.length === 0) return { html, stats: { found: 0, inlined: 0, skipped: 0 } };
+
+  const limited = imgs.slice(0, INLINE_IMG_MAX_COUNT);
+  let inlined = 0, skipped = 0;
+  let out = html;
+
+  // Wir ersetzen von hinten nach vorne, damit Indizes stabil bleiben:
+  for (let i = limited.length - 1; i >= 0; i--) {
+    const { src } = limited[i];
+    try {
+      const dataUri = await fetchImageAsDataUri(src);
+      // replace only that exact occurrence (src="…")
+      const safeSrc = src.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(`(<img\\b[^>]*\\bsrc\\s*=\\s*["'])${safeSrc}(["'][^>]*>)`, "i");
+      out = out.replace(re, `$1${dataUri}$2`);
+      inlined++;
+    } catch (e) {
+      // Loggen und überspringen – die restlichen Bilder weiter versuchen
+      await reportError(e, null, "PDF_INLINE_IMG", "WARN", { url: src });
+      skipped++;
+    }
+  }
+
+  return { html: out, stats: { found: imgs.length, inlined, skipped } };
+}
+
+/* ======================== Main Tool ======================== */
 
 async function getPDF(toolFunction /*, context, getAIResponse */) {
   let browser = null;
   try {
-    // Robust arg parsing; never throw
+    // 1) Argumente parsen (robust)
     const parsed = safeParseToolArgs(toolFunction);
     if (!parsed.ok) {
       return JSON.stringify({
@@ -181,24 +280,38 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
       });
     }
 
-    const bodyOnly = stripScripts(extractBody(htmlInput));
+    // 2) HTML vorbereiten: Scripts entfernen, auf body-Content reduzieren
+    const bodyRaw = stripScripts(extractBody(htmlInput));
 
+    // 3) Remote-Bilder inlinen (data:URI), damit Render stabil ist
+    const { html: bodyWithImages, stats: inlineStats } = await inlineImages(bodyRaw);
+
+    // 4) HTML-Dokument zusammenbauen
+    const htmlDoc = buildHtmlDocument(bodyWithImages, cssInput, title);
+
+    // 5) Dateipfade/URLs
     const documentsDir = path.join(__dirname, "documents");
     await fs.mkdir(documentsDir, { recursive: true });
 
     const filename = normalizeFilename(filenameInput || (title || "document"));
     const pdfPath = path.join(documentsDir, `${filename}.pdf`);
     const publicPath = `/documents/${filename}.pdf`;
+    const publicUrl = ensureAbsoluteUrl(publicPath);
 
-    const htmlDoc = buildHtmlDocument(bodyOnly, cssInput, title);
-
-    // Render
+    // 6) Rendern mit Puppeteer
     browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
     const page = await browser.newPage();
 
+    // Etwas großzügigere Timeout-Defaults
+    await page.setDefaultNavigationTimeout(60000);
+    await page.setDefaultTimeout(60000);
+
+    // CSP-Bypass vermeiden (nur bei Bedarf aktivieren)
+    // await page.setBypassCSP(true);
+
     await page.setContent(htmlDoc, { waitUntil: "load" });
 
-    // Wait for all images to settle (prevents broken images)
+    // Da wir inlined Images nutzen, ist das meist sofort geladen; trotzdem warten:
     try {
       await page.evaluate(() =>
         Promise.all(
@@ -219,39 +332,37 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
       path: pdfPath,
       format: "A4",
       printBackground: true,
-      // @page margin is authoritative; we don't set margin here to avoid conflicts
+      // @page margin (10mm) kommt aus hardCss(); kein margin hier setzen
     });
 
-    const publicUrl = ensureAbsoluteUrl(publicPath);
+    // 7) Preview + Rückgabe
+    const preview = getPlainFromHTML(bodyWithImages, 2000);
 
-    // Plain-text preview (limit inside helper), to help the chat output
-    const preview = getPlainFromHTML(bodyOnly, 2000);
+    const lines = [];
+    lines.push(`PDF: ${publicUrl}`);
+    lines.push(`<${publicUrl}>`);
+    lines.push("");
+    lines.push(`--- Plaintext Preview ---`);
+    lines.push(preview);
+    lines.push("");
+    lines.push(`--- CSS Used ---`);
+    lines.push("```css");
+    lines.push(cssInput || "/* (no user CSS provided) */");
+    lines.push("```");
+    lines.push("");
+    lines.push(`--- Image Inlining ---`);
+    lines.push(`found=${inlineStats.found}, inlined=${inlineStats.inlined}, skipped=${inlineStats.skipped}`);
 
-    // Returning a human-friendly block; also angle-bracket URL for clickable embed in manchen Clients
-    return [
-      `PDF: ${publicUrl}`,
-      `<${publicUrl}>`,
-      ``,
-      `--- Plaintext Preview ---`,
-      preview,
-      ``,
-      `--- CSS Used ---`,
-      "```css",
-      cssInput || "/* (no user CSS provided) */",
-      "```",
-    ].join("\n");
+    return lines.join("\n");
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "ERROR");
-    // Never throw; always return a tool string
     return JSON.stringify({
       ok: false,
       error: "PDF_UNEXPECTED — Could not generate PDF.",
       details: err?.message || String(err),
     });
   } finally {
-    try {
-      await browser?.close();
-    } catch {}
+    try { await browser?.close(); } catch {}
   }
 }
 
