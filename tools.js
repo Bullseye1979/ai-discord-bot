@@ -1,4 +1,4 @@
-// tools.js — refactored v1.5 (structured getHistory + name normalization + getPDF mode required)
+// tools.js — refactored v1.6 (structured getHistory + name normalization + simplified getPDF args)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -115,7 +115,7 @@ const tools = [
     }
   },
 
-  // ==== CHANGED: getHistory now expects structured parts instead of full SQL ====
+  // ==== getHistory expects structured parts instead of full SQL ====
   {
     type: "function",
     function: {
@@ -179,28 +179,24 @@ const tools = [
     }
   },
 
+  // ==== Simplified getPDF: HTML + CSS in, PDF out ====
   {
     type: "function",
     function: {
       name: "getPDF",
       description:
-        "Create a fully formatted PDF directly from the user's request. " +
-        "This must be the first and only tool call for PDF generation; it manages image generation and rendering internally. " +
-        "The caller MUST decide the content assembly mode before calling this tool.",
+        "Render a PDF from provided HTML and (optionally) a stylesheet. " +
+        "If a stylesheet already exists and nothing else is requested, use it unchanged.",
       parameters: {
         type: "object",
         properties: {
-          prompt: { type: "string", description: "Full instructions for the PDF." },
-          original_prompt: { type: "string", description: "Original natural-language user request." },
-          user_id: { type: "string", description: "User ID or display name." },
-          mode: {
-            type: "string",
-            enum: ["verbatim", "transform", "from_scratch"],
-            description: "Content assembly mode decided BEFORE calling this tool"
-          },
-          note: { type: "string", description: "Optional rationale for audit/logging" }
+          html: { type: "string", description: "Full HTML body content. May contain full HTML; the renderer will extract <body> if present." },
+          css: { type: "string", description: "Optional stylesheet to apply. If omitted, a safe default will be used." },
+          filename: { type: "string", description: "Optional filename without extension. Will be normalized." },
+          title: { type: "string", description: "Optional <title> for the document head." },
+          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." }
         },
-        required: ["prompt", "original_prompt", "user_id", "mode"]
+        required: ["html"]
       }
     }
   }
