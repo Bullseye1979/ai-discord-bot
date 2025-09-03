@@ -1,16 +1,59 @@
-// pdf.js — stable v1.0
-// Takes HTML + CSS, merges them, renders PDF with Puppeteer.
-// Features: enforced A4 + 1cm margins, waits for images, optional image inlining.
+// pdf.js — stable renderer v1.0
+// Input: { html, css?, filename?, title?, user_id? } via tool args
+// Output: human-readable string incl. public PDF URL, plain-text preview, and the effective CSS.
+// Guarantees (hard, non-overridable by user CSS): A4, 10mm margins, no table/figure/blockquote/image splits.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
 const fs = require("fs/promises");
-const crypto = require("crypto");
-const axios = require("axios");
-
 const { reportError } = require("./error.js");
+const { getPlainFromHTML } = require("./helper.js");
 
-/** Normalize filename (lowercase, safe, max 40 chars, no extension). */
+/* ------------------------- Utilities ------------------------- */
+
+/** Strip ``` fences, BOM, normalize quotes/newlines. */
+function cleanseArgString(s) {
+  if (typeof s !== "string") return "";
+  let t = s.trim();
+  // remove code fences
+  t = t.replace(/^```(?:json)?\s*/i, "");
+  t = t.replace(/\s*```$/i, "");
+  // remove BOM
+  t = t.replace(/^\uFEFF/, "");
+  // normalize smart quotes
+  t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  // normalize newlines
+  t = t.replace(/\r\n/g, "\n");
+  return t;
+}
+
+/** Parse tool args safely. Never throw. On failure, return { ok:false, error, raw }. */
+function safeParseToolArgs(toolFunction) {
+  try {
+    const a = toolFunction?.arguments;
+    if (a && typeof a === "object") return { ok: true, args: a };
+    const raw = cleanseArgString(String(a || ""));
+    try {
+      const parsed = JSON.parse(raw);
+      return { ok: true, args: parsed };
+    } catch (e) {
+      // try to repair trailing commas
+      const repaired = raw.replace(/,\s*([}\]])/g, "$1");
+      try {
+        const parsed2 = JSON.parse(repaired);
+        return { ok: true, args: parsed2 };
+      } catch (e2) {
+        reportError(e2, null, "PDF_ARGS_PARSE", "ERROR", { rawPreview: raw.slice(0, 500) });
+        return { ok: false, error: "Failed to parse getPDF tool arguments", raw };
+      }
+    }
+  } catch (e) {
+    reportError(e, null, "PDF_ARGS_PARSE", "ERROR");
+    return { ok: false, error: "Failed to parse getPDF tool arguments", raw: "" };
+  }
+}
+
+/** Make filesystem-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "document") {
   const base =
     String(s || "")
@@ -22,139 +65,189 @@ function normalizeFilename(s, fallback = "document") {
   return base;
 }
 
-/** Inline remote images into <img src="data:..."> to avoid broken links. */
-async function inlineImages(html) {
-  const regex = /<img\s+[^>]*src=["']([^"']+)["'][^>]*>/gi;
-  const urls = [];
-  let match;
-  while ((match = regex.exec(html)) !== null) {
-    urls.push(match[1]);
-  }
-  const unique = [...new Set(urls)];
-
-  for (const url of unique) {
-    if (!/^https?:\/\//i.test(url)) continue;
-    try {
-      const resp = await axios.get(url, { responseType: "arraybuffer", timeout: 30000 });
-      const ct = resp.headers["content-type"] || "image/png";
-      const b64 = Buffer.from(resp.data).toString("base64");
-      const dataUri = `data:${ct};base64,${b64}`;
-      html = html.replace(new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), dataUri);
-    } catch (err) {
-      await reportError(err, null, "PDF_INLINE_IMG", "WARN");
-    }
-  }
-  return html;
+/** Extract only the <body> content if full HTML given; else return as-is. */
+function extractBody(html) {
+  if (!html) return "";
+  const s = String(html);
+  const bodyMatch = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  if (bodyMatch) return bodyMatch[1];
+  // If there's an <html> but no explicit <body>, take everything between <html>…</html> as a fallback
+  const htmlMatch = s.match(/<html[^>]*>([\s\S]*?)<\/html>/i);
+  if (htmlMatch) return htmlMatch[1];
+  return s;
 }
 
-/** Ensure base/public URL is absolute */
+/** Remove <script> tags completely for safety. */
+function stripScripts(html) {
+  if (!html) return "";
+  return String(html).replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "");
+}
+
+/** Ensure absolute public URL using PUBLIC_BASE_URL / BASE_URL. */
 function ensureAbsoluteUrl(urlPath) {
   const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/$/, "");
   if (/^https?:\/\//i.test(urlPath)) return urlPath;
   if (base) {
     return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
   }
-  return urlPath;
+  return urlPath; // relative fallback
 }
 
-/** Main entry: render PDF from HTML + CSS */
-async function getPDF(toolFunction, context, getAIResponse) {
-  let browser = null;
-  try {
-    let args;
-    try {
-      args =
-        typeof toolFunction.arguments === "string"
-          ? JSON.parse(toolFunction.arguments || "{}")
-          : toolFunction.arguments || {};
-    } catch (err) {
-      await reportError(err, null, "PDF_ARGS_PARSE", "ERROR");
-      throw new Error("Failed to parse getPDF tool arguments");
-    }
+/* ------------------------- Hard CSS (non-overridable) ------------------------- */
+/**
+ * Diese Regeln sollen NICHT vom User-Stylesheet überschrieben werden:
+ * - A4 Format, 10mm Ränder
+ * - Keine Splits in Tabellen, Figures, Blockquotes, Bildern
+ * - Grundlegende Bild-Skalierung (fit)
+ *
+ * Taktiken:
+ *  - Sehr hohe Spezifität (html body …)
+ *  - !important
+ *  - eigenes <style id="hard-rules"> vor dem User-CSS
+ */
+function hardCss() {
+  return [
+    "@page{size:A4;margin:10mm !important}",
+    "html, body{margin:0 !important;padding:0 !important}",
+    // Basispadding im Body (zusätzlich zum @page-Margin – hilft innerer Abstand)
+    "html body{padding:0 !important}",
+    // Splits verhindern
+    "html body table, html body tr, html body td, html body th, html body thead, html body tbody{page-break-inside: avoid !important; break-inside: avoid !important}",
+    "html body figure, html body blockquote, html body pre, html body code{page-break-inside: avoid !important; break-inside: avoid !important}",
+    "html body img{max-width:100% !important;height:auto !important;display:block !important;page-break-inside: avoid !important; break-inside: avoid !important}",
+  ].join("");
+}
 
-    const htmlRaw = String(args.html || "").trim();
-    const cssRaw = String(args.css || "").trim();
-    const filename = normalizeFilename(args.filename || "document");
-    const title = String(args.title || "Document").trim();
+/* ------------------------- HTML Document Wrapper ------------------------- */
 
-    if (!htmlRaw) {
-      return "[ERROR]: PDF_INPUT — Missing 'html'.";
-    }
+function buildHtmlDocument(bodyHtml, userCss, title = "Document") {
+  const hard = hardCss();
+  const safeCss = String(userCss || "");
 
-    // Inline images if env flag is set
-    let finalHtml = htmlRaw;
-    if (process.env.INLINE_IMAGES === "true") {
-      finalHtml = await inlineImages(finalHtml);
-    }
-
-    // Wrap with head + base CSS (A4 + margins enforced)
-    const enforcedCss = `
-      @page { size: A4; margin: 20mm; }
-      html, body { margin:0; padding:10mm; }
-      table, figure { page-break-inside: avoid; }
-      img { max-width:100%; height:auto; display:block; page-break-inside: avoid; }
-    `;
-    const fullCss = enforcedCss + "\n" + (cssRaw || "");
-
-    const styledHtml = `<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>${title}</title>
-  <style>${fullCss}</style>
+  <title>${escapeHtml(title || "Document")}</title>
+  <!-- Hard non-overridable rules -->
+  <style id="hard-rules">
+  ${hard}
+  </style>
+  <!-- User stylesheet (may override most but not the hard rules above) -->
+  <style id="user-styles">
+  ${safeCss}
+  </style>
 </head>
 <body>
-  ${finalHtml}
+${bodyHtml}
 </body>
 </html>`;
+}
 
-    // Prepare paths
+/** Minimal HTML escaper for <title>. */
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/* ------------------------- Main Tool Entry ------------------------- */
+
+async function getPDF(toolFunction /*, context, getAIResponse */) {
+  let browser = null;
+  try {
+    // Robust arg parsing; never throw
+    const parsed = safeParseToolArgs(toolFunction);
+    if (!parsed.ok) {
+      return JSON.stringify({
+        ok: false,
+        error: parsed.error,
+        hint: "Bitte die Tool-Argumente als gültiges JSON senden (html/css/filename/title als Strings).",
+      });
+    }
+
+    const args = parsed.args || {};
+    const htmlInput = String(args.html || "");
+    const cssInput = String(args.css || ""); // optional
+    const filenameInput = String(args.filename || "").trim();
+    const title = String(args.title || "").trim();
+
+    if (!htmlInput) {
+      return JSON.stringify({
+        ok: false,
+        error: "Missing required 'html' input.",
+        hint: "Sende mindestens { html: \"...\" }.",
+      });
+    }
+
+    const bodyOnly = stripScripts(extractBody(htmlInput));
+
     const documentsDir = path.join(__dirname, "documents");
     await fs.mkdir(documentsDir, { recursive: true });
+
+    const filename = normalizeFilename(filenameInput || (title || "document"));
     const pdfPath = path.join(documentsDir, `${filename}.pdf`);
     const publicPath = `/documents/${filename}.pdf`;
 
-    // Launch Puppeteer
+    const htmlDoc = buildHtmlDocument(bodyOnly, cssInput, title);
+
+    // Render
     browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
     const page = await browser.newPage();
-    await page.setContent(styledHtml, { waitUntil: "networkidle0" });
 
-    // Wait for images to load
-    await page.evaluate(async () => {
-      const imgs = Array.from(document.images || []);
-      await Promise.all(
-        imgs.map((img) => {
-          if (img.complete) return Promise.resolve();
-          return new Promise((res) => {
-            const done = () => res();
-            img.addEventListener("load", done, { once: true });
-            img.addEventListener("error", done, { once: true });
-          });
-        })
+    await page.setContent(htmlDoc, { waitUntil: "load" });
+
+    // Wait for all images to settle (prevents broken images)
+    try {
+      await page.evaluate(() =>
+        Promise.all(
+          Array.from(document.images).map((img) => {
+            if (img.complete) return Promise.resolve();
+            return new Promise((res) => {
+              img.addEventListener("load", res, { once: true });
+              img.addEventListener("error", res, { once: true });
+            });
+          })
+        )
       );
-    });
+    } catch {
+      // ignore
+    }
 
-    // Export PDF
     await page.pdf({
       path: pdfPath,
       format: "A4",
       printBackground: true,
+      // @page margin is authoritative; we don't set margin here to avoid conflicts
     });
 
     const publicUrl = ensureAbsoluteUrl(publicPath);
 
-    // Plain text (strip HTML)
-    const plain = String(finalHtml)
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 2000);
+    // Plain-text preview (limit inside helper), to help the chat output
+    const preview = getPlainFromHTML(bodyOnly, 2000);
 
-    return `${plain}\n\nPDF: ${publicUrl}\n<${publicUrl}>\n\n### CSS\n${fullCss}`;
+    // Returning a human-friendly block; also angle-bracket URL for clickable embed in manchen Clients
+    return [
+      `PDF: ${publicUrl}`,
+      `<${publicUrl}>`,
+      ``,
+      `--- Plaintext Preview ---`,
+      preview,
+      ``,
+      `--- CSS Used ---`,
+      "```css",
+      cssInput || "/* (no user CSS provided) */",
+      "```",
+    ].join("\n");
   } catch (err) {
-    await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
-    return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF.";
+    await reportError(err, null, "PDF_UNEXPECTED", "ERROR");
+    // Never throw; always return a tool string
+    return JSON.stringify({
+      ok: false,
+      error: "PDF_UNEXPECTED — Could not generate PDF.",
+      details: err?.message || String(err),
+    });
   } finally {
     try {
       await browser?.close();
