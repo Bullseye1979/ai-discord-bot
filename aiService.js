@@ -1,5 +1,7 @@
-// aiService.js — clean v1.3
+// aiService.js — clean v1.4 (hardened)
 // Core AI helpers: chat, image gen, transcription, TTS, and vision.
+// Changes:
+// - getAI(): sanitizes messages for plain chat (drops tool roles, strips tool_calls/tool_call_id/function_call)
 
 require("dotenv").config();
 const axios = require("axios");
@@ -43,15 +45,40 @@ function toSafeAxiosError(err, tag = "AI_ERROR") {
   };
 }
 
+/** Strip any tool-related fields so a plain chat request can never include tool-calls. */
+function sanitizePlainChatMessages(input) {
+  const out = [];
+  for (const m of Array.isArray(input) ? input : []) {
+    // drop tool role entirely
+    if (m?.role === "tool") continue;
+
+    const copy = { role: m.role, content: m.content };
+    if (m.name) copy.name = m.name;
+
+    // hard strip all tool/function call artifacts
+    if (copy.role === "assistant") {
+      if ("tool_calls" in copy) delete copy.tool_calls;
+      if ("function_call" in copy) delete copy.function_call;
+    }
+    if ("tool_call_id" in copy) delete copy.tool_call_id;
+
+    // In VERY old payloads there could be function_call on user/system—strip anyway
+    if ("function_call" in copy) delete copy.function_call;
+
+    out.push(copy);
+  }
+  // If nothing left, ensure at least one system message
+  if (out.length === 0) {
+    out.push({ role: "system", content: "You are a helpful assistant. Be concise." });
+  }
+  return out;
+}
+
 /** Chat completion; returns assistant text or throws structured error. */
 async function getAI(context, tokenlimit = 4096, model = "gpt-4o") {
-  const safeMessages = Array.isArray(context?.messages) ? [...context.messages] : [];
-  if (safeMessages.length === 0) {
-    safeMessages.push({ role: "system", content: "You are a helpful assistant. Be concise." });
-  }
-
+  // IMPORTANT: sanitize to ensure no tool_calls leak into a plain chat request
+  const safeMessages = sanitizePlainChatMessages(context?.messages || []);
   const payload = { model, messages: safeMessages, max_tokens: tokenlimit };
-
   try {
     console.log("getAI → payload (preview)", {
       model,
