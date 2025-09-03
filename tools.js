@@ -189,7 +189,7 @@ const tools = [
       parameters: {
         type: "object",
         properties: {
-          html: { type: "string", description: "Full HTML body content. May contain full HTML; the renderer will extract <body> if present." },
+          html: { type: "string", description: "Full HTML body content. Must contain full HTML; the renderer will extract <body> if present." },
           css: { type: "string", description: "Required: Complete stylesheet to apply. Do not omit." },
           filename: { type: "string", description: "Optional filename without extension. Will be normalized." },
           title: { type: "string", description: "Optional <title> for the document head." },
