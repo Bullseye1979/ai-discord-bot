@@ -1,10 +1,11 @@
-// pdf.js — v5.0 (Simple HTML+CSS -> PDF renderer)
-// Eingabe: { html, css?, filename?, title?, user_id? }
-// Ausgabe: Plaintext-Preview + PDF-Link + verwendetes Stylesheet
+// pdf.js — v5.1 (HTML+CSS -> PDF, ultra-toleranter Argument-Parser)
+// Eingabe (Tool-Args): { html (req), css?, filename?, title?, user_id? }
+// Ausgabe: Textblock mit PDF-Link, Plaintext-Preview, Stylesheet
 //
-// - Kein KI-Aufruf, keine Tool-Abhängigkeiten.
-// - A4, printBackground; PUBLIC_BASE_URL zur Link-Erzeugung.
-// - Falls kein CSS geliefert, wird ein defensives Default-Stylesheet genutzt (inkl. 1cm Innenabstand).
+// - Keine KI-Aufrufe; nur Rendering mit Puppeteer
+// - PUBLIC_BASE_URL wird für den Link verwendet
+// - 1cm Innenabstand im Default-CSS
+// - Hartes Ziel: NIE werfen — immer eine Tool-Antwort zurückgeben!
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -30,20 +31,7 @@ function ensureAbsoluteUrl(urlPath) {
   const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/$/, "");
   if (/^https?:\/\//i.test(urlPath)) return urlPath;
   if (base) return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
-  return urlPath; // fallback: relative
-}
-
-/** Robust parse for tool function arguments (ohne harte JSON.parse-Crashes). */
-function safeParseArgs(argInput) {
-  try {
-    if (!argInput) return {};
-    if (typeof argInput === "object") return argInput;
-    const s = String(argInput).trim();
-    if (!s) return {};
-    return JSON.parse(s);
-  } catch {
-    return "__ARGS_PARSE_ERROR__";
-  }
+  return urlPath; // relative fallback
 }
 
 /** Minimal Default-CSS (drucktauglich, 1cm padding, 2 Spalten, farbige Tabellen). */
@@ -78,10 +66,73 @@ function extractBody(html) {
   const s = String(html || "");
   const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   if (m) return m[1];
-  // Falls kompletter HTML inkl. <head> geliefert wurde und kein <body> vorhanden ist,
-  // nehmen wir den gesamten Inhalt als body:
-  const hasHtml = /<html[\s>]/i.test(s) || /<!doctype/i.test(s) || /<head[\s>]/i.test(s);
-  return hasHtml ? s : s; // s wird als Body eingefügt
+  const hasHtmlLike = /<html[\s>]/i.test(s) || /<!doctype/i.test(s) || /<head[\s>]/i.test(s);
+  return hasHtmlLike ? s : s;
+}
+
+/** Sehr toleranter Argument-Parser: wirfst NIE. */
+function safeParseArgsLoose(argInput) {
+  try {
+    if (!argInput) return {};
+    if (typeof argInput === "object") return argInput;
+
+    let s = String(argInput).trim();
+    if (!s) return {};
+
+    // 1) Normaler JSON.parse
+    try { return JSON.parse(s); } catch {}
+
+    // 2) JSON Substring zwischen erstem { und letztem }
+    const first = s.indexOf("{");
+    const last = s.lastIndexOf("}");
+    if (first !== -1 && last !== -1 && last > first) {
+      const sub = s.slice(first, last + 1);
+      try { return JSON.parse(sub); } catch {}
+    }
+
+    // 3) Reparaturen: Smart Quotes -> "
+    s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+
+    // 4) Einfache Quotes zu doppelten (nur wenn plausibel):
+    // Achtung: sehr grob — aber besser als crashen. Wir versuchen es nur,
+    // wenn der String wie ein Objekt aussieht und doppelte Quotes rar sind.
+    const looksLikeObject = s.trim().startsWith("{") && s.trim().endsWith("}");
+    if (looksLikeObject && (s.match(/"/g) || []).length < 2) {
+      const s2 = s.replace(/'/g, '"');
+      try { return JSON.parse(s2); } catch {}
+    }
+
+    // 5) Querystring / key=value-Zeilen
+    if (/^[a-z0-9_\-]+\s*=/i.test(s) || s.includes("&")) {
+      const obj = {};
+      const pairs = s.split(/[&\n]/);
+      for (const p of pairs) {
+        const [k, v] = p.split("=").map(x => (x || "").trim());
+        if (k) obj[k] = decodeURIComponent((v || "").replace(/\+/g, " "));
+      }
+      if (Object.keys(obj).length > 0) return obj;
+    }
+
+    // 6) Wenn wie HTML aussieht: interpretieren als { html: s }
+    if (/[<][a-z!]/i.test(s)) return { html: s };
+
+    // 7) Fallback: als „html“ annehmen, wenn viel Markup drin ist
+    if (s.length > 200) return { html: s };
+
+    // 8) Letzter Fallback: leeres Objekt
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+/** Einfache HTML-Escapes für <title>. */
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 /* ------------------------- Main Tool Entry ------------------------- */
@@ -89,27 +140,22 @@ function extractBody(html) {
 async function getPDF(toolFunction /*, context, getAIResponse */) {
   let browser = null;
   try {
-    const args = safeParseArgs(toolFunction?.arguments);
-    if (args === "__ARGS_PARSE_ERROR__") {
-      await reportError(new Error("Failed to parse getPDF tool arguments"), null, "PDF_ARGS_PARSE", "WARN");
-      return "[ERROR]: PDF_INPUT — Could not parse tool arguments (invalid JSON).";
-    }
+    const args = safeParseArgsLoose(toolFunction?.arguments);
 
     const rawHtml = String(args.html || "").trim();
     const cssInput = String(args.css || "").trim();
     const filenameArg = String(args.filename || "").trim();
     const title = String(args.title || "").trim();
-    // user_id optional; derzeit nur für Logging denkbar:
-    // const user_id = String(args.user_id || "").trim();
+    // const user_id = String(args.user_id || "").trim(); // optional
 
     if (!rawHtml) {
+      // NIE werfen → immer eine Tool-Antwort:
       return "[ERROR]: PDF_INPUT — Missing 'html' content.";
     }
 
     const bodyHtml = extractBody(rawHtml);
     const css = cssInput || getDefaultCss();
 
-    // Komplettes Dokument zusammensetzen
     const docTitle = title || "Document";
     const fullHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -160,20 +206,12 @@ ${bodyHtml}
     ].join("\n");
 
   } catch (err) {
+    // NIE weiterwerfen → Tool-Antwort zurückgeben
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
     return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF.";
   } finally {
     try { await browser?.close(); } catch {}
   }
-}
-
-/** Einfache HTML-Escapes für <title>. */
-function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 module.exports = { getPDF };
