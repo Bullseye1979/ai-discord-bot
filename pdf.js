@@ -1,11 +1,6 @@
-// pdf.js — v5.1 (HTML+CSS -> PDF, ultra-toleranter Argument-Parser)
+// pdf.js — v5.2 (HTML+CSS -> PDF mit CSS-Priorität + robustem Argument-Parser)
 // Eingabe (Tool-Args): { html (req), css?, filename?, title?, user_id? }
 // Ausgabe: Textblock mit PDF-Link, Plaintext-Preview, Stylesheet
-//
-// - Keine KI-Aufrufe; nur Rendering mit Puppeteer
-// - PUBLIC_BASE_URL wird für den Link verwendet
-// - 1cm Innenabstand im Default-CSS
-// - Hartes Ziel: NIE werfen — immer eine Tool-Antwort zurückgeben!
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -34,12 +29,11 @@ function ensureAbsoluteUrl(urlPath) {
   return urlPath; // relative fallback
 }
 
-/** Minimal Default-CSS (drucktauglich, 1cm padding, 2 Spalten, farbige Tabellen). */
+/** Default CSS mit 1 cm Innenabstand */
 function getDefaultCss() {
   return [
     "@page{size:A4;margin:20mm}",
     "html,body{margin:0;padding:0}",
-    // 1 cm Innenabstand:
     "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm;padding:10mm}",
     "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
     "h2{font-size:16pt;margin:1.2rem 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
@@ -61,72 +55,62 @@ function getDefaultCss() {
   ].join("");
 }
 
-/** Entnimmt nur den <body>-Inhalt, wenn kompletter HTML geliefert wurde. */
+/** Inline-CSS aus <head> extrahieren */
+function extractInlineCssFromFullHtml(html) {
+  try {
+    const s = String(html || "");
+    const headMatch = s.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+    if (!headMatch) return "";
+    const head = headMatch[1];
+    const styles = [...head.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(m => m[1].trim());
+    return styles.join("\n\n").trim();
+  } catch { return ""; }
+}
+
+/** Body-Inhalt aus HTML extrahieren */
 function extractBody(html) {
   const s = String(html || "");
   const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   if (m) return m[1];
-  const hasHtmlLike = /<html[\s>]/i.test(s) || /<!doctype/i.test(s) || /<head[\s>]/i.test(s);
-  return hasHtmlLike ? s : s;
+  return s;
 }
 
-/** Sehr toleranter Argument-Parser: wirfst NIE. */
+/** Ultra-toleranter Argument-Parser */
 function safeParseArgsLoose(argInput) {
   try {
     if (!argInput) return {};
     if (typeof argInput === "object") return argInput;
-
     let s = String(argInput).trim();
     if (!s) return {};
 
-    // 1) Normaler JSON.parse
     try { return JSON.parse(s); } catch {}
 
-    // 2) JSON Substring zwischen erstem { und letztem }
-    const first = s.indexOf("{");
-    const last = s.lastIndexOf("}");
-    if (first !== -1 && last !== -1 && last > first) {
-      const sub = s.slice(first, last + 1);
-      try { return JSON.parse(sub); } catch {}
+    const first = s.indexOf("{"), last = s.lastIndexOf("}");
+    if (first !== -1 && last > first) {
+      try { return JSON.parse(s.slice(first, last + 1)); } catch {}
     }
 
-    // 3) Reparaturen: Smart Quotes -> "
     s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
-
-    // 4) Einfache Quotes zu doppelten (nur wenn plausibel):
-    // Achtung: sehr grob — aber besser als crashen. Wir versuchen es nur,
-    // wenn der String wie ein Objekt aussieht und doppelte Quotes rar sind.
-    const looksLikeObject = s.trim().startsWith("{") && s.trim().endsWith("}");
-    if (looksLikeObject && (s.match(/"/g) || []).length < 2) {
-      const s2 = s.replace(/'/g, '"');
-      try { return JSON.parse(s2); } catch {}
+    const looksLikeObj = s.trim().startsWith("{") && s.trim().endsWith("}");
+    if (looksLikeObj) {
+      try { return JSON.parse(s.replace(/'/g, '"')); } catch {}
     }
 
-    // 5) Querystring / key=value-Zeilen
     if (/^[a-z0-9_\-]+\s*=/i.test(s) || s.includes("&")) {
       const obj = {};
-      const pairs = s.split(/[&\n]/);
-      for (const p of pairs) {
+      for (const p of s.split(/[&\n]/)) {
         const [k, v] = p.split("=").map(x => (x || "").trim());
         if (k) obj[k] = decodeURIComponent((v || "").replace(/\+/g, " "));
       }
       if (Object.keys(obj).length > 0) return obj;
     }
 
-    // 6) Wenn wie HTML aussieht: interpretieren als { html: s }
     if (/[<][a-z!]/i.test(s)) return { html: s };
-
-    // 7) Fallback: als „html“ annehmen, wenn viel Markup drin ist
     if (s.length > 200) return { html: s };
-
-    // 8) Letzter Fallback: leeres Objekt
     return {};
-  } catch {
-    return {};
-  }
+  } catch { return {}; }
 }
 
-/** Einfache HTML-Escapes für <title>. */
 function escapeHtml(s) {
   return String(s || "")
     .replace(/&/g, "&amp;")
@@ -137,7 +121,7 @@ function escapeHtml(s) {
 
 /* ------------------------- Main Tool Entry ------------------------- */
 
-async function getPDF(toolFunction /*, context, getAIResponse */) {
+async function getPDF(toolFunction) {
   let browser = null;
   try {
     const args = safeParseArgsLoose(toolFunction?.arguments);
@@ -146,18 +130,26 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     const cssInput = String(args.css || "").trim();
     const filenameArg = String(args.filename || "").trim();
     const title = String(args.title || "").trim();
-    // const user_id = String(args.user_id || "").trim(); // optional
 
-    if (!rawHtml) {
-      // NIE werfen → immer eine Tool-Antwort:
-      return "[ERROR]: PDF_INPUT — Missing 'html' content.";
+    if (!rawHtml) return "[ERROR]: PDF_INPUT — Missing 'html' content.";
+
+    const looksFullHtml = /<html[\s>]/i.test(rawHtml) || /<!doctype/i.test(rawHtml) || /<head[\s>]/i.test(rawHtml);
+    let css = cssInput;
+
+    if (!css && looksFullHtml) {
+      const inlineCss = extractInlineCssFromFullHtml(rawHtml);
+      if (inlineCss) css = inlineCss;
     }
+    if (!css) css = getDefaultCss();
 
-    const bodyHtml = extractBody(rawHtml);
-    const css = cssInput || getDefaultCss();
-
-    const docTitle = title || "Document";
-    const fullHtml = `<!DOCTYPE html>
+    let fullHtml;
+    if (!cssInput && looksFullHtml) {
+      // Original HTML komplett rendern
+      fullHtml = rawHtml;
+    } else {
+      const bodyHtml = extractBody(rawHtml);
+      const docTitle = title || "Document";
+      fullHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -168,32 +160,23 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
 ${bodyHtml}
 </body>
 </html>`;
+    }
 
-    // Dateien & Pfade
     const documentsDir = path.join(__dirname, "documents");
     await fs.mkdir(documentsDir, { recursive: true });
 
-    const filename = normalizeFilename(filenameArg || docTitle || "document");
+    const filename = normalizeFilename(filenameArg || title || "document");
     const publicPath = `/documents/${filename}.pdf`;
     const pdfPath = path.join(documentsDir, `${filename}.pdf`);
 
-    // Rendern
-    const browserOpts = { headless: "new", args: ["--no-sandbox"] };
-    browser = await puppeteer.launch(browserOpts);
+    browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
     const page = await browser.newPage();
     await page.setContent(fullHtml, { waitUntil: "load" });
-    await page.pdf({
-      path: pdfPath,
-      format: "A4",
-      printBackground: true,
-    });
+    await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
 
     const publicUrl = ensureAbsoluteUrl(publicPath);
+    const preview = getPlainFromHTML(rawHtml, 2000);
 
-    // Reintext-Preview (aus Body)
-    const preview = getPlainFromHTML(bodyHtml, 2000);
-
-    // Rückgabe als gut konsumierbarer Textblock
     return [
       `PDF: ${publicUrl}`,
       `<${publicUrl}>`,
@@ -206,7 +189,6 @@ ${bodyHtml}
     ].join("\n");
 
   } catch (err) {
-    // NIE weiterwerfen → Tool-Antwort zurückgeben
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
     return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF.";
   } finally {
