@@ -1,12 +1,15 @@
-// pdf.js — stable renderer v1.2 (inline images)
-// Input:  { html, css?, filename?, title?, user_id? } via tool args
-// Output: String mit Public-URL, Plaintext-Preview und effektivem CSS.
-// Highlights:
-//  - HART erzwingt: A4, 10mm Ränder, keine Splits bei Tabellen/Figuren/Bildern/Blockquotes.
-//  - Robustes Argument-Parsing (Codefences, Smart Quotes, trailing commas).
-//  - Entfernt <script>-Tags und extrahiert Inhalt aus <body>, falls volle HTML-Seite.
-//  - **Neu**: Lädt http/https <img src="..."> serverseitig und ersetzt sie durch data:URI (Limits).
-//  - Wartet auf Bilder vor PDF-Erzeugung.
+// pdf.js — stable renderer v1.3 (lenient args + inline images)
+// Input:  { html, css?, filename?, title?, user_id? } via tool args (string or object)
+// Output: Text mit Public-URL, Plaintext-Preview, angewandtem CSS und Inliner-Stats.
+//
+// Neuerungen in v1.3:
+//  - Super-robustes safeParseToolArgs:
+//      * Entfernt Codefences/BOM/Smart-Quotes
+//      * Versucht JSON.parse
+//      * Versucht "balanced braces slice" (erste { .. passende } ) zu parsen
+//      * Wenn alles scheitert und raw wie HTML aussieht → { html: raw }
+//  - Bild-Inlining (http/https → data:URI) bleibt, um ablaufende Links zu entschärfen
+//  - Harte Layout-Regeln (A4, 10mm Margin, keine Split-Table/Fig/Img/Blockquote)
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -38,28 +41,89 @@ function cleanseArgString(s) {
   return t;
 }
 
+/** Detects if the string is likely raw HTML (so we can fall back). */
+function looksLikeHtml(s) {
+  const t = String(s || "");
+  return /<\s*(html|body|h1|div|section|article|p|table|img)\b/i.test(t);
+}
+
+/** Try to extract a balanced {...} slice from a raw string and parse it. */
+function tryParseBalancedJson(raw) {
+  const str = String(raw || "");
+  const start = str.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let esc = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (inString) {
+      if (esc) {
+        esc = false;
+      } else if (ch === "\\") {
+        esc = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+    } else {
+      if (ch === '"') inString = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          const slice = str.slice(start, i + 1);
+          try { return JSON.parse(slice); } catch { return null; }
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /** Parse tool args safely. Never throw. */
 function safeParseToolArgs(toolFunction) {
   try {
     const a = toolFunction?.arguments;
+
+    // If the SDK already gave an object, we are done.
     if (a && typeof a === "object") return { ok: true, args: a };
+
     const raw = cleanseArgString(String(a || ""));
+
+    // 1) Try direct JSON.parse
     try {
       const parsed = JSON.parse(raw);
       return { ok: true, args: parsed };
-    } catch {
+    } catch {}
+
+    // 2) Try removing trailing commas
+    try {
       const repaired = raw.replace(/,\s*([}\]])/g, "$1");
-      try {
-        const parsed2 = JSON.parse(repaired);
-        return { ok: true, args: parsed2 };
-      } catch (e2) {
-        reportError(e2, null, "PDF_ARGS_PARSE", "ERROR", { rawPreview: raw.slice(0, 500) });
-        return { ok: false, error: "Failed to parse getPDF tool arguments", raw };
-      }
+      const parsed2 = JSON.parse(repaired);
+      return { ok: true, args: parsed2 };
+    } catch {}
+
+    // 3) Try balanced slice { ... } and parse that
+    const balanced = tryParseBalancedJson(raw);
+    if (balanced && typeof balanced === "object") {
+      return { ok: true, args: balanced };
     }
+
+    // 4) Fallback: if it looks like HTML, use it as html param
+    if (looksLikeHtml(raw)) {
+      return { ok: true, args: { html: raw } };
+    }
+
+    // 5) Last resort: wrap raw in a paragraph as html (prevents hard failure)
+    if (raw) {
+      const wrapped = `<pre>${escapeHtml(raw)}</pre>`;
+      return { ok: true, args: { html: wrapped } };
+    }
+
+    return { ok: false, error: "Failed to parse getPDF tool arguments", raw };
   } catch (e) {
     reportError(e, null, "PDF_ARGS_PARSE", "ERROR");
-    return { ok: false, error: "Failed to parse getPDF tool arguments", raw: "" };
+    return { ok: false, error: "Failed to parse getPDF tool arguments" };
   }
 }
 
@@ -102,7 +166,7 @@ function ensureAbsoluteUrl(urlPath) {
   return urlPath; // relative fallback
 }
 
-/** Minimal HTML escaper for <title>. */
+/** Minimal HTML escaper for <title> and pre fallback. */
 function escapeHtml(s) {
   return String(s || "")
     .replace(/&/g, "&amp;")
@@ -184,9 +248,8 @@ async function fetchImageAsDataUri(url) {
       maxContentLength: INLINE_IMG_MAX_BYTES,
       timeout: INLINE_IMG_TIMEOUT_MS,
       headers: {
-        // Manche Hosts verlangen accept header
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "User-Agent": "Mozilla/5.0 (compatible; PDFBot/1.2; +https://example.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; PDFBot/1.3; +https://example.com)",
       },
       validateStatus: (s) => s >= 200 && s < 400,
     });
@@ -205,7 +268,7 @@ async function fetchImageAsDataUri(url) {
       res.headers["Content-Type"] ||
       "";
 
-    // Simple sanity fallback by URL extension
+    // Simple fallback by URL extension
     if (!/^image\//i.test(ct)) {
       if (/\.png(\?|#|$)/i.test(url)) ct = "image/png";
       else if (/\.jpe?g(\?|#|$)/i.test(url)) ct = "image/jpeg";
@@ -242,7 +305,6 @@ async function inlineImages(html) {
       out = out.replace(re, `$1${dataUri}$2`);
       inlined++;
     } catch (e) {
-      // Loggen und überspringen – die restlichen Bilder weiter versuchen
       await reportError(e, null, "PDF_INLINE_IMG", "WARN", { url: src });
       skipped++;
     }
@@ -259,10 +321,11 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     // 1) Argumente parsen (robust)
     const parsed = safeParseToolArgs(toolFunction);
     if (!parsed.ok) {
+      // Soft reply (kein Throw), damit aiCore IMMER eine Tool-Antwort hat
       return JSON.stringify({
         ok: false,
-        error: parsed.error,
-        hint: "Bitte die Tool-Argumente als gültiges JSON senden (html/css/filename/title als Strings).",
+        error: parsed.error || "Failed to parse getPDF tool arguments",
+        hint: "Sende gültiges JSON oder reines HTML als String.",
       });
     }
 
@@ -276,7 +339,7 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
       return JSON.stringify({
         ok: false,
         error: "Missing required 'html' input.",
-        hint: "Sende mindestens { html: \"...\" }.",
+        hint: "Sende mindestens { html: \"...\" } oder übergib reines HTML als Tool-Argument.",
       });
     }
 
@@ -302,16 +365,12 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
     const page = await browser.newPage();
 
-    // Etwas großzügigere Timeout-Defaults
     await page.setDefaultNavigationTimeout(60000);
     await page.setDefaultTimeout(60000);
 
-    // CSP-Bypass vermeiden (nur bei Bedarf aktivieren)
-    // await page.setBypassCSP(true);
-
     await page.setContent(htmlDoc, { waitUntil: "load" });
 
-    // Da wir inlined Images nutzen, ist das meist sofort geladen; trotzdem warten:
+    // Bilder fertig laden (auch wenn data:URI meist sofort ready ist)
     try {
       await page.evaluate(() =>
         Promise.all(
@@ -332,7 +391,7 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
       path: pdfPath,
       format: "A4",
       printBackground: true,
-      // @page margin (10mm) kommt aus hardCss(); kein margin hier setzen
+      // @page margin (10mm) kommt aus hardCss(); kein margin-Override hier setzen
     });
 
     // 7) Preview + Rückgabe
