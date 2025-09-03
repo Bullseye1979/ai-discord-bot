@@ -1,10 +1,9 @@
-// pdf.js — v3.8 (Hardened for aiCore v2.7)
-// Generic PDF generator; AI-merging stylesheet (Base + Prompt → Final CSS).
-// Robust image handling: improves weak {…} image descriptions before calling getAIImage.
-// No assumptions about content type; images optional; no inline styles/classes/ids in HTML.
-// Ensures 1 cm inner text padding via body{padding:10mm} in the base CSS.
-// HARDENING: explicit tools on contexts, env switch to disable tools, debug logs for tool_calls.
-// Compatible with aiCore.getAIResponse(context, tokenlimit, sequenceLimit, model, apiKey?, options?)
+// pdf.js — v4.1
+// Mehrstufig, aber ohne Extra-Call für die Modusentscheidung:
+// -> Die aufrufende KI setzt 'mode' bereits im getPDF-Tool-Call.
+// Hauptkontext (rollengetreu) dient als Design- & Inhaltsquelle.
+// CSS via KI-Merge (Base + Brief aus History+Prompt). Keine Inline-Styles/IDs/Klassen.
+// A4, 1cm Innenabstand. Tools ab erstem Turn aktiv. Bild-Platzhalter {…} werden bei Bedarf befüllt.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -18,11 +17,12 @@ const { reportError } = require("./error.js");
 
 /** CONFIG */
 const MAX_SEGMENTS = 25;
-const IMAGE_SIZE = "1024x1024"; // forwarded to getAIImage if supported by your service
-const MAX_IMAGES = 999;         // lower if you want to hard-limit auto image generation per document
+const IMAGE_SIZE = "1024x1024";
+const MAX_IMAGES = 999;
 const DISABLE_TOOLS_FOR_PDF = process.env.PDF_DISABLE_TOOLS === "1";
 
-/** FS-safe, lowercased filename (max 40 chars, no extension). */
+/* ------------------------- Filename helpers ------------------------- */
+
 function normalizeFilename(s, fallback = "document") {
   const base =
     String(s || "")
@@ -34,7 +34,6 @@ function normalizeFilename(s, fallback = "document") {
   return base;
 }
 
-/** Ask the model for a short filename suggestion and then sanitize it. */
 async function suggestFilename(originalPrompt, prompt) {
   try {
     const req = new Context();
@@ -51,34 +50,26 @@ async function suggestFilename(originalPrompt, prompt) {
   }
 }
 
-/* ------------------------- Image placeholder handling ------------------------- */
+/* ------------------------- Image handling ------------------------- */
 
-/** Heuristic: is the image description too generic/weak to yield a good result? */
 function isWeakImageDesc(desc) {
   const s = String(desc || "").trim().toLowerCase();
   if (!s) return true;
   const wc = s.split(/\s+/).length;
-  if (wc < 6) return true; // very short → likely weak
-
-  // very generic nouns that often appear without detail
+  if (wc < 6) return true;
   const generic = [
-    "image", "picture", "photo", "portrait", "character portrait", "logo",
-    "icon", "banner", "header image", "cover image", "illustration",
-    "diagram", "chart", "graph"
+    "image","picture","photo","portrait","character portrait","logo",
+    "icon","banner","header image","cover image","illustration",
+    "diagram","chart","graph"
   ];
   if (generic.includes(s)) return true;
-
   for (const g of generic) {
     if (s === g) return true;
-    // "portrait of", "image of", etc. with very little tail
-    if ((s.startsWith(g + " of ") || s.startsWith(g + " with ")) && wc <= 6) {
-      return true;
-    }
+    if ((s.startsWith(g + " of ") || s.startsWith(g + " with ")) && wc <= 6) return true;
   }
   return false;
 }
 
-/** Expand a vague image idea into a detailed, safe description. */
 async function enhanceImagePrompt(brief, htmlContext) {
   try {
     const ctx = new Context();
@@ -86,33 +77,26 @@ async function enhanceImagePrompt(brief, htmlContext) {
       "system",
       "",
       "You transform a vague image idea into a detailed, concrete, safe prompt for a general image generator.\n" +
-        "Rules: 30–90 words. Describe subject, setting, composition, mood, lighting, style/materials. " +
-        "No text/watermarks/logos. No brand names or copyrighted characters.\n" +
-        "Be faithful to the provided HTML context; do not invent proper names. Return the description only."
+      "Rules: 30–90 words. Describe subject, setting, composition, mood, lighting, style/materials. " +
+      "No text/watermarks/logos. No brands/copyrighted characters.\n" +
+      "Be faithful to provided HTML context; no new proper names. Return the description only."
     );
-    await ctx.add(
-      "assistant",
-      "",
-      `HTML context (may be truncated):\n${String(htmlContext || "").slice(0, 4000)}`
-    );
-    await ctx.add("user", "", `Expand this into a rich visual prompt:\n"${brief}"`);
-
+    await ctx.add("assistant", "", `HTML context (may be truncated):\n${String(htmlContext || "").slice(0, 4000)}`);
+    await ctx.add("user", "", `Expand into a rich visual prompt:\n"${brief}"`);
     const out = await getAI(ctx, 200, "gpt-4o-mini");
-    const clean = String(out || "").trim();
-    return clean || brief;
+    return String(out || "").trim() || brief;
   } catch {
     return brief;
   }
 }
 
-/** Replace {natural language image description} placeholders with generated image URLs (if any). */
 async function resolveImagePlaceholders(html) {
   const originalMatches = [...String(html || "").matchAll(/\{([^}]+)\}/g)];
   const originals = originalMatches.map((m) => m[1]);
   if (!originals.length) return { html, imagelist: "" };
 
   const uniqueOriginals = [...new Set(originals)];
-  const generationPlan = []; // [{ original, effective, skipped }]
+  const generationPlan = [];
 
   for (const orig of uniqueOriginals) {
     let effective = orig;
@@ -128,38 +112,27 @@ async function resolveImagePlaceholders(html) {
     generationPlan.push({ original: orig, effective, skipped: false });
   }
 
-  // Optional hard cap
   const limitedPlan = generationPlan.slice(0, MAX_IMAGES);
-
-  const urlMap = new Map();  // original placeholder -> final URL
+  const urlMap = new Map();
   const imagelist = [];
 
   for (const item of limitedPlan) {
     const { original, effective, skipped } = item;
-    if (skipped) {
-      imagelist.push(`${original}  :  [SKIPPED — insufficient detail]`);
-      continue;
-    }
+    if (skipped) { imagelist.push(`${original}  :  [SKIPPED — insufficient detail]`); continue; }
     try {
       const url = await getAIImage(effective, IMAGE_SIZE, "dall-e-3");
-      if (url) {
-        urlMap.set(original, url);
-        imagelist.push(`${effective}  :  ${url}`);
-      } else {
-        imagelist.push(`${effective}  :  [FAILED — no URL returned]`);
-      }
+      if (url) { urlMap.set(original, url); imagelist.push(`${effective}  :  ${url}`); }
+      else { imagelist.push(`${effective}  :  [FAILED — no URL returned]`); }
     } catch (err) {
       await reportError(err, null, "PDF_IMAGE_GEN", "WARN");
       imagelist.push(`${effective}  :  [ERROR — generation failed]`);
     }
   }
 
-  // Replace only originals for which we have URLs
   let withImages = html;
   for (const [orig, url] of urlMap.entries()) {
     const esc = orig.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`\\{\\s*${esc}\\s*\\}`, "g");
-    withImages = withImages.replace(re, url);
+    withImages = withImages.replace(new RegExp(`\\{\\s*${esc}\\s*\\}`, "g"), url);
   }
 
   return { html: withImages, imagelist: imagelist.join("\n") };
@@ -167,13 +140,11 @@ async function resolveImagePlaceholders(html) {
 
 /* ------------------------- Design Hardening ------------------------- */
 
-/** Remove ALL class/id/style attributes from generated HTML (global). */
 function sanitizeDesign(html) {
   if (!html) return "";
   return String(html).replace(/\s+(class|id|style)=(".*?"|'.*?'|[^\s>]+)/gi, "");
 }
 
-/** CSS sanitizer: keep only safe rules (element selectors, @page/@media print), no @import/url(), no classes/IDs. */
 function sanitizeCss(css) {
   let s = String(css || "");
   s = s.replace(/@import[\s\S]*?;?/gi, "");
@@ -181,88 +152,92 @@ function sanitizeCss(css) {
   s = s.replace(/!important/gi, "");
   s = s.replace(/@(?!page|media)[^{]+\{[^}]*\}/gi, "");
   s = s.replace(/@media(?!\s+print)[^{]+\{[^}]*\}/gi, "");
-  // Drop rules containing class/id/universal selectors (., #, *)
   s = s.replace(/(^|\})\s*[^@][^{]*[.#\*][^{]*\{[^}]*\}/g, "$1");
   return s.trim();
 }
 
-/** Strong, modern magazine-like Base CSS (element selectors only; rounded corners for images; 2 columns default).
- *  Ensures inner text padding of 10mm (1 cm) via body{padding:10mm}.
- */
 function getBaseMagazineCss() {
   return [
     "@page{size:A4;margin:20mm}",
     "html,body{margin:0;padding:0}",
-    // Inner text padding enforced here (10mm = 1cm)
+    // 1 cm Innenabstand:
     "body{font-family:Arial,Helvetica,sans-serif;font-size:12pt;line-height:1.6;color:#111;column-count:2;column-gap:12mm;padding:10mm}",
-    // headings
     "h1{font-size:22pt;margin:0 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
     "h2{font-size:16pt;margin:1.2rem 0 .5rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
     "h3{font-size:13pt;margin:1rem 0 .4rem 0;line-height:1.25;color:#0a66c2;break-after:avoid}",
-    // text & lists
     "p{margin:.6rem 0;text-align:justify}",
     "ul,ol{margin:.6rem 0 .6rem 1.2rem}",
     "li{margin:.2rem 0}",
     "blockquote{margin:.8rem 0;padding:.6rem 1rem;border-left:3px solid #0a66c2;color:#555;break-inside:avoid}",
     "hr{border:0;border-top:1px solid #ddd;margin:1rem 0;break-after:avoid}",
-    // images & figures
     "img{max-width:100%;height:auto;display:block;margin:0 auto 8mm;page-break-inside:avoid;border-radius:12px}",
     "figure{break-inside:avoid;page-break-inside:avoid;margin:0 0 8mm 0}",
     "figcaption{text-align:center;font-size:10pt;opacity:.75}",
-    // tables (colored/zebra)
     "table{border-collapse:collapse;width:100%;break-inside:avoid;margin:.6rem 0}",
     "thead th{background:#0a66c2;color:#fff;padding:.45rem .6rem;text-align:left}",
     "tbody tr:nth-child(even){background:#f6f8fa}",
     "th,td{border:1px solid #d0d7de;padding:.35rem .5rem;vertical-align:top}",
-    // code/pre
     "code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10pt}",
     "pre{white-space:pre-wrap;background:#f8f8f8;border:1px solid #ddd;padding:.6rem}",
     "figure,table{page-break-inside:avoid}",
   ].join("");
 }
 
-/**
- * Ask the KI to MERGE the Base CSS with the user's style brief and return a FULL final stylesheet.
- * No deterministic rules; the KI must keep defaults unless explicitly changed by the brief.
- */
+/* ------------------------- Style extraction & merge ------------------------- */
+
+async function extractStyleBriefFromHistory(fullMessages, prompt) {
+  try {
+    const ctx = new Context();
+    await ctx.add(
+      "system",
+      "",
+      "You are a style-extraction assistant. Read the conversation (roles preserved) and the current request. " +
+      "Output a SHORT style brief (max 120 words) describing typography, colors (esp. headings), layout (columns), images, tables. " +
+      "If the current prompt gives explicit overrides, apply them but KEEP other prior preferences intact. Return only the brief."
+    );
+    const msgs = Array.isArray(fullMessages) ? fullMessages.slice(-40) : [];
+    for (const m of msgs) {
+      const content = String(m.content || "").slice(0, 2000);
+      await ctx.add(m.role || "user", m.name || "", content);
+    }
+    await ctx.add("user", "", `Current prompt:\n${String(prompt || "").slice(0, 1500)}`);
+    const brief = await getAI(ctx, 300, "gpt-4o-mini");
+    return String(brief || "").trim();
+  } catch (err) {
+    await reportError(err, null, "PDF_STYLE_EXTRACTION", "WARN");
+    return "";
+  }
+}
+
 async function mergeBaseCssWithBrief(baseCss, styleBrief) {
   const req = new Context();
   await req.add(
     "system",
     "",
     "You are a senior print/CSS designer. You will receive a STRONG DEFAULT CSS for an A4, magazine-like layout " +
-      "and a user style brief describing desired deviations. Your job: produce a SINGLE, FINAL CSS STYLESHEET " +
-      "that starts from the default and applies ONLY the changes explicitly requested by the brief. " +
-      "Keep everything else as in the default. Do NOT invent unrelated changes.\n\n" +
-      "HARD RULES:\n" +
-      "• Use ONLY element selectors (html, body, h1,h2,h3,p,ul,ol,li,table,thead,tbody,tr,th,td,blockquote,figure,figcaption,code,pre,img,hr).\n" +
-      "• No classes, no IDs, no @import, no url().\n" +
-      "• You MAY use @page and @media print.\n" +
-      "• The result must be COMPLETE (not a diff/patch), minified or compact OK, but human-readable is preferred.\n" +
-      "• Images must fit the page (img{max-width:100%;height:auto}) and avoid page-breaks inside figures.\n" +
-      "• Maintain modern magazine look and colored tables by default. Rounded corners for images by default.\n" +
-      "• Keep an inner text padding of 10mm on body unless the user explicitly asks to change it."
+    "and a user style brief describing desired deviations. Your job: produce a SINGLE, FINAL CSS STYLESHEET " +
+    "that starts from the default and applies ONLY the changes explicitly requested by the brief. " +
+    "Keep everything else as in the default. Do NOT invent unrelated changes.\n\n" +
+    "HARD RULES:\n" +
+    "• Use ONLY element selectors (html, body, h1,h2,h3,p,ul,ol,li,table,thead,tbody,tr,th,td,blockquote,figure,figcaption,code,pre,img,hr).\n" +
+    "• No classes, no IDs, no @import, no url().\n" +
+    "• You MAY use @page and @media print.\n" +
+    "• The result must be COMPLETE (not a diff/patch).\n" +
+    "• Images must fit the page; avoid page breaks in figures.\n" +
+    "• Maintain inner text padding of 10mm on body unless explicitly overridden."
   );
   await req.add("assistant", "", `### DEFAULT BASE CSS\n${baseCss}`);
-  await req.add(
-    "user",
-    "",
-    `User style brief (may be empty):\n${String(styleBrief || "").trim()}\n\nReturn the FINAL COMPLETE CSS only (no comments, no explanations).`
-  );
-
+  await req.add("user", "", `Style brief:\n${String(styleBrief || "").trim()}\n\nReturn the FINAL COMPLETE CSS only.`);
   const raw = await getAI(req, 1000, "gpt-4o-mini");
   return sanitizeCss(raw || "");
 }
 
-/** Generate final stylesheet purely via KI: Base → KI merges with brief → Final CSS. */
-async function generateStylesheet(styleBrief = "") {
+async function generateStylesheetFromHistory(fullMessages, prompt) {
   const baseCss = getBaseMagazineCss();
-  const finalCss = await mergeBaseCssWithBrief(baseCss, styleBrief);
-
-  // Minimal safety-net: if KI returned empty/too tiny CSS, fall back to base.
+  const brief = await extractStyleBriefFromHistory(fullMessages, prompt);
+  const finalCss = await mergeBaseCssWithBrief(baseCss, brief);
   const css = (finalCss && finalCss.length > 200) ? finalCss : baseCss;
 
-  // Cache by hash (optional; helpful if you expose themes)
   const hash = crypto.createHash("sha1").update(css).digest("hex").slice(0, 8);
   const documentsDir = path.join(__dirname, "documents");
   const cssDir = path.join(documentsDir, "css");
@@ -278,13 +253,11 @@ async function generateStylesheet(styleBrief = "") {
 function ensureAbsoluteUrl(urlPath) {
   const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/$/, "");
   if (/^https?:\/\//i.test(urlPath)) return urlPath;
-  if (base) {
-    return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
-  }
-  return urlPath; // relative fallback
+  if (base) return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
+  return urlPath;
 }
 
-/* ------------------------- Main Tool Entry ------------------------- */
+/* ------------------------- Main Entry ------------------------- */
 
 async function getPDF(toolFunction, context, getAIResponse) {
   let browser = null;
@@ -297,77 +270,66 @@ async function getPDF(toolFunction, context, getAIResponse) {
     const prompt = String(args.prompt || "").trim();
     const original_prompt = String(args.original_prompt || "").trim();
     const user_id = String(args.user_id || "").trim();
+    const modeRaw = String(args.mode || "").toLowerCase();
 
     if (!prompt || !original_prompt || !user_id) {
       return "[ERROR]: PDF_INPUT — Missing 'prompt', 'original_prompt' or 'user_id'.";
     }
+    const allowed = new Set(["verbatim","transform","from_scratch"]);
+    if (!allowed.has(modeRaw)) {
+      return "[ERROR]: PDF_INPUT — Missing or invalid 'mode' (expected verbatim|transform|from_scratch).";
+    }
+    const mode = modeRaw;
 
-    // Build stylesheet purely via KI (Base + Prompt merged into final CSS)
-    const { css } = await generateStylesheet(`${original_prompt}\n\n${prompt}`);
+    // 1) Stylesheet aus GANZEM Verlauf + Prompt
+    const fullMessages = Array.isArray(context?.messages) ? context.messages : [];
+    const { css } = await generateStylesheetFromHistory(fullMessages, `${original_prompt}\n\n${prompt}`);
 
-    // Strong output rules: no inline/class/id. NO content assumptions (any document).
+    // 2) Tools bereitstellen (ab erstem Turn)
+    let toolSpecs = [];
+    let toolRegistry = {};
+    if (process.env.PDF_DISABLE_TOOLS !== "1") {
+      const { getToolRegistry } = require("./tools.js");
+      const allowTools = ["getHistory","getWebpage","getImage","getGoogle","getYoutube","getLocation","getImageDescription"];
+      const reg = getToolRegistry(allowTools);
+      toolSpecs = reg.tools;
+      toolRegistry = reg.registry;
+    }
+
+    // 3) Generator-Kontext
     const generationContext = new Context(
       "You are a PDF generator that writes final, publish-ready HTML.",
       `### Output (STRICT):
 - Output VALID HTML **inside <body> only** (no <html>/<head> tags).
 - **NO inline styles, NO class=, NO id=** anywhere.
 - Use only semantic tags: h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, blockquote, figure, figcaption, img, hr, br, code, pre.
-- Do **not** include explanations or comments—only HTML.
-- Prefer rich, complete content (not just outlines).
+- Prefer rich, complete content (not outlines).
 
-### Continuation / Segments:
-- If long, write in natural segments without artificial endings.
-- Only append [FINISH] on a new line AFTER the last HTML tag when the document is fully complete.
+### Content Mode (provided by caller):
+- Mode: ${mode}.
+- If 'verbatim': include the identified text EXACTLY (unchanged).
+- If 'transform': apply the requested transformation to the identified source text, then include.
+- If 'from_scratch': write new content guided by the conversation’s preferences (typography/colors).
+
+### Data & Tools:
+- If the user asks to include existing summaries, call getHistory.
+- If the user asks for web content or images, call the appropriate tool(s).
+- Do not invent data that was requested from tools.
 
 ### Images:
-- Images are optional. If adding images, use <img src="{...}"> placeholders (no inline styles).
-- Each placeholder description MUST be richly detailed (≥ 6 words) and concrete (subject, setting, style, lighting, composition).
-- Avoid generic phrases like "image", "picture", "portrait", or "character portrait" without details.
-- Do not mix real URLs and curly-brace descriptions in a single src.
-- Figures should avoid page breaks; images must scale to fit.
-
-### Consistency:
-- Use only the most recent user prompt for intent.
-- Use prior context only if it contains directly relevant source material (quotes, data, prior chapter).`,
-      [],
-      {},
+- If using images, <img src="{...}"> placeholders only (no inline styles).
+- Placeholder descriptions must be concrete (≥ 6 words).
+- Figures should avoid page breaks; images must scale to fit.`,
+      toolSpecs,
+      toolRegistry,
       null,
       { skipInitialSummaries: true, persistToDB: false }
     );
 
-    const formattedContext = Array.isArray(context?.messages)
-      ? context.messages.map((m) => `${m.role.toUpperCase()}:\n${m.content}`).join("\n\n")
-      : "";
+    generationContext.messages = [...fullMessages];
+    await generationContext.add("user", "", `Original User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}\n\nRemember mode=${mode}.`);
 
-    await generationContext.add(
-      "user",
-      "",
-      `Original chat context (use only directly relevant material):\n\n${formattedContext}\n\nOriginal User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}`
-    );
-
-    // Tools: allow or disable via ENV
-    let toolSpecs = [];
-    let toolRegistry = {};
-    if (!DISABLE_TOOLS_FOR_PDF) {
-      const { getToolRegistry } = require("./tools.js");
-      const allowTools = [
-        "getWebpage",
-        "getImage",
-        "getGoogle",
-        "getYoutube",
-        "getLocation",
-        "getHistory",
-        "getImageDescription"
-      ];
-      const reg = getToolRegistry(allowTools);
-      toolSpecs = reg.tools;
-      toolRegistry = reg.registry;
-    }
-
-    // Ensure generationContext also carries tools (aiCore reads from context)
-    generationContext.tools = toolSpecs;
-    generationContext.toolRegistry = toolRegistry;
-
+    // 4) Segmente generieren
     let fullHTML = "";
     let persistentToolMessages = [];
     let segmentCount = 0;
@@ -382,9 +344,6 @@ async function getPDF(toolFunction, context, getAIResponse) {
         { skipInitialSummaries: true, persistToDB: false }
       );
       segmentCtx.messages = [...generationContext.messages];
-      // Redundant attach (some implementations read props directly)
-      segmentCtx.tools = toolSpecs;
-      segmentCtx.toolRegistry = toolRegistry;
 
       if (persistentToolMessages.length > 0) {
         const toolBlock = persistentToolMessages.map((m) => m.content).join("\n\n");
@@ -393,26 +352,9 @@ async function getPDF(toolFunction, context, getAIResponse) {
       if (segmentCount > 0) {
         await segmentCtx.add("assistant", "", "### Previously Generated HTML\n\n" + fullHTML);
       }
-      await segmentCtx.add(
-        "user",
-        "",
-        "Continue immediately after the last segment. Add only new FINAL HTML content. Maintain structure and detail. No inline styles, classes, or ids. Do not output templates or bracketed hints."
-      );
+      await segmentCtx.add("user", "", "Continue immediately after the last segment. Add only new FINAL HTML content. Maintain structure and detail. No inline styles, classes, or ids.");
 
-      // Call aiCore.getAIResponse: signature (context, tokenlimit, sequenceLimit, model, apiKey?, options?)
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
-
-      // Debug: if assistant made tool_calls, ensure we see tool replies in the segmentCtx
-      try {
-        const last = segmentCtx.messages[segmentCtx.messages.length - 1];
-        const toolCalls = Array.isArray(last?.tool_calls) ? last.tool_calls.map(t => t.id) : [];
-        if (toolCalls.length) {
-          console.log("[PDF][DEBUG] Assistant tool_calls:", toolCalls);
-          const replies = segmentCtx.messages.filter(m => m.role === "tool").map(m => m.tool_call_id);
-          console.log("[PDF][DEBUG] Tool replies in context:", replies);
-        }
-      } catch {}
-
       if (!segmentHTML || segmentHTML.length < 100) break;
 
       const newToolMsgs = segmentCtx.messages.filter((m) => m.role === "tool");
@@ -433,7 +375,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
       return "[ERROR]: PDF_EMPTY — No HTML content was generated.";
     }
 
-    // Replace image placeholders AFTER design sanitization (with prompt enhancement for weak descriptors)
+    // 5) Bilder ersetzen (falls generiert)
     const { html: htmlWithImages, imagelist } = await resolveImagePlaceholders(fullHTML);
 
     const styledHtml = `<!DOCTYPE html>
@@ -447,6 +389,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
 </body>
 </html>`;
 
+    // 6) Rendern
     const documentsDir = path.join(__dirname, "documents");
     await fs.mkdir(documentsDir, { recursive: true });
 
@@ -455,22 +398,16 @@ async function getPDF(toolFunction, context, getAIResponse) {
     const publicPath = `/documents/${filename}.pdf`;
     const pdfPath = path.join(documentsDir, `${filename}.pdf`);
 
-    let browserOpts = { headless: "new", args: ["--no-sandbox"] };
+    const browserOpts = { headless: "new", args: ["--no-sandbox"] };
     browser = await puppeteer.launch(browserOpts);
     const page = await browser.newPage();
     await page.setContent(styledHtml, { waitUntil: "load" });
-    await page.pdf({
-      path: pdfPath,
-      format: "A4",
-      printBackground: true
-    });
+    await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
 
     const publicUrl = ensureAbsoluteUrl(publicPath);
-
     const preview = getPlainFromHTML(htmlWithImages, 2000);
     const imagesNote = imagelist ? `\n\n### Images\n${imagelist}` : "";
 
-    // Angle brackets help some chat clients render the URL as clickable.
     return `${preview}\n\nPDF: ${publicUrl}\n<${publicUrl}>${imagesNote}`;
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");

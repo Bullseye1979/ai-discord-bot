@@ -1,4 +1,4 @@
-// tools.js — refactored v1.4 (structured getHistory + name normalization)
+// tools.js — refactored v1.5 (structured getHistory + name normalization + getPDF mode required)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -123,10 +123,10 @@ const tools = [
       description:
         "Query the channel’s history (read-only). Provide mariadb-compatible SQL *parts* only and NOT a full query. " +
         "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
-        "Allowed columns in summaries: timestamp, summary "+
-        "Allowed columns in context_log: timestamp, role, sender, content "+
-        "Required columns: timestamp always has to be included. "+
-        "The channel filter and ORDER BY timestamp are auto-injected. "+
+        "Allowed columns in summaries: timestamp, summary " +
+        "Allowed columns in context_log: timestamp, role, sender, content " +
+        "Required columns: timestamp always has to be included. " +
+        "The channel filter and ORDER BY timestamp are auto-injected. " +
         "Try to restrict the results as less as possible (all messages from a timeframe are better than missing something because of too restrictive WHERE clauses), noise is ok as the result is filtered by AI . Use search parameters that bring as much results as possible for a topic. Take care of different spellings, synonyms or even languages.",
       parameters: {
         type: "object",
@@ -134,11 +134,11 @@ const tools = [
           select: {
             type: "string",
             description:
-              "Columns/expressions to select, e.g. timestamp, role, sender, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format"+
+              "Columns/expressions to select, e.g. `timestamp, role, sender, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format " +
               "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
-              "Allowed columns in summaries: timestamp, summary "+
-              "Allowed columns in context_log: timestamp, role, sender, content "+
-              "Required columns: timestamp always has to be included. "
+              "Allowed columns in summaries: timestamp, summary " +
+              "Allowed columns in context_log: timestamp, role, sender, content " +
+              "Required columns: timestamp always has to be included."
           },
           from: {
             description:
@@ -162,7 +162,8 @@ const tools = [
           where: {
             type: "string",
             description:
-              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). Use mariadb-compatible syntax. Always just search for nouns, never for verbs or adjectives." +
+              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). Use mariadb-compatible syntax. " +
+              "Always just search for nouns, never for verbs or adjectives. " +
               "Examples: `timestamp >= :sinceTs AND role = 'user'`."
           },
           bindings: {
@@ -182,15 +183,24 @@ const tools = [
     type: "function",
     function: {
       name: "getPDF",
-      description: "Create a fully formatted PDF directly from the user's request. This must be the first and only tool call for PDF generation; it manages image generation and rendering internally.",
+      description:
+        "Create a fully formatted PDF directly from the user's request. " +
+        "This must be the first and only tool call for PDF generation; it manages image generation and rendering internally. " +
+        "The caller MUST decide the content assembly mode before calling this tool.",
       parameters: {
         type: "object",
         properties: {
           prompt: { type: "string", description: "Full instructions for the PDF." },
           original_prompt: { type: "string", description: "Original natural-language user request." },
-          user_id: { type: "string", description: "User ID or display name." }
+          user_id: { type: "string", description: "User ID or display name." },
+          mode: {
+            type: "string",
+            enum: ["verbatim", "transform", "from_scratch"],
+            description: "Content assembly mode decided BEFORE calling this tool"
+          },
+          note: { type: "string", description: "Optional rationale for audit/logging" }
         },
-        required: ["prompt", "original_prompt", "user_id"]
+        required: ["prompt", "original_prompt", "user_id", "mode"]
       }
     }
   }
