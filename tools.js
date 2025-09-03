@@ -1,4 +1,4 @@
-// tools.js — refactored v1.6 (structured getHistory + name normalization + simplified getPDF args)
+// tools.js — refactored v1.7 (structured getHistory + name normalization + getPDF requires CSS)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -179,24 +179,23 @@ const tools = [
     }
   },
 
-  // ==== Simplified getPDF: HTML + CSS in, PDF out ====
+  // ==== getPDF now REQUIRES a CSS stylesheet ====
   {
     type: "function",
     function: {
       name: "getPDF",
       description:
-        "Render a PDF from provided HTML and (optionally) a stylesheet. " +
-        "If a stylesheet already exists and nothing else is requested, use it unchanged.",
+        "Render a PDF from provided HTML and a stylesheet. Always include a full CSS stylesheet in the `css` parameter; do not rely on inline <style> tags.",
       parameters: {
         type: "object",
         properties: {
           html: { type: "string", description: "Full HTML body content. May contain full HTML; the renderer will extract <body> if present." },
-          css: { type: "string", description: "Optional stylesheet to apply. If omitted, a safe default will be used." },
+          css: { type: "string", description: "Required: Complete stylesheet to apply. Do not omit." },
           filename: { type: "string", description: "Optional filename without extension. Will be normalized." },
           title: { type: "string", description: "Optional <title> for the document head." },
           user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." }
         },
-        required: ["html"]
+        required: ["html", "css"]
       }
     }
   }
