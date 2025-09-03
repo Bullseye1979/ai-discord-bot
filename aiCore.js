@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.7
+// aiCore.js — refactored v2.8
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -6,6 +6,7 @@
 // v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
 // v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
 // v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
+// v2.8: Tool-call hardening: guaranteed tool replies + preflight ensureToolReplies to prevent 400s.
 
 require("dotenv").config();
 const fs = require("fs"); // (kept if you later want file-based priming again)
@@ -157,6 +158,44 @@ function loadEnvPriming() {
   return (process.env.STANDARDPRIMING || "").trim();
 }
 
+/* -------------------- Preflight: ensure all tool_calls have tool replies ----- */
+
+/**
+ * Insert auto tool replies for any assistant.tool_calls that don't have a matching tool message yet.
+ * This must run BEFORE building the payload for the next API call.
+ */
+function ensureToolReplies(messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const awaiting = new Set(m.tool_calls.map(tc => tc && tc.id).filter(Boolean));
+
+      // Walk forward to collect following tool messages until next assistant/user/system
+      for (let j = i + 1; j < messages.length; j++) {
+        const n = messages[j];
+        if (!n || n.role !== "tool") break;
+        if (n.tool_call_id && awaiting.has(n.tool_call_id)) {
+          awaiting.delete(n.tool_call_id);
+        }
+      }
+
+      if (awaiting.size > 0) {
+        // Inject minimal tool replies immediately after the assistant tool_calls message
+        let injectOffset = 1;
+        for (const missingId of awaiting) {
+          messages.splice(i + injectOffset, 0, {
+            role: "tool",
+            tool_call_id: missingId,
+            content: JSON.stringify({ error: "auto-injected tool reply due to missing response" })
+          });
+          injectOffset++;
+        }
+      }
+    }
+  }
+  return messages;
+}
+
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
  * @param {Context} context_orig          // persistent channel context (DB-backed)
@@ -241,6 +280,9 @@ async function getAIResponse(
     // Loop until tools are resolved and optional continue chain done
     let hasToolCalls = false;
     do {
+      // Preflight: ensure every assistant.tool_calls has a corresponding tool reply before new API call
+      ensureToolReplies(context.messages);
+
       // do not feed orphan historical tool messages to the API
       const safeMsgs = pruneOrphanToolMessages(context.messages);
 
@@ -306,6 +348,8 @@ async function getAIResponse(
           const fnName = toolCall?.function?.name;
           const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
 
+          let replied = false; // track response for this tool_call
+
           const replyTool = (content) => {
             const out =
               typeof content === "string" || content == null
@@ -318,6 +362,7 @@ async function getAIResponse(
               content: out,
             });
             toolCommits.push({ name: fnName || "tool", content: out });
+            replied = true;
           };
 
           if (!toolFunction) {
@@ -333,6 +378,11 @@ async function getAIResponse(
             const emsg = toolError?.message || String(toolError);
             await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
             replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
+          } finally {
+            // Ultimate safety: if something prevented a reply, inject one now
+            if (!replied) {
+              replyTool(JSON.stringify({ error: "tool execution aborted without reply", tool: fnName || "unknown" }));
+            }
           }
         }
       }
