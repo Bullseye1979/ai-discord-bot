@@ -1,9 +1,9 @@
-// pdf.js — v4.1
-// Mehrstufig, aber ohne Extra-Call für die Modusentscheidung:
-// -> Die aufrufende KI setzt 'mode' bereits im getPDF-Tool-Call.
-// Hauptkontext (rollengetreu) dient als Design- & Inhaltsquelle.
-// CSS via KI-Merge (Base + Brief aus History+Prompt). Keine Inline-Styles/IDs/Klassen.
-// A4, 1cm Innenabstand. Tools ab erstem Turn aktiv. Bild-Platzhalter {…} werden bei Bedarf befüllt.
+// pdf.js — v4.2 (SAFE tool-output handling)
+// - Kein JSON.parse auf Tool-Outputs (alles als Text weitergereicht)
+// - mode ist required (verbatim | transform | from_scratch)
+// - Stylesheet via KI (Base + Brief aus History+Prompt); keine inline styles / class / id
+// - A4, 1cm Innenabstand; 2-Spalten-Layout default (durch CSS)
+// - Bild-Platzhalter {…} werden bei Bedarf mit KI-Bildern ersetzt
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -288,7 +288,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
     // 2) Tools bereitstellen (ab erstem Turn)
     let toolSpecs = [];
     let toolRegistry = {};
-    if (process.env.PDF_DISABLE_TOOLS !== "1") {
+    if (!DISABLE_TOOLS_FOR_PDF) {
       const { getToolRegistry } = require("./tools.js");
       const allowTools = ["getHistory","getWebpage","getImage","getGoogle","getYoutube","getLocation","getImageDescription"];
       const reg = getToolRegistry(allowTools);
@@ -329,7 +329,7 @@ async function getPDF(toolFunction, context, getAIResponse) {
     generationContext.messages = [...fullMessages];
     await generationContext.add("user", "", `Original User Prompt:\n${original_prompt}\n\nSpecific instructions:\n${prompt}\n\nRemember mode=${mode}.`);
 
-    // 4) Segmente generieren
+    // 4) Segmente generieren (Tool-Outputs nur als Text puffern, KEIN JSON.parse)
     let fullHTML = "";
     let persistentToolMessages = [];
     let segmentCount = 0;
@@ -345,22 +345,33 @@ async function getPDF(toolFunction, context, getAIResponse) {
       );
       segmentCtx.messages = [...generationContext.messages];
 
+      // bereits bekannte Tool-Ergebnisse bereitstellen (als reiner Text)
       if (persistentToolMessages.length > 0) {
-        const toolBlock = persistentToolMessages.map((m) => m.content).join("\n\n");
+        const toolBlock = persistentToolMessages.map((m) => String(m.content ?? "")).join("\n\n");
         await segmentCtx.add("assistant", "", "### Tool Results (context)\n\n" + toolBlock);
       }
       if (segmentCount > 0) {
         await segmentCtx.add("assistant", "", "### Previously Generated HTML\n\n" + fullHTML);
       }
-      await segmentCtx.add("user", "", "Continue immediately after the last segment. Add only new FINAL HTML content. Maintain structure and detail. No inline styles, classes, or ids.");
+      await segmentCtx.add(
+        "user",
+        "",
+        "Continue immediately after the last segment. Add only new FINAL HTML content. Maintain structure and detail. No inline styles, classes, or ids."
+      );
 
       const segmentHTML = await getAIResponse(segmentCtx, 700, 1, "gpt-4o");
       if (!segmentHTML || segmentHTML.length < 100) break;
 
+      // NEU: Tool-Messages nur TEXTUELL übernehmen (kein JSON.parse)
       const newToolMsgs = segmentCtx.messages.filter((m) => m.role === "tool");
       for (const msg of newToolMsgs) {
-        if (!persistentToolMessages.find((m) => m.tool_call_id === msg.tool_call_id)) {
-          persistentToolMessages.push(msg);
+        const already = persistentToolMessages.find((m) => m.tool_call_id === msg.tool_call_id);
+        if (!already) {
+          persistentToolMessages.push({
+            role: "tool",
+            tool_call_id: msg.tool_call_id,
+            content: String(msg.content ?? "")
+          });
         }
       }
 
