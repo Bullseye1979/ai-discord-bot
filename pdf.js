@@ -348,7 +348,7 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
       pdf: publicPdf,
       html: publicHtml,
       css: cssFinal,
-      text: plainText,
+      text: bodyHtml,
       filename: baseName
     });
   } catch (err) {
