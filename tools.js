@@ -185,7 +185,7 @@ const tools = [
     function: {
       name: "getPDF",
       description:
-        "Render a PDF from provided HTML and optional CSS. " +
+        "Render a PDF from provided HTML and CSS. " +
         "The CSS defines the design of the PDF. If you do not provide CSS a default style is used." +
         "Ensure that everything is correctly escaped for JSON",
       parameters: {
@@ -197,7 +197,7 @@ const tools = [
           },
           css: {
             type: "string",
-            description: "Optional stylesheet. If omitted, a safe default plus enforced print rules will be applied."
+            description: "Required stylesheet."
           },
           filename: {
             type: "string",
