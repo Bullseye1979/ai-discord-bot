@@ -132,6 +132,7 @@ const TOOL_PERSIST_ROLE =
 
 const MAX_TOOL_PERSIST_CHARS = Math.max(
   500,
+  10000,
   Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 3000))
 );
 
@@ -284,6 +285,24 @@ async function getAIResponse(
       const configured = (process.env.OPENAI_API_URL || OPENAI_API_URL || "").trim();
       const endpoint = normalizeEndpoint(configured) || "https://api.openai.com/v1/chat/completions";
 
+      // === DEBUG SNAPSHOT (wird nur im Fehlerfall ausgegeben) ===
+      const __REQUEST_DEBUG_SNAPSHOT = {
+        endpoint,
+        model,
+        tokenlimit,
+        sequenceCounter,
+        payloadPreview: {
+          messages: messagesToSend,
+          // Tools nur mit Namen (keine riesigen Strukturen)
+          tools: Array.isArray(context.tools)
+            ? context.tools.map(t => (t?.function?.name || t?.name || "unknown"))
+            : [],
+        },
+        contextMessages: context.messages,
+        handoverMessages: handoverContext.messages,
+      };
+      // === /DEBUG SNAPSHOT ===
+
       // API Call (with retry)
       let aiResponse;
       try {
@@ -299,7 +318,15 @@ async function getAIResponse(
           data: err?.response?.data,
         };
         await reportError(err, null, "OPENAI_CHAT", { details });
-        console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n"+context.messages+"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");;
+
+        // ---------------- DEBUG: Kontext & Payload vollständig als JSON ----------------
+        try {
+          console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify(__REQUEST_DEBUG_SNAPSHOT, null, 2));
+        } catch {}
+        // --------------------------------------------------------------------------------
+
+        // (Alt) Rohdump, falls du ihn weiterhin sehen willst:
+        console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n" + context.messages + "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
         throw err;
       }
 
@@ -428,7 +455,25 @@ async function getAIResponse(
       data: err?.response?.data,
     };
     await reportError(err, null, "GET_AI_RESPONSE", { details });
-    console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n"+context+"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
+
+    // ---------------- DEBUG: kompletter Kontext im Fehlerfall ----------------
+    try {
+      console.error(
+        "[GET_AI_RESPONSE][CONTEXT_DEBUG]",
+        JSON.stringify(
+          {
+            contextMessages: context?.messages || [],
+            handoverMessages: handoverContext?.messages || [],
+          },
+          null,
+          2
+        )
+      );
+    } catch {}
+    // ------------------------------------------------------------------------
+
+    // (Alt) Rohdump, falls du ihn weiterhin sehen willst:
+    console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n" + context + "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
 
     throw err;
   }
