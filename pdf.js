@@ -1,8 +1,8 @@
-// pdf.js — stable v4.6
-// Render provided HTML (+ optional CSS) into a PDF AND save a same-named .html file.
-// Returns absolute links to PDF and HTML + final CSS + plain text (no HTML).
-// Enforces non-overridable print rules: A4, 20mm page margin, 10mm inner padding, avoid split of tables/figures/etc.
-// Robust args parsing: accepts object, JSON string, or fenced blocks (```html / ```css). Adds debug logs.
+// pdf.js — stable v4.3 (tolerant args + dual save HTML/PDF + enforced print rules)
+// - Robust args parsing (JSON, fenced ```json, ```html/```css, full <html>…, or body-only HTML)
+// - Saves a same-named .html next to the .pdf
+// - Returns JSON string: { ok, pdf, html, css, text, filename }  (absolute URLs for pdf/html)
+// - Enforces non-overridable print rules via last-in-cascade !important CSS
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -32,7 +32,7 @@ function ensureAbsoluteUrl(urlPath) {
   return urlPath; // relative fallback
 }
 
-/** Extract body innerHTML if a full HTML document was supplied. */
+/** Extract innerHTML from <body> if full doc is supplied; else return as-is. */
 function extractBody(html) {
   const s = String(html || "");
   const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
@@ -40,7 +40,7 @@ function extractBody(html) {
   return s;
 }
 
-/** Enforced CSS that cannot be overridden (element selectors + !important, last in cascade). */
+/** Enforced CSS (last in cascade, !important) to lock down print layout. */
 function enforcedCss() {
   return [
     // Page & margins (A4 + outer 20mm)
@@ -49,7 +49,7 @@ function enforcedCss() {
     // Inner text padding 10mm
     "body{padding:10mm !important}",
     // Avoid splitting key elements across pages
-    "table, thead, tbody, tr, th, td, figure, img, pre, blockquote, .box, .card{page-break-inside:avoid !important; break-inside:avoid !important}",
+    "table, thead, tbody, tr, th, td, figure, img, pre, blockquote{page-break-inside:avoid !important; break-inside:avoid !important}",
     "h1,h2,h3{break-after:avoid !important; page-break-after:auto !important}",
     // Image fit
     "img{max-width:100% !important; height:auto !important; display:block !important}",
@@ -58,10 +58,9 @@ function enforcedCss() {
 
 /** Wrap body HTML + CSS into a printable full HTML document. */
 function buildPrintableHtml(bodyHtml, userCss = "", title = "Document") {
-  // User CSS first, enforced CSS last (with !important) so es gewinnt die Kaskade.
   const cssFinal = `${String(userCss || "")}\n${enforcedCss()}`;
   const safeTitle = String(title || "Document").slice(0, 140);
-  const fullHtml = `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -74,81 +73,122 @@ function buildPrintableHtml(bodyHtml, userCss = "", title = "Document") {
 ${bodyHtml || ""}
 </body>
 </html>`;
-  return { fullHtml, cssFinal };
+  return { html, cssFinal };
 }
 
-/* ------------------------- Argument Parsing ------------------------- */
-
-/** Trim code fences from a block. */
-function stripFences(s) {
-  if (typeof s !== "string") return s;
-  let t = s.trim();
-  // remove generic ```
-  if (/^```/.test(t)) {
-    t = t.replace(/^```(?:html|css|md|json)?\s*/i, "").replace(/```$/i, "");
-  }
-  return t.trim();
-}
-
-/** Extract fenced blocks for html/css if present */
-function parseFencedBlocks(raw) {
-  const str = String(raw || "");
-  const htmlMatch = str.match(/```html([\s\S]*?)```/i);
-  const cssMatch  = str.match(/```css([\s\S]*?)```/i);
-
-  const html = htmlMatch ? stripFences(htmlMatch[0].replace(/^```html/i, "```")) : null;
-  const css  = cssMatch  ? stripFences(cssMatch[0].replace(/^```css/i,  "```")) : null;
-
-  return { html, css };
-}
-
-/** Try to parse arguments: object → ok; JSON string → ok; fenced blocks → ok; else raw string treated as HTML. */
+/* ---------------------- Ultra-tolerant args parsing ---------------------- */
+/**
+ * Tolerant parser for getPDF tool arguments.
+ * Accepts:
+ *  - real JSON object, JSON string, fenced ```json,
+ *  - fenced ```html / ```css blocks,
+ *  - full <html>…</html> with optional <style>…</style>,
+ *  - body-only HTML (with optional inline <style> blocks).
+ */
 function safeParseToolArgs(toolFunction) {
   const raw = toolFunction?.arguments;
 
-  // Debug dump
-  try {
-    console.log("[PDF_ARGS_PARSE][raw typeof]", typeof raw);
-    if (typeof raw === "string") {
-      console.log("[PDF_ARGS_PARSE][raw len]", raw.length);
-      console.log("[PDF_ARGS_PARSE][raw preview]", raw.slice(0, 300));
-    } else {
-      console.log("[PDF_ARGS_PARSE][raw object keys]", raw && Object.keys(raw));
-    }
-  } catch {}
-
-  if (!raw) return {};
-
-  // If already object, use directly
-  if (typeof raw === "object") return raw;
-
-  // If string: first try strict JSON
-  if (typeof raw === "string") {
-    try {
-      const obj = JSON.parse(raw);
-      return obj && typeof obj === "object" ? obj : {};
-    } catch (e1) {
-      try { console.log("[PDF_DEBUG] ARGS strict JSON failed:", e1.message); } catch {}
-      // Try fenced blocks
-      const { html, css } = parseFencedBlocks(raw);
-      if (html || css) {
-        return { html: html || "", css: css || "" };
-      }
-
-      // Try strip ```json fences and parse
-      const s2 = raw.replace(/^```(?:json|md)?\s*/i, "").replace(/```$/i, "");
-      try {
-        const obj2 = JSON.parse(s2);
-        return obj2 && typeof obj2 === "object" ? obj2 : {};
-      } catch (e2) {
-        try { console.log("[PDF_DEBUG] ARGS fenced JSON failed:", e2.message); } catch {}
-        // Last resort: treat the entire string as HTML
-        return { html: raw, css: "" };
-      }
-    }
+  // direct object case
+  if (raw && typeof raw === "object") {
+    return {
+      html: String(raw.html || ""),
+      css: String(raw.css || ""),
+      title: raw.title ? String(raw.title) : "",
+      filename: raw.filename ? String(raw.filename) : "",
+      user_id: raw.user_id ? String(raw.user_id) : "",
+    };
   }
 
-  return {};
+  if (typeof raw !== "string") return {};
+
+  const logPreview = (s, n = 2200) => s.slice(0, n);
+  try { console.log("[PDF_ARGS_PARSE][raw typeof]", typeof raw); } catch {}
+  try { console.log("[PDF_ARGS_PARSE][raw len]", raw.length); } catch {}
+  try { console.log("[PDF_ARGS_PARSE][raw preview]", logPreview(raw)); } catch {}
+
+  const str = raw.trim();
+
+  // 1) strict JSON
+  try {
+    const obj = JSON.parse(str);
+    return {
+      html: String(obj.html || ""),
+      css: String(obj.css || ""),
+      title: obj.title ? String(obj.title) : "",
+      filename: obj.filename ? String(obj.filename) : "",
+      user_id: obj.user_id ? String(obj.user_id) : "",
+    };
+  } catch (e) {
+    try { console.log("[PDF_DEBUG] ARGS strict JSON failed:", e.message || String(e)); } catch {}
+  }
+
+  // 2) fenced ```json
+  try {
+    const s2 = str.replace(/^```(?:json|md)?\s*/i, "").replace(/```$/i, "");
+    const obj = JSON.parse(s2);
+    return {
+      html: String(obj.html || ""),
+      css: String(obj.css || ""),
+      title: obj.title ? String(obj.title) : "",
+      filename: obj.filename ? String(obj.filename) : "",
+      user_id: obj.user_id ? String(obj.user_id) : "",
+    };
+  } catch (e) {
+    try { console.log("[PDF_DEBUG] ARGS fenced JSON failed:", e.message || String(e)); } catch {}
+  }
+
+  // Helper: extract fenced blocks by language
+  const extractFence = (all, lang) => {
+    const re = new RegExp("```" + lang + "\\s*([\\s\\S]*?)```", "i");
+    const m = all.match(re);
+    return m ? m[1].trim() : "";
+  };
+
+  // 3) ```html and/or ```css blocks
+  const fencedHtml = extractFence(str, "html");
+  const fencedCss  = extractFence(str, "css");
+
+  if (fencedHtml || fencedCss) {
+    let html = fencedHtml || "";
+    let css  = fencedCss || "";
+
+    // if no fenced html but string still contains <html>…</html>, try to pull it
+    if (!html) {
+      const m = str.match(/<html[^>]*>[\s\S]*?<\/html>/i);
+      if (m) html = m[0];
+    }
+    // also pull <style>…</style> from html if css empty
+    if (!css && html) {
+      const styleBlocks = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(x => x[1].trim());
+      if (styleBlocks.length) css = styleBlocks.join("\n\n");
+    }
+
+    // remove inline style blocks from html (stylesheet kommt separat)
+    if (html) html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+
+    return { html: html.trim(), css: String(css || "").trim(), title: "", filename: "", user_id: "" };
+  }
+
+  // 4) Raw HTML document <html>…</html>
+  const htmlDocMatch = str.match(/<html[^>]*>[\s\S]*?<\/html>/i);
+  if (htmlDocMatch) {
+    let html = htmlDocMatch[0];
+    const styleBlocks = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(x => x[1].trim());
+    const css = styleBlocks.length ? styleBlocks.join("\n\n") : "";
+    html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+    return { html: html.trim(), css: css.trim(), title: "", filename: "", user_id: "" };
+  }
+
+  // 5) Body-only fallback: has HTML tags?
+  if (/[<][a-z][\s>]/i.test(str)) {
+    const styleBlocks = [...str.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(x => x[1].trim());
+    const css = styleBlocks.length ? styleBlocks.join("\n\n") : "";
+    const html = str.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+    return { html: html.trim(), css: css.trim(), title: "", filename: "", user_id: "" };
+  }
+
+  // 6) Last resort: treat as plain text/HTML body string
+  return { html: str, css: "", title: "", filename: "", user_id: "" };
 }
 
 /* ------------------------- Main Tool Entry ------------------------- */
@@ -162,22 +202,30 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
       args = safeParseToolArgs(toolFunction);
     } catch (e) {
       await reportError(e, null, "PDF_ARGS_PARSE");
+      // Also log a minimal debug line for quicker triage
+      try {
+        const raw = toolFunction?.arguments;
+        console.log("[PDF_ARGS_PARSE][raw typeof]", typeof raw);
+        if (typeof raw === "string") {
+          console.log("[PDF_ARGS_PARSE][raw len]", raw.length);
+          console.log("[PDF_ARGS_PARSE][raw preview]", raw.slice(0, 1800));
+        }
+      } catch {}
       throw e;
     }
 
     const htmlIn = String(args.html || "").trim();
-    const cssIn  = String(args.css  || "");
-    const title  = String(args.title || "");
+    const cssIn = String(args.css || ""); // required by tools spec now, aber wir tolerieren leer
+    const title = String(args.title || "");
     const filenameArg = String(args.filename || "");
-    const userId = String(args.user_id || ""); // optional
 
     if (!htmlIn) {
-      return "[ERROR]: PDF_INPUT — Missing 'html' content.";
+      return JSON.stringify({ ok: false, error: "PDF_INPUT — Missing 'html' content." });
     }
 
     // Prepare content
     const bodyHtml = extractBody(htmlIn);
-    const { fullHtml, cssFinal } = buildPrintableHtml(bodyHtml, cssIn, title || "Document");
+    const { html: fullHtml, cssFinal } = buildPrintableHtml(bodyHtml, cssIn, title || "Document");
 
     // Paths
     const documentsDir = path.join(__dirname, "documents");
@@ -185,10 +233,10 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
 
     const filename = normalizeFilename(filenameArg, "");
     const baseName = filename || normalizeFilename(title, "") || normalizeFilename("document");
-    const pdfPath  = path.join(documentsDir, `${baseName}.pdf`);
+    const pdfPath = path.join(documentsDir, `${baseName}.pdf`);
     const htmlPath = path.join(documentsDir, `${baseName}.html`);
 
-    // Write standalone HTML file (for direct viewing)
+    // Write standalone HTML file
     await fs.writeFile(htmlPath, fullHtml, "utf8");
 
     // Render PDF with Puppeteer
@@ -196,38 +244,36 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
 
-    // Load our local HTML and wait for network for images
+    // Load our local HTML; wait for images/resources (helps image reliability)
     await page.setContent(fullHtml, { waitUntil: "networkidle0", timeout: 120000 });
 
     await page.pdf({
       path: pdfPath,
       format: "A4",
       printBackground: true,
-      // We enforce margins via @page; use zero here to avoid double margins.
+      // margins 0 here because @page margin is already enforced in CSS
       margin: { top: "0", right: "0", bottom: "0", left: "0" },
     });
 
-    const publicPdf  = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
+    // Public URLs
+    const publicPdf = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
     const publicHtml = ensureAbsoluteUrl(`/documents/${path.basename(htmlPath)}`);
 
-    // Build a clean text preview from the BODY content (for the return payload)
-    const plainText = getPlainFromHTML(bodyHtml, 20000); // großzügig, du filterst später
+    // Clean text preview from BODY content (full text, no html)
+    const plainText = getPlainFromHTML(bodyHtml, 200000); // generous
 
-    // Return the 4 gewünschten Felder als gut verwertbarer Plaintext-Block:
-    // (Keine JSON-Zwänge; leicht im Bot zu parsen)
-    return [
-      `PDF: ${publicPdf}`,
-      `HTML: ${publicHtml}`,
-      "CSS:",
-      "```css",
-      cssFinal,
-      "```",
-      "TEXT:",
-      plainText
-    ].join("\n");
+    // Return structured JSON (string)
+    return JSON.stringify({
+      ok: true,
+      pdf: publicPdf,
+      html: publicHtml,
+      css: cssFinal,
+      text: plainText,
+      filename: baseName
+    });
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
-    return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF/HTML.";
+    return JSON.stringify({ ok: false, error: "PDF_UNEXPECTED — Could not generate PDF/HTML." });
   } finally {
     try { await browser?.close(); } catch {}
   }
