@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.9
+// aiCore.js — refactored v2.8 (hardened)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -6,11 +6,14 @@
 // v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
 // v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
 // v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
-// v2.8: Tool-call hardening: preflight ensureToolReplies to prevent 400s.
-// v2.9: Strong ordering & dual-context updates: assistant(tool_calls) + tool replies are pushed to BOTH contexts immediately.
+// v2.8: Hardened tool_call flow:
+//   - Never push empty tool_calls arrays into context
+//   - Only iterate when toolCalls.length > 0
+//   - Strict pairing: every assistant.tool_calls is immediately followed by matching tool messages
+//   - Safer payload mapping (omit empty/null fields), extra guards
 
 require("dotenv").config();
-const fs = require("fs");
+const fs = require("fs"); // retained for potential future file-priming
 const path = require("path");
 const axios = require("axios");
 const http = require("http");
@@ -63,6 +66,10 @@ const axiosAI = axios.create({
   validateStatus: (s) => s >= 200 && s < 300,
 });
 
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function postWithRetry(url, payload, headers, tries = 3) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
@@ -80,7 +87,7 @@ async function postWithRetry(url, payload, headers, tries = 3) {
         msg.includes("ERR_STREAM_PREMATURE_CLOSE");
 
       if (!transient || i === tries - 1) throw err;
-      await new Promise((r) => setTimeout(r, 300 * Math.pow(2, i))); // 300, 600, 1200 ms
+      await sleep(300 * Math.pow(2, i)); // 300ms, 600ms, 1200ms
     }
   }
   throw lastErr;
@@ -120,9 +127,8 @@ function pruneOrphanToolMessages(msgs) {
 
 /* -------------------- Tool result persistence as assistant/system -------------------- */
 
-const TOOL_PERSIST_ROLE = (process.env.TOOL_PERSIST_ROLE || "assistant").toLowerCase() === "system"
-  ? "system"
-  : "assistant";
+const TOOL_PERSIST_ROLE =
+  (process.env.TOOL_PERSIST_ROLE || "assistant").toLowerCase() === "system" ? "system" : "assistant";
 
 const MAX_TOOL_PERSIST_CHARS = Math.max(
   500,
@@ -132,18 +138,22 @@ const MAX_TOOL_PERSIST_CHARS = Math.max(
 /** Produce a compact, parseable wrapper for tool results */
 function formatToolResultForPersistence(toolName, content) {
   const header = `[TOOL_RESULT:${(toolName || "unknown").trim()}]`;
+  // ensure the payload is a string (raw JSON or text)
   let payloadStr;
   if (typeof content === "string") {
     payloadStr = content;
   } else {
-    try { payloadStr = JSON.stringify(content); } catch { payloadStr = String(content); }
+    try {
+      payloadStr = JSON.stringify(content);
+    } catch {
+      payloadStr = String(content);
+    }
   }
 
   const looksJSON = /^\s*[\[{]/.test((payloadStr || "").trim());
-  let body = looksJSON
-    ? `${header}\n${payloadStr}`
-    : `${header}\n\`\`\`\n${payloadStr}\n\`\`\``;
+  let body = looksJSON ? `${header}\n${payloadStr}` : `${header}\n\`\`\`\n${payloadStr}\n\`\`\``;
 
+  // Hard cap to avoid giant blobs (e.g., long PDF text)
   if (body.length > MAX_TOOL_PERSIST_CHARS) {
     const tail = "\n…[truncated]";
     body = body.slice(0, MAX_TOOL_PERSIST_CHARS - tail.length) + tail;
@@ -155,44 +165,6 @@ function formatToolResultForPersistence(toolName, content) {
 
 function loadEnvPriming() {
   return (process.env.STANDARDPRIMING || "").trim();
-}
-
-/* -------------------- Preflight: ensure all tool_calls have tool replies ----- */
-
-/**
- * Insert auto tool replies for any assistant.tool_calls that don't have a matching tool message yet.
- * This must run BEFORE building the payload for the next API call.
- */
-function ensureToolReplies(messages) {
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-      const awaiting = new Set(m.tool_calls.map(tc => tc && tc.id).filter(Boolean));
-
-      // Walk forward to collect following tool messages until next assistant/user/system
-      for (let j = i + 1; j < messages.length; j++) {
-        const n = messages[j];
-        if (!n || n.role !== "tool") break;
-        if (n.tool_call_id && awaiting.has(n.tool_call_id)) {
-          awaiting.delete(n.tool_call_id);
-        }
-      }
-
-      if (awaiting.size > 0) {
-        // Inject minimal tool replies immediately after the assistant tool_calls message
-        let injectOffset = 1;
-        for (const missingId of awaiting) {
-          messages.splice(i + injectOffset, 0, {
-            role: "tool",
-            tool_call_id: missingId,
-            content: JSON.stringify({ error: "auto-injected tool reply due to missing response" })
-          });
-          injectOffset++;
-        }
-      }
-    }
-  }
-  return messages;
 }
 
 /**
@@ -252,7 +224,9 @@ async function getAIResponse(
       if (sysCombined) {
         context.messages.unshift({ role: "system", content: sysCombined });
       }
-    } catch {}
+    } catch {
+      // ignore priming errors
+    }
 
     // Time hint (separate system line)
     const nowUtc = new Date().toISOString();
@@ -277,19 +251,23 @@ async function getAIResponse(
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
     // Loop until tools are resolved and optional continue chain done
-    let hasToolCalls = false;
+    let hadToolCallsThisTurn = false;
     do {
-      // Preflight: ensure every assistant.tool_calls has a corresponding tool reply before new API call
-      ensureToolReplies(context.messages);
+      hadToolCallsThisTurn = false;
 
       // do not feed orphan historical tool messages to the API
       const safeMsgs = pruneOrphanToolMessages(context.messages);
 
+      // Map messages for API; omit empty name/tool_calls/tool_call_id
       const messagesToSend = safeMsgs.map((m) => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
         if (safeName) out.name = safeName;
-        if (m.tool_calls) out.tool_calls = m.tool_calls;
+
+        if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+          // pass through tool_calls only if non-empty
+          out.tool_calls = m.tool_calls;
+        }
         if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
         return out;
       });
@@ -324,77 +302,85 @@ async function getAIResponse(
         throw err;
       }
 
-      const choice = aiResponse.data.choices[0];
-      const aiMessage = choice.message;
+      const choice = aiResponse?.data?.choices?.[0] || {};
+      const aiMessage = choice.message || {};
       const finishReason = choice.finish_reason;
 
-      const toolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : null;
+      const toolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
+      const hasToolCalls = toolCalls.length > 0;
 
-      if (toolCalls && toolCalls.length > 0) {
-        // 1) Assistant(tool_calls) SOFORT in beide Kontexte (damit Reihenfolge & Sichtbarkeit stimmen)
-        const assistantToolCallMsg = { role: "assistant", tool_calls: toolCalls };
-        context.messages.push(assistantToolCallMsg);
-        handoverContext.messages.push(assistantToolCallMsg);
+      // Only push assistant tool_calls if NON-EMPTY
+      if (hasToolCalls) {
+        context.messages.push({
+          role: "assistant",
+          tool_calls: toolCalls,
+        });
+      }
 
-        // 2) Jeden Tool-Call ausführen und JEWEILS direkt die tool-Antwort pushen
+      // Append any assistant content to the aggregated response buffer
+      if (typeof aiMessage.content === "string" && aiMessage.content.trim()) {
+        responseMessage += aiMessage.content.trim();
+      }
+
+      // Tool execution (strict pairing)
+      if (hasToolCalls) {
+        hadToolCallsThisTurn = true;
+
         for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
           const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
 
-          let toolReplyContent = "";
+          const replyTool = (content) => {
+            const out =
+              typeof content === "string" || content == null
+                ? content || ""
+                : (() => {
+                    try {
+                      return JSON.stringify(content);
+                    } catch {
+                      return String(content);
+                    }
+                  })();
+
+            context.messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: out,
+            });
+            toolCommits.push({ name: fnName || "tool", content: out });
+          };
+
+          if (!toolFunction || !toolCall?.function) {
+            replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available or arguments invalid.`);
+            continue;
+          }
 
           try {
-            if (!toolFunction) {
-              toolReplyContent = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
-            } else {
-              const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-              const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
-              toolReplyContent = toolResult || "";
-            }
+            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
+            replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
             await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
-            toolReplyContent = JSON.stringify({ error: emsg, tool: fnName || "unknown" });
-          } finally {
-            // Immer eine tool-Antwort in BEIDE Kontexte
-            const contentStr =
-              (typeof toolReplyContent === "string")
-                ? toolReplyContent
-                : (() => { try { return JSON.stringify(toolReplyContent); } catch { return String(toolReplyContent); } })();
-
-            const toolMsg = { role: "tool", tool_call_id: toolCall.id, content: contentStr };
-            context.messages.push(toolMsg);
-            handoverContext.messages.push(toolMsg);
-
-            // Für spätere Persistenz vormerken
-            toolCommits.push({ name: fnName || "tool", content: contentStr });
+            replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
           }
         }
-
-        hasToolCalls = true; // es folgt typischerweise eine weitere API-Runde
-      } else {
-        // Keine tool_calls → normalen Content in den Arbeitskontext übernehmen
-        if (aiMessage.content) {
-          const text = (aiMessage.content || "").trim();
-          if (text) {
-            context.messages.push({ role: "assistant", content: text });
-            // handoverContext NICHT doppeln – er spiegelt den Zustand vor Tool-Ausführung wider
-          }
-        }
-        hasToolCalls = false;
       }
 
       sequenceCounter++;
 
-      const dueToLength = !toolCalls && finishReason === "length";
+      // Auto-continue only if cut for length and within sequenceLimit
+      const dueToLength = !hasToolCalls && finishReason === "length";
 
       if (sequenceLimit <= 1) {
         continueResponse = false;
       } else if (dueToLength) {
         if (sequenceCounter < sequenceLimit) {
-          if ((aiMessage.content || "").trim()) {
-            context.messages.push({ role: "assistant", content: (aiMessage.content || "").trim() });
+          // If we have content, commit it as assistant content for the next turn
+          if (typeof aiMessage.content === "string" && aiMessage.content.trim()) {
+            context.messages.push({ role: "assistant", content: aiMessage.content.trim() });
           }
+          // Ask the model to continue
           context.messages.push({ role: "user", content: "continue" });
           continueResponse = true;
         } else {
@@ -403,7 +389,7 @@ async function getAIResponse(
       } else {
         continueResponse = false;
       }
-    } while (hasToolCalls || continueResponse);
+    } while (hadToolCallsThisTurn || continueResponse);
 
     // === Post-commit to the persistent context in correct temporal order ===
     // 1) Commit pending user with original timestamp
@@ -415,7 +401,9 @@ async function getAIResponse(
           pendingUser.content,
           pendingUser.timestamp || Date.now()
         );
-      } catch {}
+      } catch {
+        // ignore persistence errors to keep the chat responsive
+      }
     }
     // 2) Commit tool outputs right after, anchored to original time (+1ms each), as assistant/system
     if (pendingUser && toolCommits.length > 0) {
@@ -426,11 +414,12 @@ async function getAIResponse(
         const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined; // name ignored for system
         try {
           await context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, t0 + i + 1);
-        } catch {}
+        } catch {
+          // ignore persistence errors
+        }
       }
     }
 
-    // Return assistant text (if any) for the outer caller
     return responseMessage;
   } catch (err) {
     const details = {
