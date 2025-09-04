@@ -186,7 +186,7 @@ const tools = [
       name: "getPDF",
       description:
         "Render a PDF from provided HTML and optional CSS. " +
-        "If you want custom styling, also provide a full CSS stylesheet in the `css` field. " +
+        "The CSS defines the design of the PDF. If you do not provide CSS a default style is used." +
         "Ensure that everything is correctly escaped for JSON",
       parameters: {
         type: "object",
