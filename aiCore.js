@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.8
+// aiCore.js — refactored v2.9
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -6,10 +6,11 @@
 // v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
 // v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
 // v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
-// v2.8: Tool-call hardening: guaranteed tool replies + preflight ensureToolReplies to prevent 400s.
+// v2.8: Tool-call hardening: preflight ensureToolReplies to prevent 400s.
+// v2.9: Strong ordering & dual-context updates: assistant(tool_calls) + tool replies are pushed to BOTH contexts immediately.
 
 require("dotenv").config();
-const fs = require("fs"); // (kept if you later want file-based priming again)
+const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const http = require("http");
@@ -79,7 +80,7 @@ async function postWithRetry(url, payload, headers, tries = 3) {
         msg.includes("ERR_STREAM_PREMATURE_CLOSE");
 
       if (!transient || i === tries - 1) throw err;
-      await new Promise((r) => setTimeout(r, 300 * Math.pow(2, i))); // 300ms, 600ms, 1200ms
+      await new Promise((r) => setTimeout(r, 300 * Math.pow(2, i))); // 300, 600, 1200 ms
     }
   }
   throw lastErr;
@@ -131,7 +132,6 @@ const MAX_TOOL_PERSIST_CHARS = Math.max(
 /** Produce a compact, parseable wrapper for tool results */
 function formatToolResultForPersistence(toolName, content) {
   const header = `[TOOL_RESULT:${(toolName || "unknown").trim()}]`;
-  // ensure the payload is a string (raw JSON or text)
   let payloadStr;
   if (typeof content === "string") {
     payloadStr = content;
@@ -144,7 +144,6 @@ function formatToolResultForPersistence(toolName, content) {
     ? `${header}\n${payloadStr}`
     : `${header}\n\`\`\`\n${payloadStr}\n\`\`\``;
 
-  // Hard cap to avoid giant blobs (e.g., long PDF text)
   if (body.length > MAX_TOOL_PERSIST_CHARS) {
     const tail = "\n…[truncated]";
     body = body.slice(0, MAX_TOOL_PERSIST_CHARS - tail.length) + tail;
@@ -329,67 +328,65 @@ async function getAIResponse(
       const aiMessage = choice.message;
       const finishReason = choice.finish_reason;
 
-      hasToolCalls = !!(aiMessage.tool_calls && aiMessage.tool_calls.length > 0);
+      const toolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : null;
 
-      if (aiMessage.tool_calls) {
-        context.messages.push({
-          role: "assistant",
-          tool_calls: aiMessage.tool_calls || null,
-        });
-      }
+      if (toolCalls && toolCalls.length > 0) {
+        // 1) Assistant(tool_calls) SOFORT in beide Kontexte (damit Reihenfolge & Sichtbarkeit stimmen)
+        const assistantToolCallMsg = { role: "assistant", tool_calls: toolCalls };
+        context.messages.push(assistantToolCallMsg);
+        handoverContext.messages.push(assistantToolCallMsg);
 
-      if (aiMessage.content) {
-        responseMessage += (aiMessage.content || "").trim();
-      }
-
-      // Tool execution
-      if (hasToolCalls) {
-        for (const toolCall of aiMessage.tool_calls) {
+        // 2) Jeden Tool-Call ausführen und JEWEILS direkt die tool-Antwort pushen
+        for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
           const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
 
-          let replied = false; // track response for this tool_call
-
-          const replyTool = (content) => {
-            const out =
-              typeof content === "string" || content == null
-                ? content || ""
-                : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
-
-            context.messages.push({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              content: out,
-            });
-            toolCommits.push({ name: fnName || "tool", content: out });
-            replied = true;
-          };
-
-          if (!toolFunction) {
-            replyTool(`[ERROR]: Tool '${fnName}' not available or arguments invalid.`);
-            continue;
-          }
+          let toolReplyContent = "";
 
           try {
-            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
-            replyTool(toolResult || "");
+            if (!toolFunction) {
+              toolReplyContent = `[ERROR]: Tool '${fnName}' not available or arguments invalid.`;
+            } else {
+              const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+              const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
+              toolReplyContent = toolResult || "";
+            }
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
             await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
-            replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
+            toolReplyContent = JSON.stringify({ error: emsg, tool: fnName || "unknown" });
           } finally {
-            // Ultimate safety: if something prevented a reply, inject one now
-            if (!replied) {
-              replyTool(JSON.stringify({ error: "tool execution aborted without reply", tool: fnName || "unknown" }));
-            }
+            // Immer eine tool-Antwort in BEIDE Kontexte
+            const contentStr =
+              (typeof toolReplyContent === "string")
+                ? toolReplyContent
+                : (() => { try { return JSON.stringify(toolReplyContent); } catch { return String(toolReplyContent); } })();
+
+            const toolMsg = { role: "tool", tool_call_id: toolCall.id, content: contentStr };
+            context.messages.push(toolMsg);
+            handoverContext.messages.push(toolMsg);
+
+            // Für spätere Persistenz vormerken
+            toolCommits.push({ name: fnName || "tool", content: contentStr });
           }
         }
+
+        hasToolCalls = true; // es folgt typischerweise eine weitere API-Runde
+      } else {
+        // Keine tool_calls → normalen Content in den Arbeitskontext übernehmen
+        if (aiMessage.content) {
+          const text = (aiMessage.content || "").trim();
+          if (text) {
+            context.messages.push({ role: "assistant", content: text });
+            // handoverContext NICHT doppeln – er spiegelt den Zustand vor Tool-Ausführung wider
+          }
+        }
+        hasToolCalls = false;
       }
 
       sequenceCounter++;
 
-      const dueToLength = !hasToolCalls && finishReason === "length";
+      const dueToLength = !toolCalls && finishReason === "length";
 
       if (sequenceLimit <= 1) {
         continueResponse = false;
@@ -433,6 +430,7 @@ async function getAIResponse(
       }
     }
 
+    // Return assistant text (if any) for the outer caller
     return responseMessage;
   } catch (err) {
     const details = {
