@@ -1,9 +1,10 @@
-// pdf.js — stable v4.3 (minimal return fields)
+// pdf.js — stable v4.3.1 (debuggable)
 // Input:  { html: string, css?: string, filename?: string, title?: string, user_id?: string }
 // Output: JSON string with { ok, pdf, html, css_final, text }.
 // - Enforces non-overridable print rules (A4, margins, padding, no table/figure splits).
 // - Saves same-named .html alongside the .pdf
 // - Returns absolute URLs using PUBLIC_BASE_URL (or BASE_URL) if set.
+// - DEBUG: set PDF_DEBUG=1 to see raw args + parse steps.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -11,7 +12,25 @@ const fs = require("fs/promises");
 const { reportError } = require("./error.js");
 const { getPlainFromHTML } = require("./helper.js");
 
-/* ------------------------- Helpers ------------------------- */
+/* ------------------------- Debug helpers ------------------------- */
+
+const PDF_DEBUG = String(process.env.PDF_DEBUG || "").toLowerCase() === "1" ||
+                  String(process.env.PDF_DEBUG || "").toLowerCase() === "true";
+
+function dbg(...args) {
+  if (PDF_DEBUG) {
+    try { console.log("[PDF_DEBUG]", ...args); } catch {}
+  }
+}
+
+function previewStr(s, n = 500) {
+  try {
+    const str = String(s ?? "");
+    return str.length > n ? str.slice(0, n) + "…[truncated]" : str;
+  } catch { return "[[unavailable]]"; }
+}
+
+/* ------------------------- Core helpers ------------------------- */
 
 /** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "") {
@@ -23,24 +42,6 @@ function normalizeFilename(s, fallback = "") {
       .replace(/^-+|-+$/g, "")
       .slice(0, 40);
   return base || fallback || `document-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
-}
-
-/** If arguments come as bad JSON/code-fenced text, try to recover. */
-function safeParseToolArgs(toolFunction) {
-  const raw = toolFunction?.arguments;
-  if (!raw) return {};
-  if (typeof raw === "object") return raw;
-
-  if (typeof raw === "string") {
-    const str = raw.trim();
-    // strict JSON
-    try { return JSON.parse(str); } catch {}
-    // strip ```json ... ``` wrappers
-    const s2 = str.replace(/^```(?:json|md)?\s*/i, "").replace(/```$/i, "");
-    try { return JSON.parse(s2); } catch {}
-    throw new Error("Failed to parse getPDF tool arguments");
-  }
-  return {};
 }
 
 /** Build absolute URL from PUBLIC_BASE_URL (or BASE_URL) + path. */
@@ -118,19 +119,127 @@ ${bodyHtml || ""}
   return { fullHtml, css_final };
 }
 
+/* ------------------------- Robust args parser (with debug) ------------------------- */
+
+/**
+ * Try several parsing strategies and log each attempt if PDF_DEBUG=1.
+ * - Accepts object directly
+ * - Tries strict JSON
+ * - Tries removing ```json fences
+ * - Tries normalizing smart quotes
+ * - As a last resort, throws
+ */
+function safeParseToolArgs(toolFunction) {
+  const raw = toolFunction?.arguments;
+  dbg("ARGS raw typeof:", typeof raw);
+
+  if (raw == null) return {};
+  if (typeof raw === "object") {
+    dbg("ARGS accepted as object keys:", Object.keys(raw || {}));
+    return raw;
+  }
+
+  if (typeof raw === "string") {
+    const str = raw.trim();
+    dbg("ARGS raw string length:", str.length);
+    dbg("ARGS raw string preview:", previewStr(str));
+
+    // Attempt 1: strict JSON
+    try {
+      const obj1 = JSON.parse(str);
+      dbg("ARGS parsed via strict JSON; keys:", Object.keys(obj1 || {}));
+      return obj1;
+    } catch (e1) {
+      dbg("ARGS strict JSON failed:", String(e1 && e1.message));
+    }
+
+    // Attempt 2: strip ```json / ``` fences
+    const s2 = str.replace(/^```(?:json|md)?\s*/i, "").replace(/```$/i, "");
+    if (s2 !== str) {
+      dbg("ARGS trying without code fences...");
+      try {
+        const obj2 = JSON.parse(s2);
+        dbg("ARGS parsed via no-fence JSON; keys:", Object.keys(obj2 || {}));
+        return obj2;
+      } catch (e2) {
+        dbg("ARGS no-fence JSON failed:", String(e2 && e2.message));
+      }
+    }
+
+    // Attempt 3: normalize smart quotes → straight quotes (common copy/paste issue)
+    const s3 = s2
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'");
+
+    if (s3 !== s2) {
+      dbg("ARGS trying with normalized quotes...");
+      try {
+        const obj3 = JSON.parse(s3);
+        dbg("ARGS parsed via normalized-quotes JSON; keys:", Object.keys(obj3 || {}));
+        return obj3;
+      } catch (e3) {
+        dbg("ARGS normalized-quotes JSON failed:", String(e3 && e3.message));
+      }
+    }
+
+    // Attempt 4 (optional): very naive trailing commas removal in objects/arrays
+    const s4 = s3
+      .replace(/,\s*([}\]])/g, "$1"); // remove ", }" or ", ]"
+    if (s4 !== s3) {
+      dbg("ARGS trying after trailing-comma cleanup...");
+      try {
+        const obj4 = JSON.parse(s4);
+        dbg("ARGS parsed via trailing-comma cleanup; keys:", Object.keys(obj4 || {}));
+        return obj4;
+      } catch (e4) {
+        dbg("ARGS trailing-comma cleanup failed:", String(e4 && e4.message));
+      }
+    }
+
+    // If we reach here, we give up to avoid misinterpreting garbage as content
+    throw new Error("Failed to parse getPDF tool arguments");
+  }
+
+  // Not object or string
+  dbg("ARGS: unsupported type:", typeof raw);
+  return {};
+}
+
 /* ------------------------- Main Tool Entry ------------------------- */
 
 async function getPDF(toolFunction /*, context, getAIResponse */) {
   let browser = null;
   try {
-    // Parse args robustly
+    // Parse args robustly with debug
     let args;
     try {
       args = safeParseToolArgs(toolFunction);
     } catch (e) {
       await reportError(e, null, "PDF_ARGS_PARSE");
+      // Zusätzlich: Rohdaten in WARN-Log um die Auslöser zu sehen
+      try {
+        const raw = toolFunction?.arguments;
+        console.warn("[PDF_ARGS_PARSE][raw typeof]", typeof raw);
+        if (typeof raw === "string") {
+          console.warn("[PDF_ARGS_PARSE][raw len]", raw.length);
+          console.warn("[PDF_ARGS_PARSE][raw preview]", previewStr(raw, 800));
+        } else if (typeof raw === "object") {
+          console.warn("[PDF_ARGS_PARSE][raw keys]", Object.keys(raw || {}));
+        } else {
+          console.warn("[PDF_ARGS_PARSE][raw]", raw);
+        }
+      } catch {}
       throw e;
     }
+
+    // Show parsed keys & types
+    try {
+      const typed = {};
+      for (const k of Object.keys(args || {})) {
+        typed[k] = typeof args[k];
+      }
+      dbg("ARGS parsed keys+types:", typed);
+    } catch {}
 
     const htmlIn = String(args.html || "").trim();
     const cssIn = String(args.css || "");      // optional
@@ -180,17 +289,18 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     const publicPdf = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
     const publicHtml = ensureAbsoluteUrl(`/documents/${path.basename(htmlPath)}`);
 
-    // Build plain text (no HTML); use large cap to preserve most content
+    // Build plain text (no HTML)
     const text = getPlainFromHTML(bodyHtml, 200000);
 
-    // Minimal, machine-friendly return (no filename/preview)
-    return JSON.stringify({
+    const payload = {
       ok: true,
       pdf: publicPdf,
       html: publicHtml,
       css_final,
       text
-    });
+    };
+    dbg("RETURN payload keys:", Object.keys(payload));
+    return JSON.stringify(payload);
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
     return JSON.stringify({ ok: false, error: "PDF_UNEXPECTED — Could not generate PDF/HTML." });
