@@ -273,4 +273,90 @@ function safeParseToolArgs(toolFunction) {
 
 /* ------------------------- Main Tool Entry ------------------------- */
 
-as
+async function getPDF(toolFunction /*, context, getAIResponse */) {
+  let browser = null;
+  try {
+    // Parse args robustly
+    let args;
+    try {
+      args = safeParseToolArgs(toolFunction);
+    } catch (e) {
+      await reportError(e, null, "PDF_ARGS_PARSE");
+      // Minimal debug line for quicker triage
+      try {
+        const raw = toolFunction?.arguments;
+        console.log("[PDF_ARGS_PARSE][raw typeof]", typeof raw);
+        if (typeof raw === "string") {
+          console.log("[PDF_ARGS_PARSE][raw len]", raw.length);
+          console.log("[PDF_ARGS_PARSE][raw preview]", raw.slice(0, 1800));
+        }
+      } catch {}
+      throw e;
+    }
+
+    const htmlIn = String(args.html || "").trim();
+    const cssIn = String(args.css || ""); // tolerates empty
+    const title = String(args.title || "");
+    const filenameArg = String(args.filename || "");
+
+    if (!htmlIn) {
+      return JSON.stringify({ ok: false, error: "PDF_INPUT — Missing 'html' content." });
+    }
+
+    // Prepare content
+    const bodyHtml = extractBody(htmlIn);
+    const { html: fullHtml, cssFinal } = buildPrintableHtml(bodyHtml, cssIn, title || "Document");
+
+    // Paths
+    const documentsDir = path.join(__dirname, "documents");
+    await fs.mkdir(documentsDir, { recursive: true });
+
+    const filename = normalizeFilename(filenameArg, "");
+    const baseName = filename || normalizeFilename(title, "") || normalizeFilename("document");
+    const pdfPath = path.join(documentsDir, `${baseName}.pdf`);
+    const htmlPath = path.join(documentsDir, `${baseName}.html`);
+
+    // Write standalone HTML file
+    await fs.writeFile(htmlPath, fullHtml, "utf8");
+
+    // Render PDF with Puppeteer
+    const launchOpts = { headless: "new", args: ["--no-sandbox"] };
+    browser = await puppeteer.launch(launchOpts);
+    const page = await browser.newPage();
+
+    // Load our local HTML; wait for images/resources (helps image reliability)
+    await page.setContent(fullHtml, { waitUntil: "networkidle0", timeout: 120000 });
+
+    await page.pdf({
+      path: pdfPath,
+      format: "A4",
+      printBackground: true,
+      // margins 0 here because @page margin is already enforced in CSS
+      margin: { top: "0", right: "0", bottom: "0", left: "0" },
+    });
+
+    // Public URLs
+    const publicPdf = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
+    const publicHtml = ensureAbsoluteUrl(`/documents/${path.basename(htmlPath)}`);
+
+    // Clean text preview from BODY content (full text, no html)
+    const plainText = getPlainFromHTML(bodyHtml, 200000); // generous
+
+    // Return structured JSON (string)
+    return JSON.stringify({
+      ok: true,
+      pdf: publicPdf,
+      html: publicHtml,
+      css: cssFinal,
+      text: plainText,
+      filename: baseName
+    });
+  } catch (err) {
+    await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
+    return JSON.stringify({ ok: false, error: "PDF_UNEXPECTED — Could not generate PDF/HTML." });
+  } finally {
+    try { await browser?.close(); } catch {}
+  }
+}
+
+module.exports = { getPDF };
