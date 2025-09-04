@@ -299,6 +299,7 @@ async function getAIResponse(
           data: err?.response?.data,
         };
         await reportError(err, null, "OPENAI_CHAT", { details });
+        console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n"+context+"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");;
         throw err;
       }
 
