@@ -1,7 +1,8 @@
-// pdf.js — stable v4.3 (tolerant args + dual save HTML/PDF + enforced print rules)
-// - Robust args parsing (JSON, fenced ```json, ```html/```css, full <html>…, or body-only HTML)
-// - Saves a same-named .html next to the .pdf
-// - Returns JSON string: { ok, pdf, html, css, text, filename }  (absolute URLs for pdf/html)
+// pdf.js — hardened v4.4 (tolerant args + dual save HTML/PDF + enforced print rules)
+// - Ultra-tolerant args parsing (recovers incomplete/unterminated JSON strings)
+// - Accepts: JSON object/string, fenced ```json, ```html/```css, full <html>…</html>, body-only HTML
+// - Saves same-named .html next to .pdf
+// - Returns JSON string: { ok, pdf, html, css, text, filename } (absolute URLs for pdf/html)
 // - Enforces non-overridable print rules via last-in-cascade !important CSS
 
 const puppeteer = require("puppeteer");
@@ -85,10 +86,56 @@ ${bodyHtml || ""}
  *  - full <html>…</html> with optional <style>…</style>,
  *  - body-only HTML (with optional inline <style> blocks).
  */
+
+/** Scan-based tolerant extractor for JSON string values like  "html":"...".
+ *  - Respects escapes \" \\ \n \r \t \uXXXX
+ *  - If closing quote is missing (unterminated), returns best-effort up to end.
+ *  Returns { value, ok }.
+ */
+function tolerantExtractJsonStringValue(source, key) {
+  const s = String(source || "");
+  const reKey = new RegExp(`"${key}"\\s*:\\s*"`, "i");
+  const m = s.match(reKey);
+  if (!m) return { value: "", ok: false };
+  let i = m.index + m[0].length; // start after the opening quote of the value
+
+  let value = "";
+  let ok = false;
+  while (i < s.length) {
+    const ch = s[i++];
+    if (ch === "\\") {
+      // escape
+      if (i >= s.length) { value += "\\"; break; }
+      const esc = s[i++];
+      // Handle common escapes
+      if (esc === "u") {
+        // read up to 4 hex
+        const hex = s.slice(i, i + 4);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          try { value += String.fromCharCode(parseInt(hex, 16)); } catch { value += "\\u" + hex; }
+          i += 4;
+        } else {
+          value += "\\u";
+        }
+      } else {
+        // simple escapes; preserve semantics for later HTML
+        const map = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", '"': '"', "'": "'", "\\": "\\" };
+        value += (map[esc] !== undefined) ? map[esc] : esc;
+      }
+    } else if (ch === '"') {
+      ok = true; // properly terminated
+      break;
+    } else {
+      value += ch;
+    }
+  }
+  return { value, ok };
+}
+
 function safeParseToolArgs(toolFunction) {
   const raw = toolFunction?.arguments;
 
-  // direct object case
+  // direct object case (already parsed)
   if (raw && typeof raw === "object") {
     return {
       html: String(raw.html || ""),
@@ -107,6 +154,14 @@ function safeParseToolArgs(toolFunction) {
   try { console.log("[PDF_ARGS_PARSE][raw preview]", logPreview(raw)); } catch {}
 
   const str = raw.trim();
+
+  // 0) Fast path: if it *looks* like plain HTML (starts with '<' and contains a tag), treat as HTML
+  if (/^<[a-z!/]/i.test(str)) {
+    const styleBlocks = [...str.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(x => x[1].trim());
+    const css = styleBlocks.length ? styleBlocks.join("\n\n") : "";
+    const html = str.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+    return { html: html.trim(), css: css.trim(), title: "", filename: "", user_id: "" };
+  }
 
   // 1) strict JSON
   try {
@@ -137,6 +192,33 @@ function safeParseToolArgs(toolFunction) {
     try { console.log("[PDF_DEBUG] ARGS fenced JSON failed:", e.message || String(e)); } catch {}
   }
 
+  // 2b) Tolerant recovery for JSON-like input with unterminated strings
+  // Try to extract "html":"..." and optionally "css":"..." without full JSON parse.
+  if (/"html"\s*:/i.test(str)) {
+    const htmlRec = tolerantExtractJsonStringValue(str, "html");
+    const cssRec  = tolerantExtractJsonStringValue(str, "css");
+    const titleRec = tolerantExtractJsonStringValue(str, "title");
+    const filenameRec = tolerantExtractJsonStringValue(str, "filename");
+
+    if (htmlRec.value) {
+      // If html contains embedded <style> blocks and css is empty, split them out
+      let html = htmlRec.value;
+      let css = cssRec.value || "";
+      if (!css && /<style[^>]*>[\s\S]*?<\/style>/i.test(html)) {
+        const styles = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(m => m[1].trim());
+        css = styles.join("\n\n");
+        html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+      }
+      return {
+        html: String(html).trim(),
+        css: String(css).trim(),
+        title: String(titleRec.value || "").trim(),
+        filename: String(filenameRec.value || "").trim(),
+        user_id: "",
+      };
+    }
+  }
+
   // Helper: extract fenced blocks by language
   const extractFence = (all, lang) => {
     const re = new RegExp("```" + lang + "\\s*([\\s\\S]*?)```", "i");
@@ -147,7 +229,6 @@ function safeParseToolArgs(toolFunction) {
   // 3) ```html and/or ```css blocks
   const fencedHtml = extractFence(str, "html");
   const fencedCss  = extractFence(str, "css");
-
   if (fencedHtml || fencedCss) {
     let html = fencedHtml || "";
     let css  = fencedCss || "";
@@ -162,8 +243,7 @@ function safeParseToolArgs(toolFunction) {
       const styleBlocks = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(x => x[1].trim());
       if (styleBlocks.length) css = styleBlocks.join("\n\n");
     }
-
-    // remove inline style blocks from html (stylesheet kommt separat)
+    // remove inline style blocks from html (stylesheet comes separately)
     if (html) html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
 
     return { html: html.trim(), css: String(css || "").trim(), title: "", filename: "", user_id: "" };
@@ -179,7 +259,7 @@ function safeParseToolArgs(toolFunction) {
     return { html: html.trim(), css: css.trim(), title: "", filename: "", user_id: "" };
   }
 
-  // 5) Body-only fallback: has HTML tags?
+  // 5) Body-only fallback: has HTML tags anywhere? (even inside otherwise JSON-like text)
   if (/[<][a-z][\s>]/i.test(str)) {
     const styleBlocks = [...str.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map(x => x[1].trim());
     const css = styleBlocks.length ? styleBlocks.join("\n\n") : "";
@@ -193,90 +273,4 @@ function safeParseToolArgs(toolFunction) {
 
 /* ------------------------- Main Tool Entry ------------------------- */
 
-async function getPDF(toolFunction /*, context, getAIResponse */) {
-  let browser = null;
-  try {
-    // Parse args robustly
-    let args;
-    try {
-      args = safeParseToolArgs(toolFunction);
-    } catch (e) {
-      await reportError(e, null, "PDF_ARGS_PARSE");
-      // Also log a minimal debug line for quicker triage
-      try {
-        const raw = toolFunction?.arguments;
-        console.log("[PDF_ARGS_PARSE][raw typeof]", typeof raw);
-        if (typeof raw === "string") {
-          console.log("[PDF_ARGS_PARSE][raw len]", raw.length);
-          console.log("[PDF_ARGS_PARSE][raw preview]", raw.slice(0, 1800));
-        }
-      } catch {}
-      throw e;
-    }
-
-    const htmlIn = String(args.html || "").trim();
-    const cssIn = String(args.css || ""); // required by tools spec now, aber wir tolerieren leer
-    const title = String(args.title || "");
-    const filenameArg = String(args.filename || "");
-
-    if (!htmlIn) {
-      return JSON.stringify({ ok: false, error: "PDF_INPUT — Missing 'html' content." });
-    }
-
-    // Prepare content
-    const bodyHtml = extractBody(htmlIn);
-    const { html: fullHtml, cssFinal } = buildPrintableHtml(bodyHtml, cssIn, title || "Document");
-
-    // Paths
-    const documentsDir = path.join(__dirname, "documents");
-    await fs.mkdir(documentsDir, { recursive: true });
-
-    const filename = normalizeFilename(filenameArg, "");
-    const baseName = filename || normalizeFilename(title, "") || normalizeFilename("document");
-    const pdfPath = path.join(documentsDir, `${baseName}.pdf`);
-    const htmlPath = path.join(documentsDir, `${baseName}.html`);
-
-    // Write standalone HTML file
-    await fs.writeFile(htmlPath, fullHtml, "utf8");
-
-    // Render PDF with Puppeteer
-    const launchOpts = { headless: "new", args: ["--no-sandbox"] };
-    browser = await puppeteer.launch(launchOpts);
-    const page = await browser.newPage();
-
-    // Load our local HTML; wait for images/resources (helps image reliability)
-    await page.setContent(fullHtml, { waitUntil: "networkidle0", timeout: 120000 });
-
-    await page.pdf({
-      path: pdfPath,
-      format: "A4",
-      printBackground: true,
-      // margins 0 here because @page margin is already enforced in CSS
-      margin: { top: "0", right: "0", bottom: "0", left: "0" },
-    });
-
-    // Public URLs
-    const publicPdf = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
-    const publicHtml = ensureAbsoluteUrl(`/documents/${path.basename(htmlPath)}`);
-
-    // Clean text preview from BODY content (full text, no html)
-    const plainText = getPlainFromHTML(bodyHtml, 200000); // generous
-
-    // Return structured JSON (string)
-    return JSON.stringify({
-      ok: true,
-      pdf: publicPdf,
-      html: publicHtml,
-      css: cssFinal,
-      text: plainText,
-      filename: baseName
-    });
-  } catch (err) {
-    await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
-    return JSON.stringify({ ok: false, error: "PDF_UNEXPECTED — Could not generate PDF/HTML." });
-  } finally {
-    try { await browser?.close(); } catch {}
-  }
-}
-
-module.exports = { getPDF };
+as

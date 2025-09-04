@@ -186,10 +186,8 @@ const tools = [
       name: "getPDF",
       description:
         "Render a PDF from provided HTML and optional CSS. " +
-        "Arguments can be given either as JSON fields (`html`, `css`, …) or with fenced code blocks (```html …```, ```css …```). " +
-        "Always provide clean, valid HTML in the `html` field. " +
         "If you want custom styling, also provide a full CSS stylesheet in the `css` field. " +
-        "Do not escape or JSON-stringify HTML/CSS — pass them as raw strings or fenced blocks.",
+        "Ensure that everything is correctly escaped for JSON",
       parameters: {
         type: "object",
         properties: {
