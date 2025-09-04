@@ -1,4 +1,4 @@
-// tools.js — refactored v1.7 (structured getHistory + name normalization + getPDF requires CSS)
+// tools.js — refactored v1.8 (structured getHistory + name normalization + getPDF requires CSS + hardened prompting)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -179,18 +179,58 @@ const tools = [
     }
   },
 
-  // ==== getPDF now REQUIRES a CSS stylesheet ====
+  // ==== getPDF now REQUIRES a CSS stylesheet; hardened call contract ====
   {
     type: "function",
     function: {
       name: "getPDF",
       description:
-        "Render a PDF from provided HTML and a stylesheet. Always include a full CSS stylesheet in the `css` parameter; do not rely on inline <style> tags.",
+        // --- PURPOSE ---
+        "Render a PDF from provided HTML and a stylesheet.\n" +
+        // --- HARD RULES FOR THE CALL ---
+        "CALL CONTRACT (MANDATORY):\n" +
+        "• Call this tool exactly once per document.\n" +
+        "• Provide a STRICT JSON object as arguments (no comments, no trailing commas, no Markdown fences).\n" +
+        "• Keys: { \"html\": string, \"css\": string, \"title\"?: string, \"filename\"?: string, \"user_id\"?: string }.\n" +
+        "• The JSON must be valid: escape all double quotes (\\\"), backslashes (\\\\) and use \\n for newlines inside strings.\n" +
+        "• Do NOT wrap the JSON in ``` code fences. Do NOT prepend or append prose.\n" +
+        // --- HTML CONTENT RULES ---
+        "HTML RULES:\n" +
+        "• Pass either a full HTML document OR just the body markup; both are accepted. If you include <style>, it will be ignored; use the `css` field instead.\n" +
+        "• Do NOT use inline styles (`style=`). Do NOT rely on classes/ids for critical layout; prefer semantic tags (h1–h3, p, ul/ol/li, table/thead/tbody/tr/th/td, figure/img/figcaption, blockquote, hr, pre, code).\n" +
+        "• Do NOT insert placeholders like {image} / {diagram}. If you include <img>, use a real absolute http/https URL (or omit the image).\n" +
+        "• Tables must be valid and complete; avoid splitting a single logical table into multiple fragments.\n" +
+        // --- CSS RULES ---
+        "CSS RULES (provided in `css` field):\n" +
+        "• Provide a complete stylesheet. No @import, no external URLs; pure CSS only.\n" +
+        "• Prefer element selectors. Grid/columns are allowed. Avoid using classes/ids unless absolutely necessary.\n" +
+        "• Do NOT include print-page settings that fight the renderer’s enforced rules (A4, outer margin, inner padding, no split of tables/figures/images).\n" +
+        // --- OUTPUT QUALITY HINTS ---
+        "QUALITY HINTS:\n" +
+        "• Use clear headings, short paragraphs, and well-structured lists/tables.\n" +
+        "• Ensure images scale down responsively (max-width:100%; height:auto) and include sensible alt text.\n" +
+        "• Avoid long unbroken walls of text; use subheadings and spacing.\n" +
+        // --- FAILURE MODES TO AVOID ---
+        "DO NOT:\n" +
+        "• Do NOT send non-JSON text, Markdown, or code fences.\n" +
+        "• Do NOT insert placeholders, TODOs, or template markers.\n" +
+        "• Do NOT rely on inline <style> tags; all styling must be in `css`.\n" +
+        "• Do NOT invent content that contradicts prior user instructions/context.",
       parameters: {
         type: "object",
         properties: {
-          html: { type: "string", description: "Full HTML body content. Must contain full HTML; the renderer will extract <body> if present." },
-          css: { type: "string", description: "Required: Complete stylesheet to apply. Do not omit." },
+          html: {
+            type: "string",
+            description:
+              "HTML content for the document. May be a full HTML document or just the <body> markup. " +
+              "No placeholders; avoid inline styles. Absolute URLs for images if used."
+          },
+          css: {
+            type: "string",
+            description:
+              "REQUIRED: Complete stylesheet for the document. Pure CSS only; no @import or external URLs. " +
+              "Prefer element selectors; ensure images fit (img{max-width:100%;height:auto})."
+          },
           filename: { type: "string", description: "Optional filename without extension. Will be normalized." },
           title: { type: "string", description: "Optional <title> for the document head." },
           user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." }
