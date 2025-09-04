@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.8 (hardened)
+// aiCore.js — refactored v2.9 (hardened + strict pairing + debug)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -6,11 +6,8 @@
 // v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
 // v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
 // v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
-// v2.8: Hardened tool_call flow:
-//   - Never push empty tool_calls arrays into context
-//   - Only iterate when toolCalls.length > 0
-//   - Strict pairing: every assistant.tool_calls is immediately followed by matching tool messages
-//   - Safer payload mapping (omit empty/null fields), extra guards
+// v2.8: Hardened tool_call flow (no empty tool_calls; strict ordering intent in loop).
+// v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
 
 require("dotenv").config();
 const fs = require("fs"); // retained for potential future file-priming
@@ -70,11 +67,42 @@ async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * POST with retry. On non-2xx, we log details explicitly.
+ * NOTE: we override validateStatus here to always get a response,
+ * then we decide to throw based on status range.
+ */
 async function postWithRetry(url, payload, headers, tries = 3) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
-      return await axiosAI.post(url, payload, { headers });
+      const res = await axiosAI.post(url, payload, {
+        headers,
+        validateStatus: () => true, // log even on 4xx/5xx
+      });
+
+      if (res.status >= 200 && res.status < 300) return res;
+
+      // Non-2xx: log snapshot
+      console.error("[AI POST][NON-2XX]", {
+        try: i + 1,
+        status: res.status,
+        statusText: res.statusText,
+        dataPreview:
+          typeof res.data === "string" ? res.data.slice(0, 2000) : res.data,
+      });
+
+      // For 4xx, do not retry (payload issue)
+      if (res.status >= 400 && res.status < 500) {
+        const e = new Error(`AI_HTTP_${res.status}`);
+        e.response = res;
+        throw e;
+      }
+
+      // For 5xx, retry
+      lastErr = new Error(`AI_HTTP_${res.status}`);
+      await sleep(300 * Math.pow(2, i));
+      continue;
     } catch (err) {
       lastErr = err;
       const code = err?.code;
@@ -85,6 +113,17 @@ async function postWithRetry(url, payload, headers, tries = 3) {
         code === "ETIMEDOUT" ||
         msg.includes("socket hang up") ||
         msg.includes("ERR_STREAM_PREMATURE_CLOSE");
+
+      console.error("[AI POST][ERROR]", {
+        try: i + 1,
+        code,
+        message: msg,
+        status: err?.response?.status || null,
+        dataPreview:
+          typeof err?.response?.data === "string"
+            ? err.response.data.slice(0, 2000)
+            : err?.response?.data || null,
+      });
 
       if (!transient || i === tries - 1) throw err;
       await sleep(300 * Math.pow(2, i)); // 300ms, 600ms, 1200ms
@@ -104,23 +143,47 @@ function normalizeEndpoint(raw) {
   return url;
 }
 
-/** Remove orphan historical tool messages; keep only those that pair with a just-previous assistant.tool_calls */
-function pruneOrphanToolMessages(msgs) {
+/**
+ * Strictly pair assistant.tool_calls with *all* of their immediate tool replies.
+ * - After assistant.tool_calls, allow only directly following tool messages matching tool_call_id.
+ * - Allow multiple tool replies in a row (for multiple tool_call IDs).
+ * - Drop any other roles in between; orphan tool messages are dropped.
+ * - Normal user/assistant/system messages are kept; any non-tool breaks the "tool chain".
+ */
+function buildStrictToolPairedMessages(msgs) {
   const out = [];
+  let lastToolIds = null; // Set of tool_call_ids from the last assistant.tool_calls
+
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
 
-    if (m.role === "tool") {
-      const prev = out[out.length - 1];
-      const ok =
-        prev &&
-        prev.role === "assistant" &&
-        Array.isArray(prev.tool_calls) &&
-        prev.tool_calls.some((tc) => tc && tc.id && tc.id === m.tool_call_id);
+    // assistant with tool_calls
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const asst = { role: "assistant", tool_calls: m.tool_calls };
+      if (typeof m.content === "string" && m.content.trim()) asst.content = m.content.trim();
+      out.push(asst);
 
-      if (!ok) continue; // drop historical/orphan tool message from payload
+      lastToolIds = new Set(m.tool_calls.map(tc => tc && tc.id).filter(Boolean));
+      // now expect one or more matching tool replies to follow; handled in next iterations
+      continue;
     }
-    out.push(m);
+
+    // tool replies: keep only those matching the last seen assistant.tool_calls
+    if (m.role === "tool") {
+      if (m.tool_call_id && lastToolIds && lastToolIds.has(m.tool_call_id)) {
+        out.push({ role: "tool", tool_call_id: m.tool_call_id, content: m.content ?? "" });
+      }
+      // don't change lastToolIds; allow multiple matching tool replies in sequence
+      continue;
+    }
+
+    // any other role breaks the expected tool chain
+    lastToolIds = null;
+
+    // keep normal messages
+    const keep = { role: m.role, content: m.content };
+    if (m.name) keep.name = m.name;
+    out.push(keep);
   }
   return out;
 }
@@ -132,14 +195,12 @@ const TOOL_PERSIST_ROLE =
 
 const MAX_TOOL_PERSIST_CHARS = Math.max(
   500,
-  10000,
   Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 3000))
 );
 
 /** Produce a compact, parseable wrapper for tool results */
 function formatToolResultForPersistence(toolName, content) {
   const header = `[TOOL_RESULT:${(toolName || "unknown").trim()}]`;
-  // ensure the payload is a string (raw JSON or text)
   let payloadStr;
   if (typeof content === "string") {
     payloadStr = content;
@@ -256,8 +317,8 @@ async function getAIResponse(
     do {
       hadToolCallsThisTurn = false;
 
-      // do not feed orphan historical tool messages to the API
-      const safeMsgs = pruneOrphanToolMessages(context.messages);
+      // Build a *strictly paired* message list for the API
+      const safeMsgs = buildStrictToolPairedMessages(context.messages);
 
       // Map messages for API; omit empty name/tool_calls/tool_call_id
       const messagesToSend = safeMsgs.map((m) => {
@@ -266,7 +327,6 @@ async function getAIResponse(
         if (safeName) out.name = safeName;
 
         if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-          // pass through tool_calls only if non-empty
           out.tool_calls = m.tool_calls;
         }
         if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
@@ -285,7 +345,7 @@ async function getAIResponse(
       const configured = (process.env.OPENAI_API_URL || OPENAI_API_URL || "").trim();
       const endpoint = normalizeEndpoint(configured) || "https://api.openai.com/v1/chat/completions";
 
-      // === DEBUG SNAPSHOT (wird nur im Fehlerfall ausgegeben) ===
+      // === DEBUG SNAPSHOT (printed on failure) ===
       const __REQUEST_DEBUG_SNAPSHOT = {
         endpoint,
         model,
@@ -293,7 +353,6 @@ async function getAIResponse(
         sequenceCounter,
         payloadPreview: {
           messages: messagesToSend,
-          // Tools nur mit Namen (keine riesigen Strukturen)
           tools: Array.isArray(context.tools)
             ? context.tools.map(t => (t?.function?.name || t?.name || "unknown"))
             : [],
@@ -301,7 +360,6 @@ async function getAIResponse(
         contextMessages: context.messages,
         handoverMessages: handoverContext.messages,
       };
-      // === /DEBUG SNAPSHOT ===
 
       // API Call (with retry)
       let aiResponse;
@@ -319,14 +377,12 @@ async function getAIResponse(
         };
         await reportError(err, null, "OPENAI_CHAT", { details });
 
-        // ---------------- DEBUG: Kontext & Payload vollständig als JSON ----------------
+        // Debug: dump request snapshot with payload/context
         try {
           console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify(__REQUEST_DEBUG_SNAPSHOT, null, 2));
         } catch {}
-        // --------------------------------------------------------------------------------
-
-        // (Alt) Rohdump, falls du ihn weiterhin sehen willst:
-        console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n" + context.messages + "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
+        // raw fallback for legacy grep
+        console.log("\n\n=== CONTEXT RAW DUMP ===\n", context.messages, "\n=== /CONTEXT RAW DUMP ===\n");
         throw err;
       }
 
@@ -350,7 +406,7 @@ async function getAIResponse(
         responseMessage += aiMessage.content.trim();
       }
 
-      // Tool execution (strict pairing)
+      // Tool execution (strict pairing per loop; replies are appended to context.messages)
       if (hasToolCalls) {
         hadToolCallsThisTurn = true;
 
@@ -385,6 +441,7 @@ async function getAIResponse(
 
           try {
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            // handoverContext is read-only by convention; tools should not mutate it.
             const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
@@ -456,24 +513,22 @@ async function getAIResponse(
     };
     await reportError(err, null, "GET_AI_RESPONSE", { details });
 
-    // ---------------- DEBUG: kompletter Kontext im Fehlerfall ----------------
+    // Dump current working & handover contexts for forensics
     try {
       console.error(
         "[GET_AI_RESPONSE][CONTEXT_DEBUG]",
         JSON.stringify(
           {
-            contextMessages: context?.messages || [],
-            handoverMessages: handoverContext?.messages || [],
+            contextMessages: (typeof context?.messages !== "undefined") ? context.messages : [],
+            handoverMessages: (typeof handoverContext?.messages !== "undefined") ? handoverContext.messages : [],
           },
           null,
           2
         )
       );
     } catch {}
-    // ------------------------------------------------------------------------
-
-    // (Alt) Rohdump, falls du ihn weiterhin sehen willst:
-    console.log("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nCONTEXT: \n *******************************************************************************************\n" + context + "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
+    // raw fallback
+    console.log("\n\n=== CONTEXT OBJ RAW ===\n", context, "\n=== /CONTEXT OBJ RAW ===\n");
 
     throw err;
   }
