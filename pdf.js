@@ -1,8 +1,8 @@
-// pdf.js — stable v4.3
+// pdf.js — stable v4.6
 // Render provided HTML (+ optional CSS) into a PDF AND save a same-named .html file.
-// Returns: PDF/HTML absolute URLs, plain-text preview, and the final CSS used.
-// Enforces non-overridable print rules: A4, 20mm page margin, 10mm inner padding,
-// avoid split of tables/figures/pre/img across pages.
+// Returns absolute links to PDF and HTML + final CSS + plain text (no HTML).
+// Enforces non-overridable print rules: A4, 20mm page margin, 10mm inner padding, avoid split of tables/figures/etc.
+// Robust args parsing: accepts object, JSON string, or fenced blocks (```html / ```css). Adds debug logs.
 
 const puppeteer = require("puppeteer");
 const path = require("path");
@@ -10,21 +10,7 @@ const fs = require("fs/promises");
 const { reportError } = require("./error.js");
 const { getPlainFromHTML } = require("./helper.js");
 
-const PDF_DEBUG = String(process.env.PDF_DEBUG || "").toLowerCase() === "1"
-  || String(process.env.PDF_DEBUG || "").toLowerCase() === "true";
-
 /* ------------------------- Helpers ------------------------- */
-
-function logDebug(tag, data) {
-  if (!PDF_DEBUG) return;
-  try {
-    if (typeof data === "string") {
-      console.log(`[${tag}] ${data}`);
-    } else {
-      console.log(`[${tag}]`, data);
-    }
-  } catch {}
-}
 
 /** FS-safe, lowercased filename (max 40 chars, no extension). */
 function normalizeFilename(s, fallback = "") {
@@ -51,7 +37,6 @@ function extractBody(html) {
   const s = String(html || "");
   const m = s.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
   if (m) return m[1];
-  // otherwise, assume body-only content
   return s;
 }
 
@@ -64,7 +49,7 @@ function enforcedCss() {
     // Inner text padding 10mm
     "body{padding:10mm !important}",
     // Avoid splitting key elements across pages
-    "table, thead, tbody, tr, th, td, figure, img, pre, blockquote{page-break-inside:avoid !important; break-inside:avoid !important}",
+    "table, thead, tbody, tr, th, td, figure, img, pre, blockquote, .box, .card{page-break-inside:avoid !important; break-inside:avoid !important}",
     "h1,h2,h3{break-after:avoid !important; page-break-after:auto !important}",
     // Image fit
     "img{max-width:100% !important; height:auto !important; display:block !important}",
@@ -73,92 +58,94 @@ function enforcedCss() {
 
 /** Wrap body HTML + CSS into a printable full HTML document. */
 function buildPrintableHtml(bodyHtml, userCss = "", title = "Document") {
-  const css = `${String(userCss || "")}\n${enforcedCss()}`;
+  // User CSS first, enforced CSS last (with !important) so es gewinnt die Kaskade.
+  const cssFinal = `${String(userCss || "")}\n${enforcedCss()}`;
   const safeTitle = String(title || "Document").slice(0, 140);
-  return `<!DOCTYPE html>
+  const fullHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>${safeTitle}</title>
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>${css}</style>
+  <style>${cssFinal}</style>
 </head>
 <body>
 ${bodyHtml || ""}
 </body>
 </html>`;
+  return { fullHtml, cssFinal };
 }
 
-/** Try to extract <style>…</style> and <title>…</title> from a raw HTML document string. */
-function peelStyleAndTitle(rawHtml) {
-  let html = String(rawHtml || "");
+/* ------------------------- Argument Parsing ------------------------- */
 
-  // collect & remove style blocks
-  const styles = [];
-  html = html.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (_, css) => {
-    if (css && css.trim()) styles.push(css.trim());
-    return ""; // strip the style tag from HTML
-  });
-
-  // extract title (keep original HTML intact aside from styles)
-  let title = "";
-  const mt = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (mt) title = mt[1].trim();
-
-  // If it's a full HTML doc and we stripped head styles, keep the rest as-is.
-  return { html, css: styles.join("\n\n"), title };
+/** Trim code fences from a block. */
+function stripFences(s) {
+  if (typeof s !== "string") return s;
+  let t = s.trim();
+  // remove generic ```
+  if (/^```/.test(t)) {
+    t = t.replace(/^```(?:html|css|md|json)?\s*/i, "").replace(/```$/i, "");
+  }
+  return t.trim();
 }
 
-/** If arguments come as bad JSON/code-fenced text, try to recover gracefully. */
+/** Extract fenced blocks for html/css if present */
+function parseFencedBlocks(raw) {
+  const str = String(raw || "");
+  const htmlMatch = str.match(/```html([\s\S]*?)```/i);
+  const cssMatch  = str.match(/```css([\s\S]*?)```/i);
+
+  const html = htmlMatch ? stripFences(htmlMatch[0].replace(/^```html/i, "```")) : null;
+  const css  = cssMatch  ? stripFences(cssMatch[0].replace(/^```css/i,  "```")) : null;
+
+  return { html, css };
+}
+
+/** Try to parse arguments: object → ok; JSON string → ok; fenced blocks → ok; else raw string treated as HTML. */
 function safeParseToolArgs(toolFunction) {
   const raw = toolFunction?.arguments;
-  logDebug("PDF_ARGS_PARSE][raw typeof", typeof raw);
+
+  // Debug dump
+  try {
+    console.log("[PDF_ARGS_PARSE][raw typeof]", typeof raw);
+    if (typeof raw === "string") {
+      console.log("[PDF_ARGS_PARSE][raw len]", raw.length);
+      console.log("[PDF_ARGS_PARSE][raw preview]", raw.slice(0, 300));
+    } else {
+      console.log("[PDF_ARGS_PARSE][raw object keys]", raw && Object.keys(raw));
+    }
+  } catch {}
 
   if (!raw) return {};
+
+  // If already object, use directly
   if (typeof raw === "object") return raw;
 
+  // If string: first try strict JSON
   if (typeof raw === "string") {
-    const str = raw.trim();
-    logDebug("PDF_ARGS_PARSE][raw len", String(str.length));
-    logDebug("PDF_ARGS_PARSE][raw preview", str.slice(0, 400));
-
-    // 1) strict JSON
     try {
-      return JSON.parse(str);
+      const obj = JSON.parse(raw);
+      return obj && typeof obj === "object" ? obj : {};
     } catch (e1) {
-      logDebug("PDF_DEBUG", `ARGS strict JSON failed: ${e1.message}`);
-    }
+      try { console.log("[PDF_DEBUG] ARGS strict JSON failed:", e1.message); } catch {}
+      // Try fenced blocks
+      const { html, css } = parseFencedBlocks(raw);
+      if (html || css) {
+        return { html: html || "", css: css || "" };
+      }
 
-    // 2) strip ```json fences
-    const s2 = str.replace(/^```(?:json|md)?\s*/i, "").replace(/```$/i, "");
-    try {
-      return JSON.parse(s2);
-    } catch (e2) {
-      logDebug("PDF_DEBUG", `ARGS fenced JSON failed: ${e2.message}`);
+      // Try strip ```json fences and parse
+      const s2 = raw.replace(/^```(?:json|md)?\s*/i, "").replace(/```$/i, "");
+      try {
+        const obj2 = JSON.parse(s2);
+        return obj2 && typeof obj2 === "object" ? obj2 : {};
+      } catch (e2) {
+        try { console.log("[PDF_DEBUG] ARGS fenced JSON failed:", e2.message); } catch {}
+        // Last resort: treat the entire string as HTML
+        return { html: raw, css: "" };
+      }
     }
-
-    // 3) Heuristic fallback: treat as direct HTML payload
-    //    If it looks like HTML, we parse out <style> and <title>.
-    if (/[<][a-z!/]/i.test(str) && /<\/?[a-z]/i.test(str)) {
-      const { html, css, title } = peelStyleAndTitle(str);
-      return { html, css, title };
-    }
-
-    // 4) As a last resort, if we can spot something like `"html":"...` but it's invalid JSON,
-    //    try to extract the substring after "html": and treat that as HTML.
-    const idx = str.toLowerCase().indexOf(`"html":`);
-    if (idx >= 0) {
-      const after = str.slice(idx + 7); // after `"html":`
-      // Strip starting quotes if present
-      const guess = after.replace(/^["'\s]*/, "").trim();
-      // Stop at a closing brace/comma if present; else take entire tail
-      // But safer: just use the entire tail as HTML — better something than nothing.
-      return { html: guess, css: "", title: "" };
-    }
-
-    // 5) give up: signal parse error
-    throw new Error("Failed to parse getPDF tool arguments");
   }
 
   return {};
@@ -179,9 +166,10 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     }
 
     const htmlIn = String(args.html || "").trim();
-    const cssIn = String(args.css || "");
-    const title = String(args.title || "");
+    const cssIn  = String(args.css  || "");
+    const title  = String(args.title || "");
     const filenameArg = String(args.filename || "");
+    const userId = String(args.user_id || ""); // optional
 
     if (!htmlIn) {
       return "[ERROR]: PDF_INPUT — Missing 'html' content.";
@@ -189,18 +177,15 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
 
     // Prepare content
     const bodyHtml = extractBody(htmlIn);
-    const fullHtml = buildPrintableHtml(bodyHtml, cssIn, title || "Document");
+    const { fullHtml, cssFinal } = buildPrintableHtml(bodyHtml, cssIn, title || "Document");
 
     // Paths
     const documentsDir = path.join(__dirname, "documents");
     await fs.mkdir(documentsDir, { recursive: true });
 
-    const baseName =
-      normalizeFilename(filenameArg, "") ||
-      normalizeFilename(title, "") ||
-      normalizeFilename("document");
-
-    const pdfPath = path.join(documentsDir, `${baseName}.pdf`);
+    const filename = normalizeFilename(filenameArg, "");
+    const baseName = filename || normalizeFilename(title, "") || normalizeFilename("document");
+    const pdfPath  = path.join(documentsDir, `${baseName}.pdf`);
     const htmlPath = path.join(documentsDir, `${baseName}.html`);
 
     // Write standalone HTML file (for direct viewing)
@@ -211,38 +196,35 @@ async function getPDF(toolFunction /*, context, getAIResponse */) {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
 
-    // Load our local HTML via setContent to respect CSS; wait for network for images
+    // Load our local HTML and wait for network for images
     await page.setContent(fullHtml, { waitUntil: "networkidle0", timeout: 120000 });
 
     await page.pdf({
       path: pdfPath,
       format: "A4",
       printBackground: true,
-      // We already enforce margins via @page; avoid double margins here by using minimal ones:
+      // We enforce margins via @page; use zero here to avoid double margins.
       margin: { top: "0", right: "0", bottom: "0", left: "0" },
     });
 
-    const publicPdf = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
+    const publicPdf  = ensureAbsoluteUrl(`/documents/${path.basename(pdfPath)}`);
     const publicHtml = ensureAbsoluteUrl(`/documents/${path.basename(htmlPath)}`);
 
-    // Build a clean text preview from the BODY content
-    const preview = getPlainFromHTML(bodyHtml, 2000);
+    // Build a clean text preview from the BODY content (for the return payload)
+    const plainText = getPlainFromHTML(bodyHtml, 20000); // großzügig, du filterst später
 
-    // Return both links (angle brackets often help embeds become clickable) + CSS
-    const cssOut = `${String(cssIn || "")}\n${enforcedCss()}`.trim();
-
-    return `PDF: ${publicPdf}
-HTML: ${publicHtml}
-<${publicPdf}>
-<${publicHtml}>
-
-CSS (final):
-\`\`\`css
-${cssOut}
-\`\`\`
-
-TEXT:
-${preview}`;
+    // Return the 4 gewünschten Felder als gut verwertbarer Plaintext-Block:
+    // (Keine JSON-Zwänge; leicht im Bot zu parsen)
+    return [
+      `PDF: ${publicPdf}`,
+      `HTML: ${publicHtml}`,
+      "CSS:",
+      "```css",
+      cssFinal,
+      "```",
+      "TEXT:",
+      plainText
+    ].join("\n");
   } catch (err) {
     await reportError(err, null, "PDF_UNEXPECTED", "FATAL");
     return "[ERROR]: PDF_UNEXPECTED — Could not generate PDF/HTML.";
