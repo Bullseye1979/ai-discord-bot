@@ -19,7 +19,6 @@ function normalize(s) {
     .replace(/\s{2,}/g, " ");
 }
 
-
 /** Trim coordinate precision to reduce URL length (5–6 decimals ~ cm-meter precision). */
 function trimLatLng(lat, lng, decimals = 5) {
   const toNum = (v) => {
