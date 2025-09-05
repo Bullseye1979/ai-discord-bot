@@ -1,4 +1,4 @@
-// bot.js — refactored v3.12
+// bot.js — refactored v3.32
 // typed tool-calls, per-message reactions, presence, one-shot BUSY gate, tool-flow commit
 // Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
 
@@ -68,12 +68,11 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
         JSON.stringify({
           persona: channelMeta.persona || "",
           instructions: channelMeta.instructions || "",
-          tools: (channelMeta.tools || [])
-            .map((t) => t?.function?.name || t?.name || "")
-            .sort(),
+          // tools removed from signature relevance; block-only handling
           botname: channelMeta.botname || "",
           voice: channelMeta.voice || "",
           summaryPrompt: channelMeta.summaryPrompt || "",
+          avatarPrompt: channelMeta.avatarPrompt || "",
         })
       )
       .digest("hex");
@@ -82,8 +81,8 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
       const ctx = new Context(
         channelMeta.persona,
         channelMeta.instructions,
-        channelMeta.tools,
-        channelMeta.toolRegistry,
+        [],                 // ⬅︎ tools kommen nur noch aus Blöcken
+        {},                 // ⬅︎ registry ebenso
         channelId,
         { persistToDB: true } // ⬅︎ Persistenz erzwingen
       );
@@ -94,8 +93,8 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
         entry.ctx = new Context(
           channelMeta.persona,
           channelMeta.instructions,
-          channelMeta.tools,
-          channelMeta.toolRegistry,
+          [],               // ⬅︎ keine globalen Tools
+          {},               // ⬅︎ keine globale Registry
           channelId,
           { persistToDB: true } // ⬅︎ Persistenz erzwingen
         );
@@ -139,12 +138,11 @@ function metaSig(m) {
       JSON.stringify({
         persona: m.persona || "",
         instructions: m.instructions || "",
-        tools: (m.tools || [])
-          .map((t) => t?.function?.name || t?.name || "")
-          .sort(),
+        // tools intentionally not part of meta anymore (block-only)
         botname: m.botname || "",
         voice: m.voice || "",
         summaryPrompt: m.summaryPrompt || "",
+        avatarPrompt: m.avatarPrompt || "",
       })
     )
     .digest("hex");
@@ -204,6 +202,20 @@ async function deleteAllMessages(channel) {
   }
 }
 
+/** Resolve token limits from block (block-only). With sane clamps. */
+function resolveTokenLimit(block, type = "text") {
+  const raw =
+    type === "speech"
+      ? block?.max_tokens_speaker ?? block?.maxTokensSpeaker
+      : block?.max_tokens_text ?? block?.maxTokensText;
+
+  const v = Number(raw);
+  const def = type === "speech" ? 1024 : 2048;
+  return Number.isFinite(v) && v > 0
+    ? Math.max(32, Math.min(8192, Math.floor(v)))
+    : def;
+}
+
 /** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate) */
 async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {
   let ch = null;
@@ -224,67 +236,36 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       });
     }
 
-    // Block selection for voice (speaker OR user id)
+    // Block selection for voice — now strictly by userId (and wildcard), not by speaker name
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-    const speakerNameLower = String(evt.speaker || "").trim().toLowerCase();
     const userId = String(evt.userId || "").trim();
 
-    const pickBlockForSpeaker = () => {
-      let exact = null,
-        wildcard = null;
-      for (const b of blocks) {
-        const sp = Array.isArray(b.speaker)
-          ? b.speaker.map((s) => String(s).trim().toLowerCase())
-          : [];
-        if (!sp.length) continue;
-        if (sp.includes("*") && !wildcard) wildcard = b;
-        if (speakerNameLower && sp.includes(speakerNameLower) && !exact)
-          exact = b;
-      }
-      return exact || wildcard || null;
-    };
-    const pickBlockForUser = () => {
-      let exact = null,
-        wildcard = null;
-      for (const b of blocks) {
-        const us = Array.isArray(b.user)
-          ? b.user.map((x) => String(x).trim())
-          : [];
-        if (!us.length) continue;
-        if (us.includes("*") && !wildcard) wildcard = b;
-        if (userId && us.includes(userId) && !exact) exact = b;
-      }
-      return exact || wildcard || null;
-    };
+    const matchingBlock = blocks.find(
+      (b) =>
+        (Array.isArray(b.speaker) && (b.speaker.includes(userId) || b.speaker.includes("*"))) ||
+        (Array.isArray(b.user) && (b.user.includes(userId) || b.user.includes("*")))
+    );
 
-    const matchingBlock = pickBlockForSpeaker() || pickBlockForUser();
+    // Kein Block → keine Antwort / kein Zugriff
+    if (!matchingBlock) return;
+    const bypassTrigger = matchingBlock.noTrigger === true; // (Info falls später Voice-Trigger geprüft würden)
 
-    let effectiveModel = matchingBlock?.model || channelMeta.model || undefined;
-    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
+    // Nur Block-Werte (kein channelMeta-Fallback für technische Settings)
+    let effectiveModel = matchingBlock.model || undefined;
+    let effectiveApiKey = matchingBlock.apikey || null;
 
-    if (
-      matchingBlock &&
-      Array.isArray(matchingBlock.tools) &&
-      matchingBlock.tools.length > 0
-    ) {
+    if (Array.isArray(matchingBlock.tools)) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(
         matchingBlock.tools
       );
       chatContext.tools = blockTools;
       chatContext.toolRegistry = blockRegistry;
     } else {
-      chatContext.tools = channelMeta.tools;
-      chatContext.toolRegistry = channelMeta.toolRegistry;
+      chatContext.tools = [];
+      chatContext.toolRegistry = {};
     }
 
-    const tokenlimit = (() => {
-      const raw = channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker;
-      const v = Number(raw);
-      const def = 1024;
-      return Number.isFinite(v) && v > 0
-        ? Math.max(32, Math.min(8192, Math.floor(v)))
-        : def;
-    })();
+    const tokenlimit = resolveTokenLimit(matchingBlock, "speech");
 
     // mark busy + presence *before* any await — ensures strict gating + presence
     voiceBusy.set(evt.channelId, true);
@@ -293,7 +274,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     const sequenceLimit = 1;
     const instrBackup = chatContext.instructions;
     try {
-      const add = (channelMeta.speechAppend || "").trim();
+      const add = (matchingBlock?.speechAppend || "").trim(); // ⬅︎ Append nur aus Block
       if (add)
         chatContext.instructions =
           (chatContext.instructions || "") + "\n\n" + add;
@@ -376,8 +357,8 @@ client.on("messageCreate", async (message) => {
       const ctx = new Context(
         channelMeta.persona,
         channelMeta.instructions,
-        channelMeta.tools,
-        channelMeta.toolRegistry,
+        [],                 // ⬅︎ keine globalen Tools
+        {},                 // ⬅︎ keine globale Registry
         baseChannelId,
         { persistToDB: true } // ⬅︎ Persistenz erzwingen (typed chat Pfad)
       );
@@ -388,8 +369,8 @@ client.on("messageCreate", async (message) => {
         entry.ctx = new Context(
           channelMeta.persona,
           channelMeta.instructions,
-          channelMeta.tools,
-          channelMeta.toolRegistry,
+          [],               // ⬅︎ keine globalen Tools
+          {},               // ⬅︎ keine globale Registry
           baseChannelId,
           { persistToDB: true } // ⬅︎ Persistenz erzwingen (Rebuild)
         );
@@ -434,14 +415,24 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // We only store non-trigger normal chat into context immediately.
-    // Triggered AI turns will be passed as pendingUser to getAIResponse and committed after tools finish.
+    // Trigger-Berechnung
     const authorId = String(message.author?.id || "");
     const norm = (rawText || "").toLowerCase();
     const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
 
-    if (!isCommand && !isTrigger && !message.author?.bot && !message.webhookId) {
+    // === Block-Matching VOR dem Logging, damit noTrigger korrekt berücksichtigt wird
+    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const matchBlockEarly = blocks.find(
+      (b) =>
+        (Array.isArray(b.user) && (b.user.includes(authorId) || b.user.includes("*"))) ||
+        (Array.isArray(b.speaker) && (b.speaker.includes(authorId) || b.speaker.includes("*")))
+    );
+    const bypassTriggerEarly = matchBlockEarly?.noTrigger === true;
+
+    // We only store non-trigger normal chat into context immediately.
+    // → Bei noTrigger soll NICHT geloggt werden (wie bei echtem Trigger).
+    if (!isCommand && !(isTrigger || bypassTriggerEarly) && !message.author?.bot && !message.webhookId) {
       await setAddUserMessage(message, chatContext);
     }
 
@@ -566,10 +557,20 @@ client.on("messageCreate", async (message) => {
 
             const TRIGGER = (channelMeta.name || "").trim();
 
+            // === Block-Match, damit noTrigger für Voice greifen kann
+            const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+            const userId = String(evt.userId || "").trim();
+            const voiceBlock = blocks.find(
+              (b) =>
+                (Array.isArray(b.speaker) && (b.speaker.includes(userId) || b.speaker.includes("*"))) ||
+                (Array.isArray(b.user) && (b.user.includes(userId) || b.user.includes("*")))
+            );
+            const bypassTrigger = voiceBlock?.noTrigger === true;
+
             // Immer loggen (DB + RAM) — ohne Doppelverarbeitung zu verursachen:
-            // Nur WENN kein Trigger, bleibt dieser Log der einzige Eintrag.
-            // Bei Trigger übernimmt später getAIResponse das Commit (wir loggen hier NICHT).
-            const invoked = firstWordEqualsName(evt.text, TRIGGER);
+            // Nur WENN kein Trigger (und kein noTrigger), bleibt dieser Log der einzige Eintrag.
+            // Bei Trigger/noTrigger übernimmt später getAIResponse das Commit (wir loggen hier NICHT).
+            const invoked = bypassTrigger || firstWordEqualsName(evt.text, TRIGGER);
             if (!invoked) {
               try {
                 await chatContext.add(
@@ -726,53 +727,44 @@ client.on("messageCreate", async (message) => {
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    if (!isTrigger) return;
+    // Block selection for typed chat — by user id (mit Wildcard)
+    const blocks2 = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const matchingBlock = blocks2.find(
+      (b) =>
+        (Array.isArray(b.user) && (b.user.includes(authorId) || b.user.includes("*"))) ||
+        (Array.isArray(b.speaker) && (b.speaker.includes(authorId) || b.speaker.includes("*")))
+    );
+
+    // Kein Block → keine Antwort
+    if (!matchingBlock) return;
+
+    // noTrigger: Triggerwort nicht nötig
+    const bypassTrigger = matchingBlock.noTrigger === true;
+    if (!bypassTrigger && !(isTrigger)) return;
 
     // Reactions + presence
     await setMessageReaction(message, "⏳");
     incPresence();
 
-    // Block selection for typed chat — by user id
-    let effectiveModel = channelMeta.model || "gpt-4o";
-    let effectiveApiKey = channelMeta.apikey || null;
+    // Nur Block-Werte (kein channelMeta-Fallback)
+    let effectiveModel = matchingBlock.model || undefined;
+    let effectiveApiKey = matchingBlock.apikey || null;
 
-    const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-    const pickBlockForUser = () => {
-      let exact = null, wildcard = null;
-      for (const b of blocks) {
-        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
-        if (!us.length) continue;
-        if (us.includes("*") && !wildcard) wildcard = b;
-        if (authorId && us.includes(authorId) && !exact) exact = b;
-      }
-      return exact || wildcard || null;
-    };
-    const matchingBlock = pickBlockForUser();
-
-    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+    if (Array.isArray(matchingBlock.tools)) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
       chatContext.toolRegistry = blockRegistry;
     } else {
-      chatContext.tools = channelMeta.tools;
-      chatContext.toolRegistry = channelMeta.toolRegistry;
+      chatContext.tools = [];
+      chatContext.toolRegistry = {};
     }
-    if (matchingBlock?.model)  effectiveModel  = matchingBlock.model;
-    if (matchingBlock?.apikey) effectiveApiKey = matchingBlock.apikey;
 
-    const tokenlimit = (() => {
-      const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
-      const v = Number(raw);
-      const def = 4096;
-      return Number.isFinite(v) && v > 0
-        ? Math.max(32, Math.min(8192, Math.floor(v)))
-        : def;
-    })();
+    const tokenlimit = resolveTokenLimit(matchingBlock, "text");
 
-    // typed: use chatAppend only
+    // typed: use textAppend from block only
     const instrBackup = chatContext.instructions;
     try {
-      const add = (channelMeta.chatAppend || "").trim();
+      const add = (matchingBlock?.textAppend || "").trim();
       if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
     } catch {}
 
