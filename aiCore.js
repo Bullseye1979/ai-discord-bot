@@ -57,7 +57,7 @@ const keepAliveHttpsAgent = new https.Agent({
 const axiosAI = axios.create({
   httpAgent: keepAliveHttpAgent,
   httpsAgent: keepAliveHttpsAgent,
-  timeout: 60_000,
+  timeout: 180_000,
   maxRedirects: 0,
   maxBodyLength: Infinity,
   maxContentLength: Infinity,
