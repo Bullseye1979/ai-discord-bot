@@ -1,6 +1,7 @@
-// bot.js — refactored v3.12
-// typed tool-calls, per-message reactions, presence, one-shot BUSY gate, tool-flow commit
-// Commands: !context, !summarize, !purge-db, !joinvc, !leavevc. Voice transcripts → AI reply + TTS. Cron support. Static /documents.
+// bot.js — refactored v3.12 → v3.13
+// Neuerungen:
+// - 100% Inaktivität in Channels ohne Config (früher Return; keine Webhooks/Replies/Commands/Join).
+// - Endpoint-Support pro Block/global (wird an aiCore.getAIResponse übergeben).
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -204,6 +205,19 @@ async function deleteAllMessages(channel) {
   }
 }
 
+/** LLM-Endpunkt/Key/Modell pro Turn auflösen (Block > Global > ENV/Default) */
+function resolveEffectiveLLM(channelMeta, matchingBlock) {
+  return {
+    model: matchingBlock?.model || channelMeta.model || "gpt-4o",
+    apikey: matchingBlock?.apikey || channelMeta.apikey || null,
+    endpoint:
+      matchingBlock?.endpoint ||
+      channelMeta.endpoint ||
+      process.env.OPENAI_BASE_URL ||
+      "https://api.openai.com/v1",
+  };
+}
+
 /** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate) */
 async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {
   let ch = null;
@@ -216,6 +230,10 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     if (voiceBusy.get(evt.channelId)) return;
 
     const channelMeta = getChannelConfig(evt.channelId);
+
+    // 🔒 Absolute Inaktivität, wenn keine Config vorhanden
+    if (!channelMeta?.hasConfig) return;
+
     chatContext = ensureChatContextForChannel(evt.channelId, storage, channelMeta);
 
     if (typeof chatContext.setUserWindow === "function") {
@@ -224,7 +242,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       });
     }
 
-    // === Voice-Block NUR über SPEAKER (Discord-ID), KEIN user-OR ===
+    // === Voice-Block NUR über SPEAKER (Discord-ID)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const userId = String(evt.userId || "").trim();
 
@@ -246,12 +264,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     // Kein Block → keine Antwort / kein Zugriff (Voice)
     if (!matchingBlock) return;
 
-    const bypassTrigger = matchingBlock.noTrigger === true;
-
-    // Technische Einstellungen (Original-Fallbacks beibehalten)
-    let effectiveModel = matchingBlock?.model || channelMeta.model || undefined;
-    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
-
+    // Tools setzen (Block-spezifisch, sonst leer)
     if (
       matchingBlock &&
       Array.isArray(matchingBlock.tools) &&
@@ -263,9 +276,12 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       chatContext.tools = blockTools;
       chatContext.toolRegistry = blockRegistry;
     } else {
-      chatContext.tools = channelMeta.tools;
-      chatContext.toolRegistry = channelMeta.toolRegistry;
+      chatContext.tools = [];
+      chatContext.toolRegistry = {};
     }
+
+    const { model: effectiveModel, apikey: effectiveApiKey, endpoint: effectiveEndpoint } =
+      resolveEffectiveLLM(channelMeta, matchingBlock);
 
     const tokenlimit = (() => {
       const raw = channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker;
@@ -295,7 +311,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       sequenceLimit,
       effectiveModel,
       effectiveApiKey,
-      { pendingUser: pendingUserTurn } // pass pending user-turn for working copy + commit after
+      { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint } // ⬅︎ Endpoint übergeben
     );
     replyText = (replyText || "").trim();
     if (!replyText) return;
@@ -357,7 +373,9 @@ client.on("messageCreate", async (message) => {
 
     const baseChannelId = message.channelId;
     const channelMeta = getChannelConfig(baseChannelId);
-    if (!channelMeta) return;
+
+    // 🔒 Absolute Inaktivität, wenn keine Config vorhanden
+    if (!channelMeta?.hasConfig) return;
 
     const key = `channel:${baseChannelId}`;
     const signature = metaSig(channelMeta);
@@ -406,20 +424,11 @@ client.on("messageCreate", async (message) => {
     const selfIssued = message.author?.id === client.user?.id;
 
     if (isCommand) {
-      if (!channelMeta.hasConfig) {
-        await reportInfo(
-          message.channel,
-          "Commands are disabled in channels without a channel-config file.",
-          "COMMANDS"
-        );
-        return;
-      }
+      // Commands sind nur in konfigurierten Channels erlaubt – aber wir sind hier
+      // ohnehin nur drin, wenn hasConfig === true (früher Return oben).
+      if (!channelMeta.hasConfig) return;
       if (!selfIssued && !isChannelAdmin(channelMeta, message.author.id)) {
-        await reportInfo(
-          message.channel,
-          "You are not authorized to run commands in this channel.",
-          "COMMANDS"
-        );
+        // Optional: stumm bleiben statt Info – absolute Inaktivität
         return;
       }
     }
@@ -431,22 +440,7 @@ client.on("messageCreate", async (message) => {
     const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
 
-    // === Frühe Block-Prüfung nur über USER (damit noTrigger textseitig korrekt ist)
-    const blocksEarly = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
-    const pickBlockForUserEarly = () => {
-      let exact = null, wildcard = null;
-      for (const b of blocksEarly) {
-        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
-        if (!us.length) continue;
-        if (us.includes("*") && !wildcard) wildcard = b;
-        if (authorId && us.includes(authorId) && !exact) exact = b;
-      }
-      return exact || wildcard || null;
-    };
-    const matchBlockEarly = pickBlockForUserEarly();
-    const bypassTriggerEarly = matchBlockEarly?.noTrigger === true;
-
-    if (!isCommand && !(isTrigger || bypassTriggerEarly) && !message.author?.bot && !message.webhookId) {
+    if (!isCommand && !isTrigger && !message.author?.bot && !message.webhookId) {
       await setAddUserMessage(message, chatContext);
     }
 
@@ -456,6 +450,8 @@ client.on("messageCreate", async (message) => {
 
       if (lower.startsWith("+consent_chat")) {
         await setChatConsent(authorId, baseChannelId, true);
+        // Optional: still bleiben? Dann return ohne Info:
+        // return;
         await reportInfo(message.channel, "Chat consent saved for this channel.", "CONSENT");
         return;
       }
@@ -533,6 +529,7 @@ client.on("messageCreate", async (message) => {
 
     // !joinvc
     if (rawText.startsWith("!joinvc")) {
+      // Nur mit Config erlaubt; hier sind wir bereits nur bei hasConfig === true.
       try {
         let gm = null;
         try { gm = await message.guild.members.fetch(message.author.id); } catch {}
@@ -563,6 +560,10 @@ client.on("messageCreate", async (message) => {
         setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
           try {
             const channelMeta = getChannelConfig(evt.channelId);
+
+            // 🔒 Voice-Listener: komplett stumm, wenn keine Config
+            if (!channelMeta?.hasConfig) return;
+
             const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
 
             if (typeof chatContext.setUserWindow === "function") {
@@ -589,7 +590,7 @@ client.on("messageCreate", async (message) => {
             const bypassTrigger = !!voiceBlock && voiceBlock.noTrigger === true;
             const invoked = !!voiceBlock && (bypassTrigger || firstWordEqualsName(evt.text, TRIGGER));
 
-            // Immer loggen, wenn NICHT invoked (wie bisher)
+            // Immer loggen, wenn NICHT invoked
             if (!invoked) {
               try {
                 await chatContext.add(
@@ -598,11 +599,8 @@ client.on("messageCreate", async (message) => {
                   String(evt.text || "").trim(),
                   evt.startedAtMs || Date.now()
                 );
-                console.log("[VOICE→DB] stored transcript", {
-                  channelId: evt.channelId,
-                  speaker: evt.speaker || "voice",
-                  len: (String(evt.text || "").trim()).length
-                });
+                // optional debug log
+                // console.log("[VOICE→DB] stored transcript", { channelId: evt.channelId });
               } catch (e) {
                 await reportError(e, null, "VOICE_LOG_CONTEXT_NONINVOKED", { emit: "channel" });
               }
@@ -773,10 +771,7 @@ client.on("messageCreate", async (message) => {
     await setMessageReaction(message, "⏳");
     incPresence();
 
-    // Technische Einstellungen (Original-Fallbacks beibehalten)
-    let effectiveModel = matchingBlock?.model || channelMeta.model || "gpt-4o";
-    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
-
+    // Tools setzen (Block-spezifisch, sonst global)
     if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
@@ -785,6 +780,10 @@ client.on("messageCreate", async (message) => {
       chatContext.tools = channelMeta.tools;
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
+
+    // Modell/Key/Endpoint pro Block/Channel holen
+    const { model: effectiveModel, apikey: effectiveApiKey, endpoint: effectiveEndpoint } =
+      resolveEffectiveLLM(channelMeta, matchingBlock);
 
     const tokenlimit = (() => {
       const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
@@ -795,7 +794,7 @@ client.on("messageCreate", async (message) => {
         : def;
     })();
 
-    // typed: use chatAppend only (global beibehalten)
+    // typed: use chatAppend only
     const instrBackup = chatContext.instructions;
     try {
       const add = (channelMeta.chatAppend || "").trim();
@@ -816,7 +815,7 @@ client.on("messageCreate", async (message) => {
         1000,
         effectiveModel,
         effectiveApiKey,
-        { pendingUser: pendingUserTurn }
+        { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint } // ⬅︎ Endpoint übergeben
       );
 
       if (output && String(output).trim()) {

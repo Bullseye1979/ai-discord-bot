@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.9 (hardened + strict pairing + debug)
+// aiCore.js — refactored v2.10 (endpoint override + conditional auth)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -8,6 +8,7 @@
 // v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
 // v2.8: Hardened tool_call flow (no empty tool_calls; strict ordering intent in loop).
 // v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
+// v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
 
 require("dotenv").config();
 const fs = require("fs"); // retained for potential future file-priming
@@ -138,9 +139,18 @@ function normalizeEndpoint(raw) {
   const fallback = "https://api.openai.com/v1/chat/completions";
   let url = (raw || "").trim();
   if (!url) return fallback;
-  if (/\/v1\/responses\/?$/.test(url)) return url.replace(/\/v1\/responses\/?$/, "/v1/chat/completions");
+
+  // if already a chat/completions endpoint, keep it
+  if (/\/v1\/chat\/completions\/?$/.test(url)) return url.replace(/\/+$/, "");
+
+  // normalize /v1 or /v1/ → /v1/chat/completions
   if (/\/v1\/?$/.test(url)) return url.replace(/\/v1\/?$/, "/v1/chat/completions");
-  return url;
+
+  // normalize /v1/responses → /v1/chat/completions
+  if (/\/v1\/responses\/?$/.test(url)) return url.replace(/\/v1\/responses\/?$/, "/v1/chat/completions");
+
+  // leave other URLs as-is (e.g., fully qualified non-OpenAI-compatible endpoints)
+  return url.replace(/\/+$/, "");
 }
 
 /**
@@ -236,7 +246,7 @@ function loadEnvPriming() {
  * @param {number}  sequenceLimit
  * @param {string}  model
  * @param {string|null} apiKey
- * @param {object}  options               // { pendingUser?: {name, content, timestamp} }
+ * @param {object}  options               // { pendingUser?: {name, content, timestamp}, endpoint?: string }
  */
 async function getAIResponse(
   context_orig,
@@ -341,9 +351,14 @@ async function getAIResponse(
         tools: context.tools,
       };
 
-      // Resolve endpoint
-      const configured = (process.env.OPENAI_API_URL || OPENAI_API_URL || "").trim();
-      const endpoint = normalizeEndpoint(configured) || "https://api.openai.com/v1/chat/completions";
+      // Resolve endpoint (options.endpoint > ENV > config > default) and normalize
+      const configuredRaw =
+        (options?.endpoint || "").trim() ||
+        (process.env.OPENAI_API_URL || "").trim() ||
+        (OPENAI_API_URL || "").trim();
+
+      const endpoint =
+        normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
 
       // === DEBUG SNAPSHOT (printed on failure) ===
       const __REQUEST_DEBUG_SNAPSHOT = {
@@ -361,14 +376,17 @@ async function getAIResponse(
         handoverMessages: handoverContext.messages,
       };
 
+      // Headers (Authorization nur, wenn Key vorhanden)
+      const headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+      };
+      if (authKey) headers.Authorization = `Bearer ${authKey}`;
+
       // API Call (with retry)
       let aiResponse;
       try {
-        aiResponse = await postWithRetry(endpoint, payload, {
-          Authorization: `Bearer ${authKey}`,
-          "Content-Type": "application/json",
-          Connection: "keep-alive",
-        });
+        aiResponse = await postWithRetry(endpoint, payload, headers);
       } catch (err) {
         const details = {
           endpoint,
