@@ -224,7 +224,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       });
     }
 
-    // === FIX: Voice-Block NUR über SPEAKER (Discord-ID), KEIN user-OR mehr ===
+    // === Voice-Block NUR über SPEAKER (Discord-ID), KEIN user-OR ===
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const userId = String(evt.userId || "").trim();
 
@@ -248,7 +248,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
 
     const bypassTrigger = matchingBlock.noTrigger === true;
 
-    // Technische Einstellungen mit Channel-Fallback (wie Original)
+    // Technische Einstellungen (Original-Fallbacks beibehalten)
     let effectiveModel = matchingBlock?.model || channelMeta.model || undefined;
     let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
 
@@ -431,7 +431,22 @@ client.on("messageCreate", async (message) => {
     const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
 
-    if (!isCommand && !isTrigger && !message.author?.bot && !message.webhookId) {
+    // === Frühe Block-Prüfung nur über USER (damit noTrigger textseitig korrekt ist)
+    const blocksEarly = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
+    const pickBlockForUserEarly = () => {
+      let exact = null, wildcard = null;
+      for (const b of blocksEarly) {
+        const us = Array.isArray(b.user) ? b.user.map(x => String(x).trim()) : [];
+        if (!us.length) continue;
+        if (us.includes("*") && !wildcard) wildcard = b;
+        if (authorId && us.includes(authorId) && !exact) exact = b;
+      }
+      return exact || wildcard || null;
+    };
+    const matchBlockEarly = pickBlockForUserEarly();
+    const bypassTriggerEarly = matchBlockEarly?.noTrigger === true;
+
+    if (!isCommand && !(isTrigger || bypassTriggerEarly) && !message.author?.bot && !message.webhookId) {
       await setAddUserMessage(message, chatContext);
     }
 
@@ -495,7 +510,7 @@ client.on("messageCreate", async (message) => {
           "CRON"
         );
       } catch (e) {
-               await reportError(e, message.channel, "CMD_RELOAD_CRON", { emit: "channel" });
+        await reportError(e, message.channel, "CMD_RELOAD_CRON", { emit: "channel" });
       }
       return;
     }
@@ -556,7 +571,7 @@ client.on("messageCreate", async (message) => {
 
             const TRIGGER = (channelMeta.name || "").trim();
 
-            // === FIX: Voice-Block nur via SPEAKER (Discord-ID); noTrigger berücksichtigen ===
+            // === Voice-Block nur via SPEAKER (Discord-ID); noTrigger berücksichtigen ===
             const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
             const userId = String(evt.userId || "").trim();
 
@@ -726,21 +741,14 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Normal flow: explicit trigger (typed chat)
+    // =========================
+    // Normal flow: typed chat
+    // =========================
     if (message.author?.bot || message.webhookId) return;
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    if (!isTrigger) return;
-
-    // Reactions + presence
-    await setMessageReaction(message, "⏳");
-    incPresence();
-
-    // Block selection for typed chat — by user id
-    let effectiveModel = channelMeta.model || "gpt-4o";
-    let effectiveApiKey = channelMeta.apikey || null;
-
+    // Block selection for typed chat — STRICTLY by user id (with wildcard)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const pickBlockForUser = () => {
       let exact = null, wildcard = null;
@@ -754,6 +762,21 @@ client.on("messageCreate", async (message) => {
     };
     const matchingBlock = pickBlockForUser();
 
+    // Kein passender USER-Block → keine Antwort
+    if (!matchingBlock) return;
+
+    // noTrigger: Triggerwort nicht nötig
+    const bypassTrigger = matchingBlock.noTrigger === true;
+    if (!bypassTrigger && !isTrigger) return;
+
+    // Reactions + presence
+    await setMessageReaction(message, "⏳");
+    incPresence();
+
+    // Technische Einstellungen (Original-Fallbacks beibehalten)
+    let effectiveModel = matchingBlock?.model || channelMeta.model || "gpt-4o";
+    let effectiveApiKey = matchingBlock?.apikey || channelMeta.apikey || null;
+
     if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
@@ -762,8 +785,6 @@ client.on("messageCreate", async (message) => {
       chatContext.tools = channelMeta.tools;
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
-    if (matchingBlock?.model)  effectiveModel  = matchingBlock.model;
-    if (matchingBlock?.apikey) effectiveApiKey = matchingBlock.apikey;
 
     const tokenlimit = (() => {
       const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
@@ -774,7 +795,7 @@ client.on("messageCreate", async (message) => {
         : def;
     })();
 
-    // typed: use chatAppend only
+    // typed: use chatAppend only (global beibehalten)
     const instrBackup = chatContext.instructions;
     try {
       const add = (channelMeta.chatAppend || "").trim();
