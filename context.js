@@ -454,15 +454,34 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
   }
 
   /**
-   * Redo: delete newest summary and immediately summarize again with same delta and prompt logic.
-   * Gleiches Locking/Gating wie summarizeSince(), da intern erneut summarizeSince() aufgerufen wird.
+   * Redo: delete newest summary and immediately summarize again with the SAME window as the deleted one
+   * if no explicit cutoffMs is provided.
    */
   async redoLastSummary(cutoffMs, customPrompt = null) {
     if (!this.persistent) {
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
     }
+
+    // Falls kein cutoffMs übergeben ist: den Timestamp der jüngsten Summary als Cutoff verwenden.
+    let effectiveCutoffMs = cutoffMs;
+    try {
+      if (!effectiveCutoffMs) {
+        const db = await getPool();
+        const [rows] = await db.execute(
+          `SELECT id, timestamp FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+          [this.channelId]
+        );
+        const ts = rows?.[0]?.timestamp;
+        if (ts) {
+          // MySQL DATETIME "YYYY-MM-DD HH:mm:ss" -> ms (UTC)
+          const parsed = Date.parse(String(ts).replace(" ", "T") + "Z");
+          if (!Number.isNaN(parsed)) effectiveCutoffMs = parsed;
+        }
+      }
+    } catch {}
+
     await this.deleteLastSummary(); // Cursor springt auf die vorherige Summary zurück
-    return this.summarizeSince(cutoffMs, customPrompt);
+    return this.summarizeSince(effectiveCutoffMs || Date.now(), customPrompt);
   }
 
   /** Get newest N summaries. */
