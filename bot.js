@@ -440,9 +440,8 @@ client.on("messageCreate", async (message) => {
     const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
 
-    if (!isCommand && !isTrigger && !message.author?.bot && !message.webhookId) {
-      await setAddUserMessage(message, chatContext);
-    }
+    // ❌ (CONSENT FIX) — KEIN Logging mehr vor Consent!
+    // (Der bisherige Block `setAddUserMessage` vor dem Consent wurde entfernt.)
 
     // Consent quick-commands
     {
@@ -745,6 +744,12 @@ client.on("messageCreate", async (message) => {
     if (message.author?.bot || message.webhookId) return;
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
+
+    // ✅ (CONSENT FIX) — ab hier ist Consent sicher:
+    // Non-trigger Chat wird nun *nach* Consent geloggt.
+    if (!isTrigger) {
+      await setAddUserMessage(message, chatContext);
+    }
 
     // Block selection for typed chat — STRICTLY by user id (with wildcard)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
