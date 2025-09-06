@@ -11,5 +11,6 @@ module.exports = {
 - Prefer digital art style.
 - Prefer dynamic action-packed scenes, when appropriate.
 - Ensure that each hand only has 5 fingers. Persons only have 2 arms and 2 legs. Avoid deformed faces and bodies.
-- Ensure descriptions are not inappropriate or suggestive in any way.`
+- Ensure descriptions are not inappropriate or suggestive in any way.
+- No Text`
 };
