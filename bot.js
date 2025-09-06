@@ -472,7 +472,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !clear-channel / !purge-channel
-    if (rawText.startsWith("!clear-channel") || rawText.startsWith("!purge-channel")) {
+    if (rawText.trim() === "!clear-channel") {
       try {
         await deleteAllMessages(message.channel);
         await reportInfo(message.channel, "Channel cleared.", "MAINTENANCE");
@@ -488,7 +488,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !context (view only)
-    if (rawText.startsWith("!context")) {
+    if (rawText.trim() === "!context") {
       const chunks = await chatContext.getContextAsChunks();
       for (const c of chunks)
         await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
@@ -496,7 +496,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !reload-cron
-    if (rawText.startsWith("!reload-cron")) {
+    if (rawText.trim() === "!reload-cron") {
       try {
         const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
         await reportInfo(
@@ -511,7 +511,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !purge-db
-    if (rawText.startsWith("!purge-db")) {
+    if (rawText.trim() === "!purge-db") {
       try {
         const res = await chatContext.purgeChannelData();
         await reportInfo(
@@ -527,7 +527,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !joinvc
-    if (rawText.startsWith("!joinvc")) {
+    if (rawText.trim() === "!joinvc") {
       // Nur mit Config erlaubt; hier sind wir bereits nur bei hasConfig === true.
       try {
         let gm = null;
@@ -647,7 +647,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !leavevc
-    if (rawText.startsWith("!leavevc")) {
+    if (rawText.trim() === "!leavevc") {
       try {
         const conn = getVoiceConnection(message.guild.id);
         if (conn) {
@@ -664,7 +664,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !summarize
-    if (rawText.startsWith("!summarize")) {
+    if (rawText.trim() === "!summarize") {
       if (!channelMeta.summariesEnabled) {
         await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
         return;
@@ -739,7 +739,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !summarize-redo
-    if (rawText.startsWith("!summarize-redo")) {
+    if (rawText.trim() === "!summarize-redo") {
       if (!channelMeta.summariesEnabled) {
         await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
         return;
@@ -791,7 +791,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // !summarize-replace
-    if (rawText.startsWith("!summarize-replace")) {
+    if (rawText.trim() === "!summarize-replace") {
       if (!channelMeta.summariesEnabled) {
         await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
         return;
