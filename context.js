@@ -1,5 +1,9 @@
-// context.js — clean v5.2b (Delta + Chunking, DB_* env names)
-// Conversation context with optional MySQL persistence, delta summaries, chunking, and user-window trimming.
+// context.js — v5.4 (Delta + Chunking with prompt-on-chunks + Redo)
+// - Persistenter Verlauf in MySQL
+// - Inkrementelle Summaries (Delta seit letztem Cursor)
+// - Chunking: bereits der Chunk-Pass nutzt den channel summaryPrompt (OOC greift früh)
+// - Final-Pass nutzt denselben Prompt erneut (konsistente Filterung)
+// - redoLastSummary(): löscht jüngste Summary + erzeugt sofort eine neue (gleiches Locking)
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -41,10 +45,8 @@ async function ensureTables(pool) {
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-    await c.query(`
-      ALTER TABLE summaries
-      ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
-    `).catch(() => {});
+    // für ältere DBs
+    await c.query(`ALTER TABLE summaries ADD COLUMN IF NOT EXISTS last_context_id INT NULL;`).catch(() => {});
   } finally {
     c.release();
   }
@@ -53,7 +55,7 @@ async function ensureTables(pool) {
 /** DB pool getter (lazy). */
 async function getPool() {
   if (!pool) {
-    // Prefer your ENV names; fall back to old MYSQL_* for compatibility.
+    // Deine ENV-Namen bevorzugt; Fallback auf alte MYSQL_* für Kompatibilität
     const host = process.env.DB_HOST || process.env.MYSQL_HOST || "127.0.0.1";
     const user = process.env.DB_USER || process.env.MYSQL_USER || "root";
     const password = process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || "";
@@ -61,11 +63,7 @@ async function getPool() {
     const port = Number(process.env.DB_PORT || process.env.MYSQL_PORT || 3306);
 
     pool = await mysql.createPool({
-      host,
-      user,
-      password,
-      database,
-      port,
+      host, user, password, database, port,
       connectionLimit: 5,
       charset: "utf8mb4",
       supportBigNumbers: true,
@@ -81,7 +79,6 @@ async function getPool() {
 function isSystem(msg) { return msg?.role === "system"; }
 function isSummary(msg) { return msg?.role === "assistant" && (msg?.name === "summary" || /^summary/i.test(msg?.name || "")); }
 function isUser(msg) { return msg?.role === "user"; }
-function isTool(msg) { return msg?.role === "tool"; }
 function isAssistantToolCall(msg) { return msg?.role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0; }
 
 /** Group messages into user-led blocks (system isolated, summaries separated). */
@@ -178,13 +175,11 @@ class Context {
     if (cap != null) this._enforceUserWindowCap();
   }
 
-  /** Count user-led blocks. */
   _countUserBlocks() {
     const { blocks } = buildBlocks(this.messages);
     return blocks.filter(b => b.some(isUser)).length;
   }
 
-  /** Enforce the rolling window by dropping oldest user-blocks. */
   _enforceUserWindowCap() {
     if (this._maxUserMessages == null) return;
     const have = this._countUserBlocks();
@@ -193,7 +188,6 @@ class Context {
     }
   }
 
-  /** Post-add trimming hook to keep tool-call pairs and window intact. */
   _afterAddTrim(lastRole) {
     if (this._maxUserMessages == null) return;
     const L = this.messages.length;
@@ -239,7 +233,6 @@ class Context {
     }
   }
 
-  /** Rebuild memory to only the system message. */
   _rebuildSystemOnly() {
     const sys = `${this.persona}\n${this.instructions}`.trim();
     this.messages = sys ? [{ role: "system", name: "system", content: sys }] : [];
@@ -294,8 +287,9 @@ class Context {
 
   /**
    * Summarize logs since last cursor up to cutoff (UTC ms), store one new summary, and advance cursor.
-   * - Keeps "delta" behavior (no full history pass).
-   * - Uses adaptive chunking for long inputs, then a final pass with the channel's summaryPrompt (OOC filter).
+   * - Delta-Verhalten bleibt (kein Full-History-Pass).
+   * - Chunking mit frühem OOC/Filter: Der channel summaryPrompt wird bereits auf die Chunks angewandt.
+   * - Final-Pass fasst die Chunk-Outputs erneut mit demselben Prompt zu EINER Summary zusammen.
    */
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (!this.persistent || this.isSummarizing) {
@@ -303,31 +297,18 @@ class Context {
     }
     this.isSummarizing = true;
 
-    // Neutral extractive prompt for chunk passes (no story style, keep maximal detail)
-    const CHUNK_EXTRACTIVE_PROMPT = `
-You are producing a strictly extractive, chronological outline of the given chat log segment.
-- Preserve concrete facts, names (exact spelling), dates/times, items, places, decisions, and numeric results.
-- Avoid creativity. Do not invent, rephrase minimally, and DO NOT DROP details.
-- Use compact bullet points (•) grouped by subtopic when helpful.
-- If parts look like dice/math/meta/OOC, keep them but mark with [OOC?] tag; do not filter.
-- Output only the outline (no intro/outro).
-`.trim();
+    const FINAL_MODEL = "gpt-4o";
+    const MAX_INPUT_TOKENS_PER_CHUNK = 1800; // grobe Heuristik (≈ Wörter)
+    const CHUNK_OUTPUT_TOKENS = 800;
+    const MAX_FINAL_TOKENS = 3000;
 
-    // Default fallback if no channel summaryPrompt/custom is provided.
     const DEFAULT_FINAL_PROMPT = `
 Summarize the provided chat logs concisely. Capture key points, decisions, follow-ups, references, and open questions.
 Use bullet points, preserve dates/times, and include brief quotes only when necessary. Avoid speculation and omit trivial chit-chat.
 `.trim();
 
-    // Simple heuristics for chunking
-    const MAX_INPUT_TOKENS_PER_CHUNK = 1800;   // rough word-count heuristic
-    const MAX_FINAL_TOKENS = 3000;             // final recap budget
-    const CHUNK_OUTPUT_TOKENS = 800;           // per chunk outline budget
-    const FINAL_MODEL = "gpt-4o";              // stronger model for the final pass
-
     const tokenCount = (s) => String(s || "").trim().split(/\s+/).length;
 
-    // Prepare DB fetch of delta
     try {
       const db = await getPool();
       const [lastSum] = await db.execute(
@@ -362,20 +343,25 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
       let insertedSummaryId = null;
 
       if (rows.length) {
-        // Build "raw lines" text (1 line per DB row)
+        // Roh-Lines aufbauen
         const makeLine = (r) => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`;
         const lines = rows.map(makeLine);
 
-        // Decide if we need chunking
+        const finalPrompt =
+          (customPrompt && customPrompt.trim()) ||
+          (this.summaryPrompt && this.summaryPrompt.trim()) ||
+          DEFAULT_FINAL_PROMPT;
+
+        // Chunking ja/nein
         const totalTokens = tokenCount(lines.join("\n"));
         const needsChunking = totalTokens > MAX_INPUT_TOKENS_PER_CHUNK * 1.2;
 
         let finalMaterial;
         if (!needsChunking) {
-          // Single pass – send raw logs directly into final prompt
+          // kein Chunking: Material direkt in den Final-Pass geben
           finalMaterial = lines.join("\n");
         } else {
-          // Chunk input by approximate token budget
+          // in Chunks schneiden
           const chunks = [];
           let buf = [];
           let acc = 0;
@@ -392,12 +378,12 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
           }
           if (buf.length) chunks.push(buf.join("\n"));
 
-          // Summarize each chunk extractively
+          // Jeden Chunk mit DEMSELBEN summaryPrompt verdichten (OOC greift bereits hier)
           const chunkSummaries = [];
           for (let i = 0; i < chunks.length; i++) {
             const sumCtx = new Context(
-              "You are a chunk summarizer.",
-              CHUNK_EXTRACTIVE_PROMPT,
+              "You are a chunk summarizer (apply the same summary rules).",
+              finalPrompt,
               [],
               {},
               null,
@@ -405,19 +391,12 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
             );
             sumCtx.messages.push({ role: "user", name: "system", content: chunks[i] });
             const s = (await getAI(sumCtx, CHUNK_OUTPUT_TOKENS, FINAL_MODEL))?.trim() || "";
-            if (s) {
-              chunkSummaries.push(`-- Chunk ${i + 1}/${chunks.length} --\n${s}`);
-            }
+            if (s) chunkSummaries.push(`-- Chunk ${i + 1}/${chunks.length} --\n${s}`);
           }
           finalMaterial = chunkSummaries.join("\n\n");
         }
 
-        // Final pass with channel's summaryPrompt (OOC filter stays intact)
-        const finalPrompt =
-          (customPrompt && customPrompt.trim()) ||
-          (this.summaryPrompt && this.summaryPrompt.trim()) ||
-          DEFAULT_FINAL_PROMPT;
-
+        // Final-Pass mit demselben Prompt
         const finalCtx = new Context(
           "You are a channel summary generator.",
           finalPrompt,
@@ -426,13 +405,7 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
           null,
           { skipInitialSummaries: true, persistToDB: false }
         );
-
-        // Feed the material as "THIS_SESSION_TRANSCRIPT (condensed if chunked)"
-        finalCtx.messages.push({
-          role: "user",
-          name: "system",
-          content: finalMaterial
-        });
+        finalCtx.messages.push({ role: "user", name: "system", content: finalMaterial });
 
         const finalSummary = (await getAI(finalCtx, MAX_FINAL_TOKENS, FINAL_MODEL))?.trim() || "";
 
@@ -459,6 +432,37 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
     } finally {
       this.isSummarizing = false;
     }
+  }
+
+  /** Delete newest summary row for this.channelId. Returns deleted row id or null. */
+  async deleteLastSummary() {
+    if (!this.persistent) return null;
+    try {
+      const db = await getPool();
+      const [rows] = await db.execute(
+        `SELECT id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        [this.channelId]
+      );
+      const lastId = rows?.[0]?.id ?? null;
+      if (!lastId) return null;
+      await db.execute(`DELETE FROM summaries WHERE id=?`, [lastId]);
+      return lastId;
+    } catch (e) {
+      console.error("[SUMMARY] deleteLastSummary failed:", e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Redo: delete newest summary and immediately summarize again with same delta and prompt logic.
+   * Gleiches Locking/Gating wie summarizeSince(), da intern erneut summarizeSince() aufgerufen wird.
+   */
+  async redoLastSummary(cutoffMs, customPrompt = null) {
+    if (!this.persistent) {
+      return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
+    }
+    await this.deleteLastSummary(); // Cursor springt auf die vorherige Summary zurück
+    return this.summarizeSince(cutoffMs, customPrompt);
   }
 
   /** Get newest N summaries. */
