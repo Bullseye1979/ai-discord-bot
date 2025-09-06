@@ -536,6 +536,55 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
     for (let i = 0; i < full.length; i += max) out.push(full.slice(i, i + max));
     return out;
   }
+
+  /* ----------------------------- NEW: replace summary text only ----------------------------- */
+
+  /** Fetch newest context_log row for this channel. */
+  async _getLastContextRow() {
+    const db = await getPool();
+    const [rows] = await db.execute(
+      `SELECT id, timestamp, role, sender, content
+         FROM context_log
+        WHERE channel_id=?
+        ORDER BY id DESC
+        LIMIT 1`,
+      [this.channelId]
+    );
+    return rows?.[0] || null;
+  }
+
+  /**
+   * Replace ONLY the text of the newest summary with the content of the newest context_log row.
+   * - Keeps timestamp, id, and last_context_id of the summary unchanged.
+   * - If no summary exists: returns { ok:false, reason:"NO_SUMMARY" }.
+   * - If no context_log row exists: returns { ok:false, reason:"NO_CONTEXT_LOG" }.
+   */
+  async replaceLastSummaryWithLastLog() {
+    if (!this.persistent) return { ok: false, reason: "NOT_PERSISTENT" };
+    try {
+      const db = await getPool();
+
+      const lastLog = await this._getLastContextRow();
+      if (!lastLog) return { ok: false, reason: "NO_CONTEXT_LOG" };
+
+      const [sumRows] = await db.execute(
+        `SELECT id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        [this.channelId]
+      );
+      const sum = sumRows?.[0] || null;
+      if (!sum) return { ok: false, reason: "NO_SUMMARY" };
+
+      await db.execute(
+        `UPDATE summaries SET summary=? WHERE id=?`,
+        [String(lastLog.content || ""), sum.id]
+      );
+
+      return { ok: true, updated: sum.id };
+    } catch (e) {
+      console.error("[SUMMARY] replaceLastSummaryWithLastLog failed:", e.message);
+      return { ok: false, reason: "ERROR", error: e?.message || String(e) };
+    }
+  }
 }
 
 module.exports = Context;

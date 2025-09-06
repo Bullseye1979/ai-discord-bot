@@ -738,6 +738,99 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
+    // !summarize-redo
+    if (rawText.startsWith("!summarize-redo")) {
+      if (!channelMeta.summariesEnabled) {
+        await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
+        return;
+      }
+
+      await reportInfo(message.channel, "**Redo in progress…** New messages won’t be considered.", "SUMMARY");
+
+      const cutoffMs = Date.now();
+      const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
+
+      try {
+        const before = await chatContext.getLastSummaries(1).catch(() => []);
+        await chatContext.redoLastSummary(cutoffMs, customPrompt);
+        const after = await chatContext.getLastSummaries(1).catch(() => []);
+        const createdNew =
+          (before.length === 0 && after.length > 0) ||
+          (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
+
+        if (!createdNew) {
+          await setReplyAsWebhookEmbed(
+            message,
+            "No messages to summarize yet.",
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
+          return;
+        }
+      } catch (e) {
+        await reportError(e, message.channel, "CMD_SUMMARIZE_REDO_RUN", { emit: "channel" });
+        await reportInfo(message.channel, "Redo failed.", "SUMMARY");
+        return;
+      }
+
+      try {
+        const last = await chatContext.getLastSummaries(1);
+        if (!last?.length) {
+          await setReplyAsWebhookEmbed(message, "No summaries available yet.", { botname: channelMeta.botname, color: 0x00b3ff });
+        } else {
+          const r = last[0];
+          await setReplyAsWebhookEmbed(
+            message,
+            `**Summary — ${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`,
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
+        }
+      } catch (e) {
+        await reportError(e, message.channel, "CMD_SUMMARIZE_REDO_POST", { emit: "channel" });
+      }
+      return;
+    }
+
+    // !summarize-replace
+    if (rawText.startsWith("!summarize-replace")) {
+      if (!channelMeta.summariesEnabled) {
+        await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
+        return;
+      }
+
+      try {
+        const res = await chatContext.replaceLastSummaryWithLastLog();
+        if (!res?.ok) {
+          const reason = res?.reason || "Unknown";
+          await setReplyAsWebhookEmbed(
+            message,
+            `Replace failed (${reason}).`,
+            { botname: channelMeta.botname, color: 0xff3b30 }
+          );
+          return;
+        }
+
+        const last = await chatContext.getLastSummaries(1);
+        if (!last?.length) {
+          await setReplyAsWebhookEmbed(
+            message,
+            "No summaries available after replace.",
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
+        } else {
+          const r = last[0];
+          await setReplyAsWebhookEmbed(
+            message,
+            `**Summary — ${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`,
+            { botname: channelMeta.botname, color: 0x00b3ff }
+          );
+        }
+      } catch (e) {
+        await reportError(e, message.channel, "CMD_SUMMARIZE_REPLACE", { emit: "channel" });
+        await reportInfo(message.channel, "Replace failed.", "SUMMARY");
+      }
+      return;
+    }
+
     // =========================
     // Normal flow: typed chat
     // =========================
