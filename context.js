@@ -1,9 +1,11 @@
-// context.js — clean v5.0
-// Conversation context with optional MySQL persistence, summaries, and user-window trimming.
+// context.js — clean v5.2 (Delta + Chunking)
+// Conversation context with optional MySQL persistence, delta summaries, chunking, and user-window trimming.
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
+
+/* ----------------------------- DB bootstrap ----------------------------- */
 
 let pool;
 
@@ -13,12 +15,67 @@ function toMySQLDateTime(date = new Date()) {
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
 
-/** Message role predicates. */
+/** Create tables if they do not exist. */
+async function ensureTables(pool) {
+  const c = await pool.getConnection();
+  try {
+    await c.query(`
+      CREATE TABLE IF NOT EXISTS context_log (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        timestamp DATETIME NOT NULL,
+        channel_id VARCHAR(64) NOT NULL,
+        role VARCHAR(50) NOT NULL,
+        sender VARCHAR(64) NOT NULL,
+        content MEDIUMTEXT NOT NULL,
+        INDEX idx_ch_ts (channel_id, timestamp),
+        INDEX idx_ch_id (channel_id, id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    await c.query(`
+      CREATE TABLE IF NOT EXISTS summaries (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        timestamp DATETIME NOT NULL,
+        channel_id VARCHAR(64) NOT NULL,
+        summary MEDIUMTEXT NOT NULL,
+        last_context_id INT NULL,
+        INDEX idx_sum_ch_id (channel_id, id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    await c.query(`
+      ALTER TABLE summaries
+      ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
+    `).catch(() => {});
+  } finally {
+    c.release();
+  }
+}
+
+/** DB pool getter (lazy). */
+async function getPool() {
+  if (!pool) {
+    pool = await mysql.createPool({
+      host: process.env.MYSQL_HOST || "127.0.0.1",
+      user: process.env.MYSQL_USER || "root",
+      password: process.env.MYSQL_PASSWORD || "",
+      database: process.env.MYSQL_DATABASE || "discordgpt",
+      port: Number(process.env.MYSQL_PORT || 3306),
+      connectionLimit: 5,
+      charset: "utf8mb4",
+      supportBigNumbers: true,
+      dateStrings: true,
+    });
+    await ensureTables(pool);
+  }
+  return pool;
+}
+
+/* ----------------------------- Helpers for windowing ----------------------------- */
+
 function isSystem(msg) { return msg?.role === "system"; }
 function isSummary(msg) { return msg?.role === "assistant" && (msg?.name === "summary" || /^summary/i.test(msg?.name || "")); }
 function isUser(msg) { return msg?.role === "user"; }
-function isAssistantToolCall(msg) { return msg?.role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0; }
 function isTool(msg) { return msg?.role === "tool"; }
+function isAssistantToolCall(msg) { return msg?.role === "assistant" && Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0; }
 
 /** Group messages into user-led blocks (system isolated, summaries separated). */
 function buildBlocks(messages) {
@@ -78,61 +135,8 @@ function sanitizeName(input, fallback = "user") {
     .slice(0, 64) || fallback;
 }
 
-/** Get or create a MySQL pool and ensure required tables. */
-async function getPool() {
-  if (!pool) {
-    pool = await mysql.createPool({
-      host: process.env.DB_HOST || "127.0.0.1",
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD || process.env.DB_PASS || "",
-      database: process.env.DB_NAME || process.env.DB_DATABASE,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-      timezone: "Z",
-      charset: "utf8mb4_general_ci",
-    });
-    await ensureTables(pool);
-  }
-  return pool;
-}
+/* ----------------------------- Context class ----------------------------- */
 
-/** Create tables if they do not exist. */
-async function ensureTables(pool) {
-  const c = await pool.getConnection();
-  try {
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS context_log (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        timestamp DATETIME NOT NULL,
-        channel_id VARCHAR(64) NOT NULL,
-        role VARCHAR(50) NOT NULL,
-        sender VARCHAR(64) NOT NULL,
-        content MEDIUMTEXT NOT NULL,
-        INDEX idx_ch_ts (channel_id, timestamp),
-        INDEX idx_ch_id (channel_id, id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-    await c.query(`
-      CREATE TABLE IF NOT EXISTS summaries (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        timestamp DATETIME NOT NULL,
-        channel_id VARCHAR(64) NOT NULL,
-        summary MEDIUMTEXT NOT NULL,
-        last_context_id INT NULL,
-        INDEX idx_sum_ch_id (channel_id, id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-    await c.query(`
-      ALTER TABLE summaries
-      ADD COLUMN IF NOT EXISTS last_context_id INT NULL;
-    `).catch(() => {});
-  } finally {
-    c.release();
-  }
-}
-
-/** Conversation context with optional DB persistence and summarization. */
 class Context {
   constructor(persona = "", instructions = "", tools = [], toolRegistry = {}, channelId = null, opts = {}) {
     const { skipInitialSummaries = false, persistToDB, summaryPrompt = "" } = opts;
@@ -279,17 +283,44 @@ class Context {
     }
   }
 
-  /** Summarize all logs up to a cutoff and store a new summary with cursor. */
+  /* ----------------------------- Summaries (Delta + Chunking) ----------------------------- */
+
+  /**
+   * Summarize logs since last cursor up to cutoff (UTC ms), store one new summary, and advance cursor.
+   * - Keeps "delta" behavior (no full history pass).
+   * - Uses adaptive chunking for long inputs, then a final pass with the channel's summaryPrompt (OOC filter).
+   */
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (!this.persistent || this.isSummarizing) {
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
     }
     this.isSummarizing = true;
 
-    const DEFAULT_EXTRACTIVE_PROMPT = `
-Summarize the provided chat logs concisely. Capture key points, decisions, follow-ups, references, and open questions. Use bullet points, preserve dates/times, and include brief quotes only when necessary. Avoid speculation and omit trivial chit-chat.
+    // Neutral extractive prompt for chunk passes (no story style, keep maximal detail)
+    const CHUNK_EXTRACTIVE_PROMPT = `
+You are producing a strictly extractive, chronological outline of the given chat log segment.
+- Preserve concrete facts, names (exact spelling), dates/times, items, places, decisions, and numeric results.
+- Avoid creativity. Do not invent, rephrase minimally, and DO NOT DROP details.
+- Use compact bullet points (•) grouped by subtopic when helpful.
+- If parts look like dice/math/meta/OOC, keep them but mark with [OOC?] tag; do not filter.
+- Output only the outline (no intro/outro).
 `.trim();
 
+    // Default fallback if no channel summaryPrompt/custom is provided.
+    const DEFAULT_FINAL_PROMPT = `
+Summarize the provided chat logs concisely. Capture key points, decisions, follow-ups, references, and open questions.
+Use bullet points, preserve dates/times, and include brief quotes only when necessary. Avoid speculation and omit trivial chit-chat.
+`.trim();
+
+    // Simple heuristics for chunking
+    const MAX_INPUT_TOKENS_PER_CHUNK = 1800;   // rough word-count heuristic
+    const MAX_FINAL_TOKENS = 3000;             // final recap budget
+    const CHUNK_OUTPUT_TOKENS = 800;           // per chunk outline budget
+    const FINAL_MODEL = "gpt-4o";              // stronger model for the final pass
+
+    const tokenCount = (s) => String(s || "").trim().split(/\s+/).length;
+
+    // Prepare DB fetch of delta
     try {
       const db = await getPool();
       const [lastSum] = await db.execute(
@@ -324,28 +355,85 @@ Summarize the provided chat logs concisely. Capture key points, decisions, follo
       let insertedSummaryId = null;
 
       if (rows.length) {
-        const text = rows.map(r => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`).join("\n");
-        const prompt =
+        // Build "raw lines" text (1 line per DB row)
+        const makeLine = (r) => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`;
+        const lines = rows.map(makeLine);
+
+        // Decide if we need chunking
+        const totalTokens = tokenCount(lines.join("\n"));
+        const needsChunking = totalTokens > MAX_INPUT_TOKENS_PER_CHUNK * 1.2;
+
+        let finalMaterial;
+        if (!needsChunking) {
+          // Single pass – send raw logs directly into final prompt
+          finalMaterial = lines.join("\n");
+        } else {
+          // Chunk input by approximate token budget
+          const chunks = [];
+          let buf = [];
+          let acc = 0;
+          for (const ln of lines) {
+            const t = tokenCount(ln);
+            if (acc + t > MAX_INPUT_TOKENS_PER_CHUNK && buf.length) {
+              chunks.push(buf.join("\n"));
+              buf = [ln];
+              acc = t;
+            } else {
+              buf.push(ln);
+              acc += t;
+            }
+          }
+          if (buf.length) chunks.push(buf.join("\n"));
+
+          // Summarize each chunk extractively
+          const chunkSummaries = [];
+          for (let i = 0; i < chunks.length; i++) {
+            const sumCtx = new Context(
+              "You are a chunk summarizer.",
+              CHUNK_EXTRACTIVE_PROMPT,
+              [],
+              {},
+              null,
+              { skipInitialSummaries: true, persistToDB: false }
+            );
+            sumCtx.messages.push({ role: "user", name: "system", content: chunks[i] });
+            const s = (await getAI(sumCtx, CHUNK_OUTPUT_TOKENS, FINAL_MODEL))?.trim() || "";
+            if (s) {
+              chunkSummaries.push(`-- Chunk ${i + 1}/${chunks.length} --\n${s}`);
+            }
+          }
+          finalMaterial = chunkSummaries.join("\n\n");
+        }
+
+        // Final pass with channel's summaryPrompt (OOC filter stays intact)
+        const finalPrompt =
           (customPrompt && customPrompt.trim()) ||
           (this.summaryPrompt && this.summaryPrompt.trim()) ||
-          DEFAULT_EXTRACTIVE_PROMPT;
+          DEFAULT_FINAL_PROMPT;
 
-        const sumCtx = new Context(
+        const finalCtx = new Context(
           "You are a channel summary generator.",
-          prompt,
+          finalPrompt,
           [],
           {},
           null,
           { skipInitialSummaries: true, persistToDB: false }
         );
-        sumCtx.messages.push({ role: "user", name: "system", content: text });
 
-        const summary = (await getAI(sumCtx, 900, "gpt-4-turbo", { temperature: 0.1 }))?.trim() || "";
-        if (summary) {
+        // Feed the material as "THIS_SESSION_TRANSCRIPT (condensed if chunked)"
+        finalCtx.messages.push({
+          role: "user",
+          name: "system",
+          content: finalMaterial
+        });
+
+        const finalSummary = (await getAI(finalCtx, MAX_FINAL_TOKENS, FINAL_MODEL))?.trim() || "";
+
+        if (finalSummary) {
           const [res] = await db.execute(
             `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
              VALUES (?, ?, ?, ?)`,
-            [toMySQLDateTime(new Date()), this.channelId, summary, maxId]
+            [toMySQLDateTime(new Date()), this.channelId, finalSummary, maxId]
           );
           insertedSummaryId = res?.insertId ?? null;
         }
