@@ -1,4 +1,4 @@
-// context.js — clean v5.2 (Delta + Chunking)
+// context.js — clean v5.2b (Delta + Chunking, DB_* env names)
 // Conversation context with optional MySQL persistence, delta summaries, chunking, and user-window trimming.
 
 require("dotenv").config();
@@ -53,12 +53,19 @@ async function ensureTables(pool) {
 /** DB pool getter (lazy). */
 async function getPool() {
   if (!pool) {
+    // Prefer your ENV names; fall back to old MYSQL_* for compatibility.
+    const host = process.env.DB_HOST || process.env.MYSQL_HOST || "127.0.0.1";
+    const user = process.env.DB_USER || process.env.MYSQL_USER || "root";
+    const password = process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || "";
+    const database = process.env.DB_NAME || process.env.MYSQL_DATABASE || "discord_ai";
+    const port = Number(process.env.DB_PORT || process.env.MYSQL_PORT || 3306);
+
     pool = await mysql.createPool({
-      host: process.env.DB_HOST || "127.0.0.1",
-      user: process.env.DB_USER || "root",
-      password: process.env.DBL_PASSWORD || "",
-      database: process.env.DB_DATABASE || "discordgpt",
-      port: Number(process.env.DB_PORT || 3306),
+      host,
+      user,
+      password,
+      database,
+      port,
       connectionLimit: 5,
       charset: "utf8mb4",
       supportBigNumbers: true,
