@@ -290,17 +290,24 @@ class Context {
    * - startId = last_summary.last_context_id (or 0)
    * - endId   = MAX(context_log.id) at execution time
    * Store one new summary with last_context_id=endId.
+   * Chunkgrößen per ENV steuerbar:
+   *   SUMMARY_CHUNK_WORDS (default 900), SUMMARY_CHUNK_THRESHOLD (default 1.05),
+   *   SUMMARY_CHUNK_OUT_TOKENS (default 600), SUMMARY_FINAL_TOKENS (default 2500)
    */
-  async summarizeSince(cutoffMs, customPrompt = null) {
+  async summarizeSince(cutoffMs, customPrompt = null, upperMaxContextId = null) {
     if (!this.persistent || this.isSummarizing) {
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
     }
     this.isSummarizing = true;
 
     const FINAL_MODEL = "gpt-4o";
-    const MAX_INPUT_TOKENS_PER_CHUNK = 1800; // grobe Heuristik (≈ Wörter)
-    const CHUNK_OUTPUT_TOKENS = 800;
-    const MAX_FINAL_TOKENS = 3000;
+
+    // ▼ Kleinere Chunks (ENV-steuerbar)
+    const CHUNK_WORDS = Number(process.env.SUMMARY_CHUNK_WORDS || process.env.SUMMARY_CHUNK_TOKENS || 900);
+    const CHUNK_THRESHOLD = Math.max(1.0, Number(process.env.SUMMARY_CHUNK_THRESHOLD || 1.05));
+    const MAX_INPUT_TOKENS_PER_CHUNK = Math.max(200, Math.floor(CHUNK_WORDS));
+    const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 600));
+    const MAX_FINAL_TOKENS = Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 2500));
 
     const DEFAULT_FINAL_PROMPT = `
 Summarize the provided chat logs concisely. Capture key points, decisions, follow-ups, references, and open questions.
@@ -319,12 +326,15 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
       );
       const startId = lastSum?.[0]?.last_context_id ?? 0;
 
-      // End-ID (obere Grenze, inklusiv) zum Zeitpunkt der Ausführung
-      const [mx] = await db.execute(
-        `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
-        [this.channelId]
-      );
-      const endId = mx?.[0]?.maxId ?? null;
+      // End-ID (obere Grenze, inklusiv): explizit übergeben (z.B. Redo), sonst aktuelles MAX(id)
+      let endId = upperMaxContextId;
+      if (endId == null) {
+        const [mx] = await db.execute(
+          `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
+          [this.channelId]
+        );
+        endId = mx?.[0]?.maxId ?? null;
+      }
 
       // Nichts zu tun, wenn keine Logs oder kein Fortschritt
       if (endId == null || endId <= startId) {
@@ -367,7 +377,7 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
 
         // Chunking ja/nein
         const totalTokens = tokenCount(lines.join("\n"));
-        const needsChunking = totalTokens > MAX_INPUT_TOKENS_PER_CHUNK * 1.2;
+        const needsChunking = totalTokens > MAX_INPUT_TOKENS_PER_CHUNK * CHUNK_THRESHOLD;
 
         let finalMaterial;
         if (!needsChunking) {
@@ -391,24 +401,12 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
           }
           if (buf.length) chunks.push(buf.join("\n"));
 
-          // *** WICHTIG: Chunk-Pass = rein extraktiv, KEINE Recap-Struktur ***
-          const chunkPrompt = `
-${finalPrompt}
-
-CRITICAL SUBTASK CONSTRAINTS (CHUNK COMPRESSION):
-- Output ONLY terse IC facts as plain bullet points (one per line).
-- No titles or headings. No "###". No "Cast & Creatures". No narrative recap.
-- Keep exact spellings of all names/places/items mentioned IC.
-- Drop OOC/DM/meta/tech chatter and dice math.
-- Preserve the order of events within this chunk.
-- Do not invent; if uncertain, omit.
-`.trim();
-
+          // Jeden Chunk mit DEMSELBEN summaryPrompt verdichten
           const chunkSummaries = [];
           for (let i = 0; i < chunks.length; i++) {
             const sumCtx = new Context(
               "You are a chunk summarizer (apply the same summary rules).",
-              chunkPrompt,
+              finalPrompt,
               [],
               {},
               null,
@@ -421,7 +419,7 @@ CRITICAL SUBTASK CONSTRAINTS (CHUNK COMPRESSION):
           finalMaterial = chunkSummaries.join("\n\n");
         }
 
-        // Final-Pass mit dem ursprünglichen Prompt (baut erst jetzt die Recap-Struktur)
+        // Final-Pass mit demselben Prompt
         const finalCtx = new Context(
           "You are a channel summary generator.",
           finalPrompt,
@@ -481,13 +479,25 @@ CRITICAL SUBTASK CONSTRAINTS (CHUNK COMPRESSION):
   /**
    * Redo: delete newest summary and immediately summarize again with same delta and prompt logic.
    * Gleiches Locking/Gating wie summarizeSince(), da intern erneut summarizeSince() aufgerufen wird.
+   * (Optional: deterministisch identisch machen, indem upperMaxContextId auf die alte End-ID gesetzt wird.)
    */
   async redoLastSummary(cutoffMs, customPrompt = null) {
     if (!this.persistent) {
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
     }
+    // Optional deterministische Obergrenze holen (alte End-ID):
+    let endCapId = null;
+    try {
+      const db = await getPool();
+      const [rows] = await db.execute(
+        `SELECT last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
+        [this.channelId]
+      );
+      endCapId = rows?.[0]?.last_context_id ?? null;
+    } catch {}
+
     await this.deleteLastSummary(); // Cursor springt auf die vorherige Summary zurück
-    return this.summarizeSince(cutoffMs, customPrompt);
+    return this.summarizeSince(null, customPrompt, endCapId);
   }
 
   /** Get newest N summaries. */
