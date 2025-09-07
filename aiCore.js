@@ -205,7 +205,7 @@ const TOOL_PERSIST_ROLE =
 
 const MAX_TOOL_PERSIST_CHARS = Math.max(
   500,
-  Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 3000))
+  Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 8000))
 );
 
 /** Produce a compact, parseable wrapper for tool results */
