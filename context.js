@@ -286,10 +286,10 @@ class Context {
   /* ----------------------------- Summaries (Delta + Chunking) ----------------------------- */
 
   /**
-   * Summarize logs since last cursor up to cutoff (UTC ms), store one new summary, and advance cursor.
-   * - Delta-Verhalten bleibt (kein Full-History-Pass).
-   * - Chunking mit frühem OOC/Filter: Der channel summaryPrompt wird bereits auf die Chunks angewandt.
-   * - Final-Pass fasst die Chunk-Outputs erneut mit demselben Prompt zu EINER Summary zusammen.
+   * Summarize logs since last cursor using ID-bounded window:
+   * - startId = last_summary.last_context_id (or 0)
+   * - endId   = MAX(context_log.id) at execution time
+   * Store one new summary with last_context_id=endId.
    */
   async summarizeSince(cutoffMs, customPrompt = null) {
     if (!this.persistent || this.isSummarizing) {
@@ -311,35 +311,48 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
 
     try {
       const db = await getPool();
+
+      // Start-ID (untere Grenze, exklusiv)
       const [lastSum] = await db.execute(
         `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
-      const lastCursor = lastSum?.[0]?.last_context_id ?? null;
-      const cutoff = toMySQLDateTime(new Date(cutoffMs));
+      const startId = lastSum?.[0]?.last_context_id ?? 0;
 
+      // End-ID (obere Grenze, inklusiv) zum Zeitpunkt der Ausführung
+      const [mx] = await db.execute(
+        `SELECT MAX(id) AS maxId FROM context_log WHERE channel_id=?`,
+        [this.channelId]
+      );
+      const endId = mx?.[0]?.maxId ?? null;
+
+      // Nichts zu tun, wenn keine Logs oder kein Fortschritt
+      if (endId == null || endId <= startId) {
+        return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: startId };
+      }
+
+      // Fenster laden: (startId, endId]
       let rows = [];
-      if (lastCursor != null) {
+      if (startId > 0) {
         const [r] = await db.execute(
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE channel_id=? AND id > ? AND timestamp <= ?
+            WHERE channel_id=? AND id > ? AND id <= ?
             ORDER BY id ASC`,
-          [this.channelId, lastCursor, cutoff]
+          [this.channelId, startId, endId]
         );
         rows = r || [];
       } else {
         const [r] = await db.execute(
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE channel_id=? AND timestamp <= ?
+            WHERE channel_id=? AND id <= ?
             ORDER BY id ASC`,
-          [this.channelId, cutoff]
+          [this.channelId, endId]
         );
         rows = r || [];
       }
 
-      const maxId = rows.length ? rows[rows.length - 1].id : lastCursor;
       let insertedSummaryId = null;
 
       if (rows.length) {
@@ -413,7 +426,7 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
           const [res] = await db.execute(
             `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
              VALUES (?, ?, ?, ?)`,
-            [toMySQLDateTime(new Date()), this.channelId, finalSummary, maxId]
+            [toMySQLDateTime(new Date()), this.channelId, finalSummary, endId]
           );
           insertedSummaryId = res?.insertId ?? null;
         }
@@ -425,7 +438,7 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
         lastSummary = rowsOne?.[0]?.summary || null;
       }
 
-      return { messages: this.messages, lastSummary, insertedSummaryId, usedMaxContextId: maxId };
+      return { messages: this.messages, lastSummary, insertedSummaryId, usedMaxContextId: endId };
     } catch (e) {
       console.error("[SUMMARIZE] failed:", e);
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
@@ -454,34 +467,15 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
   }
 
   /**
-   * Redo: delete newest summary and immediately summarize again with the SAME window as the deleted one
-   * if no explicit cutoffMs is provided.
+   * Redo: delete newest summary and immediately summarize again with same delta and prompt logic.
+   * Gleiches Locking/Gating wie summarizeSince(), da intern erneut summarizeSince() aufgerufen wird.
    */
   async redoLastSummary(cutoffMs, customPrompt = null) {
     if (!this.persistent) {
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
     }
-
-    // Falls kein cutoffMs übergeben ist: den Timestamp der jüngsten Summary als Cutoff verwenden.
-    let effectiveCutoffMs = cutoffMs;
-    try {
-      if (!effectiveCutoffMs) {
-        const db = await getPool();
-        const [rows] = await db.execute(
-          `SELECT id, timestamp FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
-          [this.channelId]
-        );
-        const ts = rows?.[0]?.timestamp;
-        if (ts) {
-          // MySQL DATETIME "YYYY-MM-DD HH:mm:ss" -> ms (UTC)
-          const parsed = Date.parse(String(ts).replace(" ", "T") + "Z");
-          if (!Number.isNaN(parsed)) effectiveCutoffMs = parsed;
-        }
-      }
-    } catch {}
-
     await this.deleteLastSummary(); // Cursor springt auf die vorherige Summary zurück
-    return this.summarizeSince(effectiveCutoffMs || Date.now(), customPrompt);
+    return this.summarizeSince(cutoffMs, customPrompt);
   }
 
   /** Get newest N summaries. */
