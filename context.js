@@ -1,9 +1,19 @@
-// context.js — v5.5 (ID-bounded Delta + Loss-minimizing Chunking + Redo)
+// context.js — v6.0 (ID-bounded Delta + Sequential Summaries + Loss-minimizing Chunking + Redo)
 // - Persistenter Verlauf in MySQL
-// - Inkrementelle Summaries (Delta über last_context_id)
-// - Chunking: frühe, verlustarme Kompression pro Chunk (keine Erzählform, keine Domänenannahmen)
-// - Final-Pass: fasst Chunk-Outputs zusammen, dedupliziert, behält Inhalte
-// - redoLastSummary(): löscht jüngste Summary + erzeugt sofort eine neue (gleiches Fenster via End-ID-Cap)
+// - Delta per last_context_id (ohne Timestamps)
+// - NEU: "Subsequente Summaries" — Fenster (startId, endId] wird in feste Gruppen (~Wörter) geteilt;
+//         pro Gruppe wird sofort eine Summary persistiert, dann die nächste, bis alles verarbeitet ist.
+// - Verlustarme Kompression: Chunk-Pass extrahiert faktenorientierte Bullets, Final-Pass konsolidiert.
+// - Redo: löscht jüngste Summary und reproduziert exakt dasselbe Fenster via End-ID-Cap.
+//
+// ENV (alle optional):
+//   SUMMARY_GROUP_WORDS        (default 3000)  // Zielgröße Rohlogs pro Summary-Gruppe (Wortschätzung)
+//   SUMMARY_CHUNK_WORDS        (default 1800)  // Zielgröße pro Zwischen-Chunk innerhalb einer Gruppe
+//   SUMMARY_CHUNK_THRESHOLD    (default 1.15)  // ab wann gechunkt wird (Faktor auf CHUNK_WORDS)
+//   SUMMARY_CHUNK_OUT_TOKENS   (default 700)   // max Tokens je Chunk-Zusammenfassung
+//   SUMMARY_FINAL_TOKENS       (default 2800)  // max Tokens je Final-Pass (pro Gruppe)
+//
+// Hinweis: Wortzählung ist Heuristik (kein BPE). Werte bei Bedarf über ENV anpassen.
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -264,7 +274,7 @@ class Context {
     return { role: safeRole, name: safeName, content: safeContent };
   }
 
-  /** Fetch messages from DB at or after a UTC ms cutoff. */
+  /** Fetch messages from DB at or after a UTC ms cutoff. (legacy helper; nicht genutzt für Delta) */
   async getMessagesAfter(cutoffMs) {
     if (!this.persistent) return [];
     try {
@@ -283,16 +293,18 @@ class Context {
     }
   }
 
-  /* ----------------------------- Summaries (Delta + Chunking) ----------------------------- */
+  /* ----------------------------- Summaries (ID-bounded + Sequential) ----------------------------- */
 
   /**
-   * Summarize logs since last cursor using ID-bounded window:
+   * Summarize logs since last cursor using an ID window:
    * - startId = last_summary.last_context_id (or 0)
    * - endId   = MAX(context_log.id) at execution time (oder explizit übergeben)
-   * Store one new summary with last_context_id=endId.
-   * Chunkgrößen per ENV steuerbar:
-   *   SUMMARY_CHUNK_WORDS (default 900), SUMMARY_CHUNK_THRESHOLD (default 1.05),
-   *   SUMMARY_CHUNK_OUT_TOKENS (default 600), SUMMARY_FINAL_TOKENS (default 2500)
+   *
+   * NEU: Das Fenster wird in feste Gruppen von Rohtext (~ Wörter) aufgeteilt.
+   * Für JEDE Gruppe wird unmittelbar eine Summary erzeugt und in der DB gespeichert
+   * (mit last_context_id = End-ID dieser Gruppe). Dann geht es mit der nächsten Gruppe weiter.
+   *
+   * Gibt die letzte Summary (Text+Id) zurück; in der DB liegen ggf. mehrere neue Summaries.
    */
   async summarizeSince(cutoffMs, customPrompt = null, upperMaxContextId = null) {
     if (!this.persistent || this.isSummarizing) {
@@ -302,27 +314,30 @@ class Context {
 
     const FINAL_MODEL = "gpt-4o";
 
-    // Kleinere/steuerbare Chunks
-    const CHUNK_WORDS = Number(process.env.SUMMARY_CHUNK_WORDS || process.env.SUMMARY_CHUNK_TOKENS || 900);
-    const CHUNK_THRESHOLD = Math.max(1.0, Number(process.env.SUMMARY_CHUNK_THRESHOLD || 1.05));
-    const MAX_INPUT_TOKENS_PER_CHUNK = Math.max(200, Math.floor(CHUNK_WORDS));
-    const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 600));
-    const MAX_FINAL_TOKENS = Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 2500));
+    // Gruppierung: Zielgröße pro Summary (Rohlogs/Wörter)
+    const GROUP_WORDS = Math.max(800, Number(process.env.SUMMARY_GROUP_WORDS || 3000));
 
-    // Final-Pass: allgemein, nicht domänenspezifisch
+    // Zwischen-Chunking innerhalb einer Gruppe (für sehr lange Gruppenzeilen)
+    const CHUNK_WORDS = Math.max(600, Number(process.env.SUMMARY_CHUNK_WORDS || 1800));
+    const CHUNK_THRESHOLD = Math.max(1.0, Number(process.env.SUMMARY_CHUNK_THRESHOLD || 1.15));
+    const MAX_INPUT_TOKENS_PER_CHUNK = CHUNK_WORDS;
+
+    const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 700));
+    const MAX_FINAL_TOKENS = Math.max(800, Number(process.env.SUMMARY_FINAL_TOKENS || 2800));
+
+    // Final-Pass: neutral, verlustarm, strukturiert
     const DEFAULT_FINAL_PROMPT = `
-You will receive compressed chunk outputs summarizing chat logs.
-Your job: produce ONE consolidated, **loss-minimizing** summary for the whole window.
+You will receive compressed bullet outputs summarizing a group of chat logs.
+Your job: produce ONE consolidated, loss-minimizing summary for this group.
 
 Rules:
-- Preserve **all concrete information** (facts, decisions, requests, action items, owners, deadlines, numbers, URLs/IDs, code refs, error messages).
-- Deduplicate near-identical items, but **do not drop edge-cases**.
-- Prefer neutral, precise phrasing; keep exact proper nouns/terms.
-- Preserve chronology when helpful; group by [DECISION], [TASK], [QUESTION], [NOTE], [REF] if tags are present.
-- Keep it concise but comprehensive; avoid filler and meta-commentary.
+- Keep *all* concrete information (facts, decisions, tasks with owner & deadline, questions, numbers, URLs/IDs, code refs, errors).
+- Deduplicate, but do not drop edge-cases. Prefer neutral, precise phrasing; keep exact names/terms.
+- Preserve helpful chronology. If tags like [DECISION]/[TASK]/[QUESTION]/[NOTE]/[REF] appear, carry them through.
+- Concise but complete; avoid filler/meta.
 
 Output:
-- A structured bullet list (optionally with sections like Decisions / Tasks / Open questions / Notes / References).
+- A structured bullet list (sections like Decisions / Tasks / Open questions / Notes / References are welcome).
 `.trim();
 
     const tokenCount = (s) => String(s || "").trim().split(/\s+/).length;
@@ -330,14 +345,14 @@ Output:
     try {
       const db = await getPool();
 
-      // Start-ID (untere Grenze, exklusiv)
+      // Untere Grenze (exklusiv) = Cursor
       const [lastSum] = await db.execute(
         `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
       );
-      const startId = lastSum?.[0]?.last_context_id ?? 0;
+      let startId = lastSum?.[0]?.last_context_id ?? 0;
 
-      // End-ID (obere Grenze, inklusiv): explizit übergeben (z.B. Redo), sonst aktuelles MAX(id)
+      // Obere Grenze (inklusiv) = End-ID jetzt, oder explizit gesetzt
       let endId = upperMaxContextId;
       if (endId == null) {
         const [mx] = await db.execute(
@@ -347,12 +362,11 @@ Output:
         endId = mx?.[0]?.maxId ?? null;
       }
 
-      // Nichts zu tun, wenn keine Logs oder kein Fortschritt
       if (endId == null || endId <= startId) {
         return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: startId };
       }
 
-      // Fenster laden: (startId, endId]
+      // Vollständiges Fenster laden: (startId, endId]
       let rows = [];
       if (startId > 0) {
         const [r] = await db.execute(
@@ -373,66 +387,84 @@ Output:
         );
         rows = r || [];
       }
+      if (!rows.length) {
+        return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: startId };
+      }
 
-      let insertedSummaryId = null;
+      // Hilfsfunktionen
+      const makeLine = (r) => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`;
 
-      if (rows.length) {
-        // Roh-Lines aufbauen (mit IDs für Nachvollziehbarkeit)
-        const makeLine = (r) => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`;
-        const lines = rows.map(makeLine);
+      // Partition in Gruppen fester "Wortgröße"
+      const groups = [];
+      let g = [];
+      let acc = 0;
+      for (const r of rows) {
+        const ln = makeLine(r);
+        const t = tokenCount(ln);
+        if (acc + t > GROUP_WORDS && g.length > 0) {
+          groups.push(g);
+          g = [r];
+          acc = t;
+        } else {
+          g.push(r);
+          acc += t;
+        }
+      }
+      if (g.length) groups.push(g);
 
-        const finalPrompt =
-          (customPrompt && customPrompt.trim()) ||
-          (this.summaryPrompt && this.summaryPrompt.trim()) ||
-          DEFAULT_FINAL_PROMPT;
+      let lastInsertedId = null;
+      let lastSummaryText = null;
+      let processedEndId = startId;
 
-        // Chunking-Entscheidung
-        const totalTokens = tokenCount(lines.join("\n"));
+      // Chunk-Prompt (verlustarme Extraktion)
+      const chunkPrompt = `
+You are compressing a slice of chat logs with minimal information loss.
+
+Extract all content-carrying items as compact bullets, using tags where apt:
+- [DECISION] decisions/outcomes
+- [TASK] action items (include owner & deadline if present)
+- [QUESTION] open questions/blockers
+- [NOTE] factual notes/context/observations
+- [REF] references (URLs, IDs, files, PRs, issues, msg IDs)
+
+Rules:
+- Keep exact names/IDs/terms; include numbers, dates, versions, error codes.
+- Preserve local chronology within this slice.
+- Skip pure pleasantries/emoji-only/acks unless they affect decisions/tasks.
+- One item per line, terse. If uncertain, keep the item and mark with [?].
+
+Output: only the bullet list, no headings.
+`.trim();
+
+      // Jede Gruppe separat zusammenfassen und direkt persistieren
+      for (const grp of groups) {
+        const lines = grp.map(makeLine);
+        const grpEndId = grp[grp.length - 1].id;
+        const material = lines.join("\n");
+        const totalTokens = tokenCount(material);
         const needsChunking = totalTokens > MAX_INPUT_TOKENS_PER_CHUNK * CHUNK_THRESHOLD;
 
         let finalMaterial;
         if (!needsChunking) {
-          // kein Chunking: Material direkt in den Final-Pass geben
-          finalMaterial = lines.join("\n");
+          // Kein Zwischen-Chunking erforderlich
+          finalMaterial = material;
         } else {
-          // in Chunks schneiden (zeilenbasiert)
+          // Zwischen-Chunking innerhalb der Gruppe
           const chunks = [];
           let buf = [];
-          let acc = 0;
+          let acc2 = 0;
           for (const ln of lines) {
             const t = tokenCount(ln);
-            if (acc + t > MAX_INPUT_TOKENS_PER_CHUNK && buf.length) {
+            if (acc2 + t > MAX_INPUT_TOKENS_PER_CHUNK && buf.length) {
               chunks.push(buf.join("\n"));
               buf = [ln];
-              acc = t;
+              acc2 = t;
             } else {
               buf.push(ln);
-              acc += t;
+              acc2 += t;
             }
           }
           if (buf.length) chunks.push(buf.join("\n"));
-
-          // Loss-minimizing Chunk-Prompt (domänenneutral, keine Erzählform)
-          const chunkPrompt = `
-You are compressing a slice of chat logs with **minimal information loss**.
-
-Extract **all content-carrying items** as compact bullets, using tags:
-- [DECISION] for decisions/outcomes.
-- [TASK] for action items (include owner and deadline if present).
-- [QUESTION] for open questions or blocking issues.
-- [NOTE] for factual notes (states, observations, context).
-- [REF] for references (URLs, IDs, filenames, PRs, issue numbers, message IDs).
-
-Rules:
-- Keep exact names/IDs/terms. Include numbers, dates, times, versions, error codes.
-- If multiple bullets stem from the same source line(s), you may append origin like (from #123) or (from #120–#125).
-- Preserve local chronology within this chunk.
-- Skip pure pleasantries/emoji-only/ack-only lines unless they change decisions or tasks.
-- Do **not** narrate or rephrase into prose. Keep bullets terse, one item per line.
-- If uncertain, keep the item and mark with [?].
-
-Output: only the bullet list, no headings.
-`.trim();
 
           const chunkSummaries = [];
           for (let i = 0; i < chunks.length; i++) {
@@ -446,12 +478,18 @@ Output: only the bullet list, no headings.
             );
             sumCtx.messages.push({ role: "user", name: "system", content: chunks[i] });
             const s = (await getAI(sumCtx, CHUNK_OUTPUT_TOKENS, FINAL_MODEL))?.trim() || "";
-            if (s) chunkSummaries.push(`-- Chunk ${i + 1}/${chunks.length} --\n${s}`);
+            if (s) chunkSummaries.push(s);
           }
-          finalMaterial = chunkSummaries.join("\n\n");
+          // Konsolidiertes Material für Final-Pass der Gruppe
+          finalMaterial = chunkSummaries.join("\n");
         }
 
-        // Final-Pass: konsolidieren, deduplizieren, Struktur geben – ohne Inhalte zu verlieren
+        // Final-Pass je Gruppe
+        const finalPrompt =
+          (customPrompt && customPrompt.trim()) ||
+          (this.summaryPrompt && this.summaryPrompt.trim()) ||
+          DEFAULT_FINAL_PROMPT;
+
         const finalCtx = new Context(
           "You consolidate chunk summaries with minimal loss.",
           finalPrompt,
@@ -468,19 +506,25 @@ Output: only the bullet list, no headings.
           const [res] = await db.execute(
             `INSERT INTO summaries (timestamp, channel_id, summary, last_context_id)
              VALUES (?, ?, ?, ?)`,
-            [toMySQLDateTime(new Date()), this.channelId, finalSummary, endId]
+            [toMySQLDateTime(new Date()), this.channelId, finalSummary, grpEndId]
           );
-          insertedSummaryId = res?.insertId ?? null;
+          lastInsertedId = res?.insertId ?? lastInsertedId;
+          lastSummaryText = finalSummary;
+          processedEndId = grpEndId;
+        } else {
+          // Wenn die Gruppe kein Output ergab, Cursor NICHT vorsetzen (damit nichts "verloren" geht)
+          // Optional: you may still advance to avoid infinite loops, aber wir bleiben konservativ.
+          break;
         }
       }
 
-      let lastSummary = null;
-      if (insertedSummaryId) {
-        const [rowsOne] = await db.execute(`SELECT summary FROM summaries WHERE id=?`, [insertedSummaryId]);
-        lastSummary = rowsOne?.[0]?.summary || null;
-      }
-
-      return { messages: this.messages, lastSummary, insertedSummaryId, usedMaxContextId: endId };
+      // Ergebnis (letzte Summary dieses Laufs)
+      return {
+        messages: this.messages,
+        lastSummary: lastSummaryText,
+        insertedSummaryId: lastInsertedId,
+        usedMaxContextId: processedEndId
+      };
     } catch (e) {
       console.error("[SUMMARIZE] failed:", e);
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
@@ -509,14 +553,13 @@ Output: only the bullet list, no headings.
   }
 
   /**
-   * Redo: delete newest summary and immediately summarize again with same delta and prompt logic.
-   * Nutzt die End-ID (last_context_id) des gelöschten Laufs als Obergrenze, um exakt dasselbe Fenster zu verarbeiten.
+   * Redo: löscht jüngste Summary und erzeugt sofort eine neue über dasselbe Fenster.
+   * Nutzt die End-ID (last_context_id) der gelöschten Summary als Obergrenze.
    */
   async redoLastSummary(cutoffMs, customPrompt = null) {
     if (!this.persistent) {
       return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: null };
     }
-
     // Obergrenze sichern, bevor wir löschen
     let endCapId = null;
     try {
@@ -528,7 +571,8 @@ Output: only the bullet list, no headings.
       endCapId = rows?.[0]?.last_context_id ?? null;
     } catch {}
 
-    await this.deleteLastSummary(); // Cursor springt auf die vorherige Summary zurück
+    await this.deleteLastSummary(); // Cursor fällt auf vorherige Summary zurück
+    // Exakt dieses Fenster erneut zusammenfassen (ggf. in mehrere Gruppen, falls groß)
     return this.summarizeSince(null, customPrompt, endCapId);
   }
 
