@@ -391,12 +391,24 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
           }
           if (buf.length) chunks.push(buf.join("\n"));
 
-          // Jeden Chunk mit DEMSELBEN summaryPrompt verdichten (OOC greift bereits hier)
+          // *** WICHTIG: Chunk-Pass = rein extraktiv, KEINE Recap-Struktur ***
+          const chunkPrompt = `
+${finalPrompt}
+
+CRITICAL SUBTASK CONSTRAINTS (CHUNK COMPRESSION):
+- Output ONLY terse IC facts as plain bullet points (one per line).
+- No titles or headings. No "###". No "Cast & Creatures". No narrative recap.
+- Keep exact spellings of all names/places/items mentioned IC.
+- Drop OOC/DM/meta/tech chatter and dice math.
+- Preserve the order of events within this chunk.
+- Do not invent; if uncertain, omit.
+`.trim();
+
           const chunkSummaries = [];
           for (let i = 0; i < chunks.length; i++) {
             const sumCtx = new Context(
               "You are a chunk summarizer (apply the same summary rules).",
-              finalPrompt,
+              chunkPrompt,
               [],
               {},
               null,
@@ -409,7 +421,7 @@ Use bullet points, preserve dates/times, and include brief quotes only when nece
           finalMaterial = chunkSummaries.join("\n\n");
         }
 
-        // Final-Pass mit demselben Prompt
+        // Final-Pass mit dem ursprünglichen Prompt (baut erst jetzt die Recap-Struktur)
         const finalCtx = new Context(
           "You are a channel summary generator.",
           finalPrompt,
