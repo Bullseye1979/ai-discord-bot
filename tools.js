@@ -22,7 +22,8 @@ const tools = [
         type: "object",
         properties: {
           url: { type: "string", description: "Full URL to fetch and clean." },
-          user_id: { type: "string", description: "User ID or display name." }
+          user_id: { type: "string", description: "User ID or display name." },
+          user_prompt: { type: "string", description: "Original natural-language user request." }
         },
         required: ["url", "user_id"]
       }

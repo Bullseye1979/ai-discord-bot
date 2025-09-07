@@ -1,13 +1,13 @@
-// youtube.js — v3.0 (no-chunk, GPT-4.1 large-context summarization)
-// Summarize a YouTube video's transcript (CC) in ONE pass using GPT-4.1.
-// We fetch the CCs, assemble them into a single timeline text, and summarize directly.
+// youtube.js — v3.1 (generic transcript Q&A via GPT-4.1)
+// Fetch YouTube transcript (CCs), feed into GPT-4.1 with user prompt, return result.
+// Not forced to summarize anymore — the user_prompt defines what should happen.
 
 const { getAI } = require("./aiService.js");
 const Context = require("./context.js");
 
-const MAX_INPUT_CHARS = 250_000;  // safety cap for transcript text
-const YT_SUMMARY_MODEL = "gpt-4.1";
-const YT_SUMMARY_TOKENS = 1400;
+const MAX_INPUT_CHARS = 250_000;  // safety cap
+const YT_MODEL = "gpt-4.1";
+const YT_TOKENS = 1400;
 
 let _YT;
 async function loadYT() {
@@ -17,7 +17,6 @@ async function loadYT() {
   return _YT;
 }
 
-/** Extracts a YouTube video ID from various URL formats or plain IDs. */
 function extractVideoId(input) {
   try {
     if (/^[A-Za-z0-9_-]{11}$/.test(input)) return input;
@@ -32,13 +31,11 @@ function extractVideoId(input) {
   }
 }
 
-/** Converts offset to seconds (accepts seconds or ms). */
 function toSeconds(offset) {
   const n = Number(offset || 0);
   return n > 10000 ? Math.round(n / 1000) : Math.round(n);
 }
 
-/** Formats seconds to mm:ss or hh:mm:ss. */
 function fmtTime(s) {
   s = Math.max(0, Math.round(s || 0));
   const h = Math.floor(s / 3600);
@@ -48,7 +45,6 @@ function fmtTime(s) {
   return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
 
-/** Normalizes raw transcript items into {start, text}. */
 function normalizeTranscript(items) {
   return (items || [])
     .map((it) => ({
@@ -58,7 +54,6 @@ function normalizeTranscript(items) {
     .filter((x) => x.text);
 }
 
-/** Fetches transcript in preferred languages with fallbacks. */
 async function fetchTranscript(videoId) {
   const YoutubeTranscript = await loadYT();
   const langs = ["de", "a.de", "en", "a.en", "en-US", "en-GB"];
@@ -66,7 +61,7 @@ async function fetchTranscript(videoId) {
     try {
       const items = await YoutubeTranscript.fetchTranscript(videoId, { lang });
       if (Array.isArray(items) && items.length) return normalizeTranscript(items);
-    } catch {} // try next language
+    } catch {}
   }
   try {
     const items = await YoutubeTranscript.fetchTranscript(videoId);
@@ -75,7 +70,6 @@ async function fetchTranscript(videoId) {
   return [];
 }
 
-/** Tool entry: summarize a YouTube transcript in a single pass guided by the user's prompt. */
 async function getYoutube(toolFunction) {
   try {
     const args =
@@ -88,38 +82,36 @@ async function getYoutube(toolFunction) {
     const videoId = extractVideoId(videoUrl);
 
     if (!videoId) return "[ERROR]: YT_BAD_ID — Unable to extract a valid YouTube video ID.";
-    if (!userPrompt) return "[ERROR]: YT_NO_PROMPT — Missing 'user_prompt' to guide the summary.";
+    if (!userPrompt) return "[ERROR]: YT_NO_PROMPT — Missing 'user_prompt'.";
 
     const transcript = await fetchTranscript(videoId);
     if (!transcript.length) return "[ERROR]: YT_NO_TRANSCRIPT — No transcript available for this video.";
 
-    // Assemble a single timeline text like:
-    // [0:05] Intro text...
-    // [0:47] Next line...
+    // Build timeline text
     let timeline = "";
     for (const entry of transcript) {
       timeline += `[${fmtTime(entry.start)}] ${entry.text}\n`;
-      if (timeline.length > MAX_INPUT_CHARS) break; // safety cap
+      if (timeline.length > MAX_INPUT_CHARS) break;
     }
 
     const ctx = new Context();
     await ctx.add(
       "system",
-      "summarizer",
+      "yt_analyst",
       [
-        "You are a meticulous summarizer with a very large context window.",
-        "Summarize the following YouTube transcript with minimal information loss.",
-        "Preserve key names, figures, timestamps when relevant, and important numbers.",
-        "Use compact, well-structured output (headings and bullet points where useful).",
-        "Write in the user's language if inferable (German if unsure).",
+        "You are a helpful assistant with a very large context window.",
+        "You are given a YouTube transcript with timestamps.",
+        "Answer the user's request precisely, using the transcript as source.",
+        "Preserve names, numbers, and timestamps where they matter.",
+        "Output should directly address the request (can be summary, quotes, analysis, etc.).",
       ].join(" ")
     );
 
-    await ctx.add("user", "request", `User request: "${userPrompt}".`);
+    await ctx.add("user", "request", `User request: "${userPrompt}"`);
     await ctx.add("user", "transcript", timeline);
 
-    const out = await getAI(ctx, YT_SUMMARY_TOKENS, YT_SUMMARY_MODEL);
-    return (out || "").trim() || "[ERROR]: YT_SUMMARY_EMPTY — No summary returned.";
+    const out = await getAI(ctx, YT_TOKENS, YT_MODEL);
+    return (out || "").trim() || "[ERROR]: YT_EMPTY_OUTPUT — No result returned.";
   } catch (err) {
     const msg = err?.message || "unexpected error";
     return `[ERROR]: YT_FAILURE — ${msg}`;
