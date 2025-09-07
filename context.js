@@ -1,12 +1,10 @@
-// context.js — v6.1.1 (ID-bounded Delta + Single Summary + classic chunk size + debug logging + fixes)
+// context.js — v6.2 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1)
 // - Persistenter Verlauf in MySQL
-// - Inkrementelle Summaries (Delta über last_context_id)
-// - EIN Summary-Pass pro Lauf (kein subsequentes Partitionieren)
-// - Chunking: fixe Größe (≈1800 Wörter) mit Schwelle 1.2; Zwischenpass extrahiert faktenorientierte Bullets
-// - Redo: löscht jüngste Summary + erzeugt sofort eine neue (gleiches Fenster via End-ID-Cap)
-// - Debug: Ausführliche console.log-Ausgaben
-// - Fix: 'Newest is not defined' → korrekt 'newest && newest.trim()'
-// - Prompts: Chronologie via (#id), Intro & Outcome, keine „ein Bullet pro Chunk”-Verdichtung
+// - Inkrementelle Summaries (Fenster über last_context_id → MAX(id))
+// - KEIN Chunking: komplettes Fenster wird 1:1 in den Kontext gegeben
+// - summaryPrompt wird direkt auf das Fenster angewandt (Final-Pass only)
+// - Redo: löscht jüngste Summary und fasst exakt dasselbe Fenster erneut zusammen
+// - replaceLastSummaryWithLastLog: ersetzt nur den Summary-Text, behält last_context_id/timestamp
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -48,7 +46,7 @@ async function ensureTables(pool) {
         INDEX idx_sum_ch_id (channel_id, id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
-    // kompatibel für ältere DBs
+    // für ältere DBs
     await c.query(`ALTER TABLE summaries ADD COLUMN IF NOT EXISTS last_context_id INT NULL;`).catch(() => {});
   } finally {
     c.release();
@@ -58,7 +56,6 @@ async function ensureTables(pool) {
 /** DB pool getter (lazy). */
 async function getPool() {
   if (!pool) {
-    // Bevorzugte ENV-Namen; Fallback auf alte MYSQL_*
     const host = process.env.DB_HOST || process.env.MYSQL_HOST || "127.0.0.1";
     const user = process.env.DB_USER || process.env.MYSQL_USER || "root";
     const password = process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || "";
@@ -267,7 +264,7 @@ class Context {
     return { role: safeRole, name: safeName, content: safeContent };
   }
 
-  /** Fetch messages from DB at or after a UTC ms cutoff. (legacy helper; nicht genutzt für Delta) */
+  /** (Legacy helper) Fetch messages from DB at or after a UTC ms cutoff. */
   async getMessagesAfter(cutoffMs) {
     if (!this.persistent) return [];
     try {
@@ -286,13 +283,13 @@ class Context {
     }
   }
 
-  /* ----------------------------- Summaries (ID-bounded, single) ----------------------------- */
+  /* ----------------------------- Summaries (ID-bounded, no chunking) ----------------------------- */
 
   /**
-   * Summarize logs since last cursor using an ID window:
+   * Summarize logs since last cursor using an ID window (NO CHUNKING):
    * - startId = last_summary.last_context_id (or 0)
-   * - endId   = MAX(context_log.id) at execution time (oder explizit übergeben)
-   * Erzeugt GENAU EINE Summary über das gesamte Fenster und speichert sie mit last_context_id = endId.
+   * - endId   = MAX(context_log.id) at execution time (or explicit upperMaxContextId)
+   * Applies the channel summaryPrompt directly over the full window.
    */
   async summarizeSince(cutoffMs, customPrompt = null, upperMaxContextId = null) {
     if (!this.persistent || this.isSummarizing) {
@@ -300,55 +297,21 @@ class Context {
     }
     this.isSummarizing = true;
 
-    const FINAL_MODEL = "gpt-4o";
-    // Klassische Chunk-Größen – wie „vorher“
-    const MAX_INPUT_TOKENS_PER_CHUNK = Number(process.env.SUMMARY_CHUNK_WORDS || process.env.SUMMARY_CHUNK_TOKENS || 1800);
-    const CHUNK_THRESHOLD = Math.max(1.0, Number(process.env.SUMMARY_CHUNK_THRESHOLD || 1.2));
-    // Erhöht: mehr Generierungs-Tokens pro Chunk-Summary
-    const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 1400));
-    const MAX_FINAL_TOKENS = Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 3000));
+    const MODEL = process.env.SUMMARY_MODEL || "gpt-4.1";
+    const MAX_FINAL_TOKENS = Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 3500));
 
-    // Final-Pass: neutral, verlustarm, strukturiert — inkl. Intro & Outcome, Chronologie per (#id)
+    // Fallback-Prompt (falls kein summaryPrompt gesetzt ist)
     const DEFAULT_FINAL_PROMPT = `
-You will receive bullet-style extracts (possibly from multiple slices) summarizing chat logs.
-
-Your job: produce ONE consolidated, loss-minimizing summary for the WHOLE window.
-
-Do this:
-- **Ignore slice/chunk boundaries.** Consider all bullets as one pool.
-- **Order by chronology using (#ID) markers when present (ascending).**
-- Start with a brief **Overview** (1–2 sentences) capturing the initial situation / context.
-- Then provide structured bullets; keep concrete info: facts, decisions, tasks (owner & deadline), questions, numbers, URLs/IDs, code refs, errors.
-- Deduplicate near-duplicates, but **do not collapse everything to one bullet per slice**. Merge only truly identical items.
-- End with **Outcome & Next steps** summarizing final state and actionable follow-ups.
-
-Style:
-- Neutral, precise phrasing. Keep exact names/terms. Prefer clarity over brevity when in doubt.
-- No headings other than the ones requested (Overview, Outcome & Next steps).
+Summarize the provided chat logs comprehensively and precisely.
+Keep factual details, decisions, tasks (owner & deadline), questions, numbers, URLs/IDs, code refs, and errors.
+Preserve chronology and exact names/terms. Avoid filler and speculation.
+Output a clear, well-structured summary (bullets/sections allowed).
 `.trim();
-
-    // Chunk-Pass: faktenorientierte Extraktion, IDs mitführen
-    const CHUNK_PROMPT = `
-You are compressing a slice of chat logs with minimal information loss.
-
-Extract content-carrying items as compact bullets. For each bullet:
-- **Include source message IDs** using the smallest covering range from the slice, e.g. "(#123)" or "(#123–#126)".
-- Use tags where apt:
-  [DECISION], [TASK], [QUESTION], [NOTE], [REF]
-- Keep exact names/IDs/terms; include numbers, dates, versions, error codes.
-- Preserve local chronology within THIS slice (ascending by ID).
-- Skip pure pleasantries/emoji-only/acks unless they affect decisions/tasks.
-- One atomic item per bullet; do NOT add any "chunk" headings; no prose.
-
-Output: only the bullet list, one item per line.
-`.trim();
-
-    const tokenCount = (s) => String(s || "").trim().split(/\s+/).length;
 
     try {
       const db = await getPool();
 
-      // Untere Grenze (exklusiv) = Cursor
+      // Untere Grenze (exklusiv) = Cursor aus summaries
       const [lastSum] = await db.execute(
         `SELECT id, last_context_id FROM summaries WHERE channel_id=? ORDER BY id DESC LIMIT 1`,
         [this.channelId]
@@ -365,7 +328,7 @@ Output: only the bullet list, one item per line.
         endId = mx?.[0]?.maxId ?? null;
       }
 
-      console.log(`[SUMMARY][${this.channelId}] window: startId=${startId} endId=${endId}`);
+      console.log(`[SUMMARY][${this.channelId}] (NO CHUNKING) window: startId=${startId} endId=${endId}`);
 
       if (endId == null || endId <= startId) {
         console.log(`[SUMMARY][${this.channelId}] nothing to summarize (no new rows).`);
@@ -403,93 +366,25 @@ Output: only the bullet list, one item per line.
 
       // Roh-Lines aufbauen (mit IDs für Nachvollziehbarkeit)
       const makeLine = (r) => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`;
-      const lines = rows.map(makeLine);
+      const allJoined = rows.map(makeLine).join("\n");
 
       const finalPrompt =
         (customPrompt && customPrompt.trim()) ||
         (this.summaryPrompt && this.summaryPrompt.trim()) ||
         DEFAULT_FINAL_PROMPT;
 
-      // Chunking-Entscheidung (einmalig über das gesamte Fenster)
-      const allJoined = lines.join("\n");
-      const totalTokens = tokenCount(allJoined);
-      const needsChunking = totalTokens > MAX_INPUT_TOKENS_PER_CHUNK * CHUNK_THRESHOLD;
-
-      console.log(
-        `[SUMMARY][${this.channelId}] tokenCount≈${totalTokens} ` +
-        `limit≈${MAX_INPUT_TOKENS_PER_CHUNK} threshold=${CHUNK_THRESHOLD} ` +
-        `=> needsChunking=${needsChunking}`
-      );
-
-      let finalMaterial;
-      if (!needsChunking) {
-        // kein Chunking: Material direkt in den Final-Pass geben
-        finalMaterial = allJoined;
-        console.log(`[SUMMARY][${this.channelId}] NO CHUNKING; passing full window to final pass.`);
-      } else {
-        // in Chunks schneiden (zeilenbasiert)
-        const chunks = [];
-        let buf = [];
-        let acc = 0;
-        for (const ln of lines) {
-          const t = tokenCount(ln);
-          if (acc + t > MAX_INPUT_TOKENS_PER_CHUNK && buf.length) {
-            chunks.push(buf.join("\n"));
-            buf = [ln];
-            acc = t;
-          } else {
-            buf.push(ln);
-            acc += t;
-          }
-        }
-        if (buf.length) chunks.push(buf.join("\n"));
-
-        console.log(
-          `[SUMMARY][${this.channelId}] CHUNKING: produced ${chunks.length} chunks ` +
-          `(maxPerChunk≈${MAX_INPUT_TOKENS_PER_CHUNK}).`
-        );
-
-        // RAW-Chunk-Ausgabe
-        chunks.forEach((c, i) => {
-          const words = tokenCount(c);
-          console.log(`\n[SUMMARY][${this.channelId}] ===== RAW CHUNK ${i + 1}/${chunks.length} (words≈${words}) =====\n${c}\n`);
-        });
-
-        // Zwischenpass: faktenorientierte Bullets je Chunk (mit IDs)
-        const chunkSummaries = [];
-        for (let i = 0; i < chunks.length; i++) {
-          const sumCtx = new Context(
-            "You compress chat logs with minimal information loss.",
-            CHUNK_PROMPT,
-            [],
-            {},
-            null,
-            { skipInitialSummaries: true, persistToDB: false }
-          );
-          sumCtx.messages.push({ role: "user", name: "system", content: chunks[i] });
-          const s = (await getAI(sumCtx, CHUNK_OUTPUT_TOKENS, FINAL_MODEL))?.trim() || "";
-
-          // Chunk-Summary-Ausgabe
-          console.log(`\n[SUMMARY][${this.channelId}] ----- CHUNK SUMMARY ${i + 1}/${chunks.length} (maxTokens=${CHUNK_OUTPUT_TOKENS}) -----\n${s}\n`);
-
-          if (s) chunkSummaries.push(s);
-        }
-        // Konsolidiertes Material für den Final-Pass (alle Bullets zusammen, ohne Chunk-Header)
-        finalMaterial = chunkSummaries.join("\n");
-      }
-
-      // Final-Pass
+      // Final-Pass: summaryPrompt direkt auf das komplette Fenster
       const finalCtx = new Context(
-        "You consolidate chunk summaries with minimal loss.",
+        "You are a channel summary generator.",
         finalPrompt,
         [],
         {},
         null,
         { skipInitialSummaries: true, persistToDB: false }
       );
-      finalCtx.messages.push({ role: "user", name: "system", content: finalMaterial });
+      finalCtx.messages.push({ role: "user", name: "system", content: allJoined });
 
-      const finalSummary = (await getAI(finalCtx, MAX_FINAL_TOKENS, FINAL_MODEL))?.trim() || "";
+      const finalSummary = (await getAI(finalCtx, MAX_FINAL_TOKENS, MODEL))?.trim() || "";
 
       let insertedSummaryId = null;
       if (finalSummary) {
@@ -559,7 +454,7 @@ Output: only the bullet list, one item per line.
     } catch {}
 
     await this.deleteLastSummary(); // Cursor fällt auf vorherige Summary zurück
-    // Exakt dieses Fenster erneut zusammenfassen
+    // Exakt dieses Fenster erneut zusammenfassen (NO CHUNKING)
     return this.summarizeSince(null, customPrompt, endCapId);
   }
 
