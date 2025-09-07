@@ -1,11 +1,12 @@
-// context.js — v6.1 (ID-bounded Delta + Single Summary + classic chunk size + debug logging)
+// context.js — v6.1.1 (ID-bounded Delta + Single Summary + classic chunk size + debug logging + fixes)
 // - Persistenter Verlauf in MySQL
 // - Inkrementelle Summaries (Delta über last_context_id)
 // - EIN Summary-Pass pro Lauf (kein subsequentes Partitionieren)
-// - Chunking: fixe, “klassische” Größe (≈1800 Wörter) mit Schwelle 1.2; Zwischenpass extrahiert faktenorientierte Bullets
+// - Chunking: fixe Größe (≈1800 Wörter) mit Schwelle 1.2; Zwischenpass extrahiert faktenorientierte Bullets
 // - Redo: löscht jüngste Summary + erzeugt sofort eine neue (gleiches Fenster via End-ID-Cap)
-// - Debug: Ausführliche console.log-Ausgaben zu Fenster, Chunks und Chunk-Summaries.
-// - Änderung: Default SUMMARY_CHUNK_OUT_TOKENS = 1400 (vorher 800) → mehr Detailtiefe je Chunk.
+// - Debug: Ausführliche console.log-Ausgaben
+// - Fix: 'Newest is not defined' → korrekt 'newest && newest.trim()'
+// - Prompts: Chronologie via (#id), Intro & Outcome, keine „ein Bullet pro Chunk”-Verdichtung
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -157,7 +158,7 @@ class Context {
     this.persistent = typeof persistToDB === "boolean" ? persistToDB : !!this.channelId;
 
     this._maxUserMessages = null;
-       this._prunePerTwoNonUser = true;
+    this._prunePerTwoNonUser = true;
     this.isSummarizing = false;
 
     const sys = `${this.persona}\n${this.instructions}`.trim();
@@ -207,7 +208,7 @@ class Context {
     try {
       const last = await this.getLastSummaries(1);
       const newest = last?.[0]?.summary;
-      if (newest &&Newest.trim()) {
+      if (newest && newest.trim()) {
         this.messages.push({ role: "assistant", name: "summary", content: newest.trim() });
       }
     } catch (e) {
@@ -303,43 +304,43 @@ class Context {
     // Klassische Chunk-Größen – wie „vorher“
     const MAX_INPUT_TOKENS_PER_CHUNK = Number(process.env.SUMMARY_CHUNK_WORDS || process.env.SUMMARY_CHUNK_TOKENS || 1800);
     const CHUNK_THRESHOLD = Math.max(1.0, Number(process.env.SUMMARY_CHUNK_THRESHOLD || 1.2));
-    // 🔼 Erhöht: mehr Generierungs-Tokens pro Chunk-Summary
+    // Erhöht: mehr Generierungs-Tokens pro Chunk-Summary
     const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 1400));
     const MAX_FINAL_TOKENS = Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 3000));
 
-    // Final-Pass: neutral, verlustarm, strukturiert
+    // Final-Pass: neutral, verlustarm, strukturiert — inkl. Intro & Outcome, Chronologie per (#id)
     const DEFAULT_FINAL_PROMPT = `
-You will receive compressed bullet outputs summarizing chat logs.
-Your job: produce ONE consolidated, loss-minimizing summary for the whole window.
+You will receive bullet-style extracts (possibly from multiple slices) summarizing chat logs.
 
-Rules:
-- Preserve all concrete information (facts, decisions, tasks with owner & deadline, questions, numbers, URLs/IDs, code refs, errors).
-- Deduplicate near-duplicates, but do not drop edge-cases. Keep exact names/terms.
-- Preserve helpful chronology. If tags like [DECISION]/[TASK]/[QUESTION]/[NOTE]/[REF] appear, carry them through.
-- Concise but complete; avoid filler/meta.
+Your job: produce ONE consolidated, loss-minimizing summary for the WHOLE window.
 
-Output:
-- A structured bullet list (sections like Decisions / Tasks / Open questions / Notes / References are welcome).
+Do this:
+- **Ignore slice/chunk boundaries.** Consider all bullets as one pool.
+- **Order by chronology using (#ID) markers when present (ascending).**
+- Start with a brief **Overview** (1–2 sentences) capturing the initial situation / context.
+- Then provide structured bullets; keep concrete info: facts, decisions, tasks (owner & deadline), questions, numbers, URLs/IDs, code refs, errors.
+- Deduplicate near-duplicates, but **do not collapse everything to one bullet per slice**. Merge only truly identical items.
+- End with **Outcome & Next steps** summarizing final state and actionable follow-ups.
+
+Style:
+- Neutral, precise phrasing. Keep exact names/terms. Prefer clarity over brevity when in doubt.
+- No headings other than the ones requested (Overview, Outcome & Next steps).
 `.trim();
 
-    // Chunk-Pass: faktenorientierte Extraktion, keine Prosa
+    // Chunk-Pass: faktenorientierte Extraktion, IDs mitführen
     const CHUNK_PROMPT = `
 You are compressing a slice of chat logs with minimal information loss.
 
-Extract all content-carrying items as compact bullets, using tags where apt:
-- [DECISION] decisions/outcomes
-- [TASK] action items (include owner & deadline if present)
-- [QUESTION] open questions/blockers
-- [NOTE] factual notes/context/observations
-- [REF] references (URLs, IDs, files, PRs, issues, msg IDs)
-
-Rules:
+Extract content-carrying items as compact bullets. For each bullet:
+- **Include source message IDs** using the smallest covering range from the slice, e.g. "(#123)" or "(#123–#126)".
+- Use tags where apt:
+  [DECISION], [TASK], [QUESTION], [NOTE], [REF]
 - Keep exact names/IDs/terms; include numbers, dates, versions, error codes.
-- Preserve local chronology within this slice.
+- Preserve local chronology within THIS slice (ascending by ID).
 - Skip pure pleasantries/emoji-only/acks unless they affect decisions/tasks.
-- One item per line, terse. If uncertain, keep the item and mark with [?].
+- One atomic item per bullet; do NOT add any "chunk" headings; no prose.
 
-Output: only the bullet list, no headings.
+Output: only the bullet list, one item per line.
 `.trim();
 
     const tokenCount = (s) => String(s || "").trim().split(/\s+/).length;
@@ -454,7 +455,7 @@ Output: only the bullet list, no headings.
           console.log(`\n[SUMMARY][${this.channelId}] ===== RAW CHUNK ${i + 1}/${chunks.length} (words≈${words}) =====\n${c}\n`);
         });
 
-        // Zwischenpass: faktenorientierte Bullets je Chunk
+        // Zwischenpass: faktenorientierte Bullets je Chunk (mit IDs)
         const chunkSummaries = [];
         for (let i = 0; i < chunks.length; i++) {
           const sumCtx = new Context(
@@ -473,11 +474,11 @@ Output: only the bullet list, no headings.
 
           if (s) chunkSummaries.push(s);
         }
-        // Konsolidiertes Material für den Final-Pass
+        // Konsolidiertes Material für den Final-Pass (alle Bullets zusammen, ohne Chunk-Header)
         finalMaterial = chunkSummaries.join("\n");
       }
 
-      // Final-Pass: konsolidieren, deduplizieren, Struktur geben – ohne Inhalte zu verlieren
+      // Final-Pass
       const finalCtx = new Context(
         "You consolidate chunk summaries with minimal loss.",
         finalPrompt,
