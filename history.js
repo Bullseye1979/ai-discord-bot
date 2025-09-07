@@ -224,7 +224,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     const safe = (rows || []).map((r) => {
       const obj = {};
       for (const [k, v] of Object.entries(r)) {
-        obj[k] = typeof v === "string" ? truncate(v) : v;
+        obj[k] = v;
       }
       return obj;
     });
