@@ -1,8 +1,6 @@
-// webpage.js — v2.0 (generic Q&A on webpages via GPT-4.1)
-// Always returns JSON with { result, raw_text, url }.
-// - raw_text = full page text without HTML (clipped to MAX_INPUT_CHARS)
-// - result   = answer to user_prompt (can be summary, extraction, search, etc.)
-// - url      = source URL
+// webpage.js — v2.1 (only result + url)
+// Executes the user_prompt against the page text (HTML stripped).
+// Returns JSON: { result, url }
 
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
@@ -32,12 +30,7 @@ async function getWebpage(toolFunction) {
 
     browser = await puppeteer.launch({
       headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-        "--disable-setuid-sandbox",
-      ],
+      args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--disable-setuid-sandbox"],
     });
 
     const page = await browser.newPage();
@@ -45,28 +38,17 @@ async function getWebpage(toolFunction) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     );
-    await page.setExtraHTTPHeaders({
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-    });
 
     const resp = await page.goto(url, { waitUntil: "networkidle2", timeout: 45000 });
-    if (!resp) {
-      return JSON.stringify({ error: "WEBPAGE_FETCH — No response received." });
-    }
+    if (!resp) return JSON.stringify({ error: "WEBPAGE_FETCH — No response received." });
 
     const status = resp.status();
-    const ctype = String(resp.headers()?.["content-type"] || "").toLowerCase();
-    if (status >= 400) {
-      return JSON.stringify({ error: `WEBPAGE_STATUS — HTTP ${status} for ${url}` });
-    }
+    if (status >= 400) return JSON.stringify({ error: `WEBPAGE_STATUS — HTTP ${status} for ${url}` });
 
+    const ctype = String(resp.headers()?.["content-type"] || "").toLowerCase();
     let textContent = "";
 
-    if (ctype.includes("application/json")) {
-      const jsonText = await resp.text();
-      textContent = jsonText.slice(0, MAX_INPUT_CHARS);
-    } else if (ctype.includes("text/html") || ctype.includes("application/xhtml+xml")) {
+    if (ctype.includes("text/html") || ctype.includes("application/xhtml+xml")) {
       await page.waitForSelector("main, article, body", { timeout: 15000 }).catch(() => {});
       const { title, text } = await extractReadableText(page);
       textContent = ((title ? `${title}\n\n` : "") + text).trim();
@@ -74,17 +56,14 @@ async function getWebpage(toolFunction) {
         const fallback = (await page.evaluate(() => document.body?.innerText || "")).trim();
         textContent = fallback;
       }
-      textContent = textContent.slice(0, MAX_INPUT_CHARS);
     } else {
       const rawOther = await resp.text().catch(() => "");
-      textContent = rawOther.slice(0, MAX_INPUT_CHARS);
+      textContent = rawOther;
     }
 
-    if (!textContent) {
-      return JSON.stringify({ error: "WEBPAGE_CONTENT_EMPTY — Could not extract meaningful text." });
-    }
+    textContent = textContent.slice(0, MAX_INPUT_CHARS);
+    if (!textContent) return JSON.stringify({ error: "WEBPAGE_CONTENT_EMPTY — No text extracted." });
 
-    // Run the user prompt against the page text
     const ctx = new Context();
     await ctx.add(
       "system",
@@ -94,7 +73,6 @@ async function getWebpage(toolFunction) {
         "You are given a webpage's plain text (HTML stripped).",
         "Answer the user's request precisely using the page text as source.",
         "Preserve key names, numbers, and URLs if relevant.",
-        "Output should directly address the request (can be summary, extraction, search, etc.).",
       ].join(" ")
     );
     await ctx.add("user", "request", `User request: "${userPrompt}"`);
@@ -102,11 +80,7 @@ async function getWebpage(toolFunction) {
 
     const out = await getAI(ctx, WEB_TOKENS, WEB_MODEL);
 
-    return JSON.stringify({
-      result: (out || "").trim(),
-      raw_text: textContent,
-      url,
-    });
+    return JSON.stringify({ result: (out || "").trim(), url });
   } catch (e) {
     await reportError(e, null, "WEBPAGE_UNHANDLED", "ERROR");
     return JSON.stringify({ error: `WEBPAGE_UNHANDLED — ${e?.message || "Unexpected failure"}` });

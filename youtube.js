@@ -1,11 +1,11 @@
-// youtube.js — v3.1 (generic transcript Q&A via GPT-4.1)
-// Fetch YouTube transcript (CCs), feed into GPT-4.1 with user prompt, return result.
-// Not forced to summarize anymore — the user_prompt defines what should happen.
+// youtube.js — v3.2 (only result + video_url)
+// Executes the user_prompt against the transcript of a YouTube video.
+// Returns JSON: { result, video_url }
 
 const { getAI } = require("./aiService.js");
 const Context = require("./context.js");
 
-const MAX_INPUT_CHARS = 250_000;  // safety cap
+const MAX_INPUT_CHARS = 250_000;
 const YT_MODEL = "gpt-4.1";
 const YT_TOKENS = 1400;
 
@@ -81,13 +81,12 @@ async function getYoutube(toolFunction) {
     const videoUrl = String(args.video_url || "").trim();
     const videoId = extractVideoId(videoUrl);
 
-    if (!videoId) return "[ERROR]: YT_BAD_ID — Unable to extract a valid YouTube video ID.";
-    if (!userPrompt) return "[ERROR]: YT_NO_PROMPT — Missing 'user_prompt'.";
+    if (!videoId) return JSON.stringify({ error: "YT_BAD_ID — Invalid video ID/URL." });
+    if (!userPrompt) return JSON.stringify({ error: "YT_NO_PROMPT — Missing 'user_prompt'." });
 
     const transcript = await fetchTranscript(videoId);
-    if (!transcript.length) return "[ERROR]: YT_NO_TRANSCRIPT — No transcript available for this video.";
+    if (!transcript.length) return JSON.stringify({ error: "YT_NO_TRANSCRIPT — No transcript available." });
 
-    // Build timeline text
     let timeline = "";
     for (const entry of transcript) {
       timeline += `[${fmtTime(entry.start)}] ${entry.text}\n`;
@@ -102,19 +101,16 @@ async function getYoutube(toolFunction) {
         "You are a helpful assistant with a very large context window.",
         "You are given a YouTube transcript with timestamps.",
         "Answer the user's request precisely, using the transcript as source.",
-        "Preserve names, numbers, and timestamps where they matter.",
-        "Output should directly address the request (can be summary, quotes, analysis, etc.).",
+        "Preserve key names, numbers, and timestamps where relevant.",
       ].join(" ")
     );
-
     await ctx.add("user", "request", `User request: "${userPrompt}"`);
     await ctx.add("user", "transcript", timeline);
 
     const out = await getAI(ctx, YT_TOKENS, YT_MODEL);
-    return (out || "").trim() || "[ERROR]: YT_EMPTY_OUTPUT — No result returned.";
+    return JSON.stringify({ result: (out || "").trim(), video_url: videoUrl });
   } catch (err) {
-    const msg = err?.message || "unexpected error";
-    return `[ERROR]: YT_FAILURE — ${msg}`;
+    return JSON.stringify({ error: `YT_FAILURE — ${err?.message || "Unexpected error"}` });
   }
 }
 
