@@ -5,6 +5,7 @@
 // - Chunking: fixe, “klassische” Größe (≈1800 Wörter) mit Schwelle 1.2; Zwischenpass extrahiert faktenorientierte Bullets
 // - Redo: löscht jüngste Summary + erzeugt sofort eine neue (gleiches Fenster via End-ID-Cap)
 // - Debug: Ausführliche console.log-Ausgaben zu Fenster, Chunks und Chunk-Summaries.
+// - Änderung: Default SUMMARY_CHUNK_OUT_TOKENS = 1400 (vorher 800) → mehr Detailtiefe je Chunk.
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -156,7 +157,7 @@ class Context {
     this.persistent = typeof persistToDB === "boolean" ? persistToDB : !!this.channelId;
 
     this._maxUserMessages = null;
-    this._prunePerTwoNonUser = true;
+       this._prunePerTwoNonUser = true;
     this.isSummarizing = false;
 
     const sys = `${this.persona}\n${this.instructions}`.trim();
@@ -206,7 +207,7 @@ class Context {
     try {
       const last = await this.getLastSummaries(1);
       const newest = last?.[0]?.summary;
-      if (newest && newest.trim()) {
+      if (newest &&Newest.trim()) {
         this.messages.push({ role: "assistant", name: "summary", content: newest.trim() });
       }
     } catch (e) {
@@ -302,7 +303,8 @@ class Context {
     // Klassische Chunk-Größen – wie „vorher“
     const MAX_INPUT_TOKENS_PER_CHUNK = Number(process.env.SUMMARY_CHUNK_WORDS || process.env.SUMMARY_CHUNK_TOKENS || 1800);
     const CHUNK_THRESHOLD = Math.max(1.0, Number(process.env.SUMMARY_CHUNK_THRESHOLD || 1.2));
-    const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 800));
+    // 🔼 Erhöht: mehr Generierungs-Tokens pro Chunk-Summary
+    const CHUNK_OUTPUT_TOKENS = Math.max(200, Number(process.env.SUMMARY_CHUNK_OUT_TOKENS || 1400));
     const MAX_FINAL_TOKENS = Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 3000));
 
     // Final-Pass: neutral, verlustarm, strukturiert
