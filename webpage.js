@@ -1,5 +1,7 @@
-// webpage.js — refactored v1.4
-// Fetches a webpage via Puppeteer, strips UI/noise, returns clean text; optional summarization.
+// webpage.js — v1.6 (auto-summarize long pages, threshold 15k chars)
+// Fetches a webpage via Puppeteer, strips UI/noise, returns clean plain text.
+// If the extracted text is very long, we automatically summarize it with GPT-4.1
+// in a single pass (no chunking), aiming for minimal information loss.
 
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
@@ -9,7 +11,15 @@ const { reportError } = require("./error.js");
 
 puppeteer.use(StealthPlugin());
 
-/** Fetch, clean and optionally summarize a webpage (tool entry). */
+// Character thresholds
+const LONG_TEXT_THRESHOLD = 15_000;   // above this, summarize instead of returning raw text
+const MAX_INPUT_CHARS     = 250_000;  // hard cap for what we feed to the model
+
+// Model config for summaries
+const WEB_SUMMARY_MODEL  = "gpt-4.1";
+const WEB_SUMMARY_TOKENS = 1400;
+
+/** Tool entry: Always return plain text (no HTML). For very long pages, return a faithful summary. */
 async function getWebpage(toolFunction) {
   let browser;
   try {
@@ -18,7 +28,6 @@ async function getWebpage(toolFunction) {
         ? JSON.parse(toolFunction.arguments || "{}")
         : (toolFunction.arguments || {});
     const url = String(args.url || "").trim();
-    const wantSummary = args.summary === true; // default: return clean text
 
     if (!url) return "[ERROR]: WEBPAGE_INPUT — Missing 'url'.";
 
@@ -26,9 +35,9 @@ async function getWebpage(toolFunction) {
       headless: "new",
       args: [
         "--no-sandbox",
-        "--disable-setuid-sandbox",
+        "--disable-gpu",
         "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
+        "--disable-setuid-sandbox",
       ],
     });
 
@@ -39,7 +48,7 @@ async function getWebpage(toolFunction) {
     );
     await page.setExtraHTTPHeaders({
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.8",
+      "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       "Sec-Fetch-Mode": "navigate",
     });
 
@@ -57,42 +66,51 @@ async function getWebpage(toolFunction) {
       return `[ERROR]: WEBPAGE_STATUS — HTTP ${status} for ${url}`;
     }
 
-    // JSON → pretty print
+    // JSON → return pretty-printed JSON as text (clipped)
     if (ctype.includes("application/json")) {
       const jsonText = await resp.text();
       if (!jsonText || jsonText.length < 2) {
-        await reportError(new Error("Empty JSON body"), null, "WEBPAGE_JSON_EMPTY", "WARN");
-        return "[ERROR]: WEBPAGE_JSON_EMPTY — Empty JSON body.";
+        await reportError(new Error("Empty JSON response"), null, "WEBPAGE_JSON_EMPTY", "WARN");
+        return "[ERROR]: WEBPAGE_JSON_EMPTY — No JSON content.";
       }
       try {
-        const parsed = JSON.parse(jsonText);
-        return JSON.stringify(parsed, null, 2);
-      } catch (e) {
-        await reportError(e, null, "WEBPAGE_JSON_PARSE", "ERROR");
-        return "[ERROR]: WEBPAGE_JSON_PARSE — JSON could not be parsed.";
+        const obj = JSON.parse(jsonText);
+        const pretty = JSON.stringify(obj, null, 2);
+        return pretty.slice(0, MAX_INPUT_CHARS);
+      } catch {
+        // Not strictly JSON? just return as-is clipped.
+        return jsonText.slice(0, MAX_INPUT_CHARS);
       }
     }
 
-    // HTML/XHTML → extrahieren
+    // HTML/XHTML → extract readable text
     if (ctype.includes("text/html") || ctype.includes("application/xhtml+xml")) {
       await page.waitForSelector("main, article, body", { timeout: 15000 }).catch(() => {});
       const { title, text } = await extractReadableText(page);
 
-      const raw = (title ? `${title}\n\n` : "") + text;
-      if (!raw || raw.trim().length < 50) {
+      const raw = ((title ? `${title}\n\n` : "") + text).trim();
+
+      if (!raw || raw.length < 50) {
         const fallback = (await page.evaluate(() => document.body?.innerText || "")).trim();
         if (!fallback || fallback.length < 50) {
           await reportError(new Error("Could not extract meaningful text."), null, "WEBPAGE_CONTENT_EMPTY", "WARN");
           return "[ERROR]: WEBPAGE_CONTENT_EMPTY — Could not extract meaningful text.";
         }
-        return wantSummary ? await summarizeText(fallback.slice(0, 120000)) : fallback;
+        const clipped = fallback.slice(0, MAX_INPUT_CHARS);
+        if (clipped.length > LONG_TEXT_THRESHOLD) {
+          return await summarizeLikeHistory(clipped, url);
+        }
+        return clipped;
       }
 
-      const clipped = raw.slice(0, 200_000);
-      return wantSummary ? await summarizeText(clipped) : clipped;
+      const clipped = raw.slice(0, MAX_INPUT_CHARS);
+      if (clipped.length > LONG_TEXT_THRESHOLD) {
+        return await summarizeLikeHistory(clipped, url);
+      }
+      return clipped;
     }
 
-    // Andere Typen → Rohtext (geclippt) oder Fehler
+    // Other content types → return raw text (clipped) or error
     const rawOther = await resp.text().catch(() => "");
     if (!rawOther || !rawOther.length) {
       await reportError(new Error(`Unsupported content-type: ${ctype}`), null, "WEBPAGE_UNSUPPORTED_TYPE", "INFO");
@@ -100,8 +118,8 @@ async function getWebpage(toolFunction) {
     }
     return rawOther.slice(0, 4000);
   } catch (e) {
-    await reportError(e, null, "WEBPAGE_EXCEPTION", "ERROR");
-    return `[ERROR]: WEBPAGE_EXCEPTION — ${e?.message || "Unexpected error."}`;
+    await reportError(e, null, "WEBPAGE_UNHANDLED", "ERROR");
+    return `[ERROR]: WEBPAGE_UNHANDLED — ${e?.message || "Unexpected failure"}`;
   } finally {
     try { await browser?.close(); } catch {}
   }
@@ -119,25 +137,46 @@ async function extractReadableText(page) {
 
     const root = document.querySelector("article") || document.querySelector("main") || document.body;
     const ttl = document.title || "";
-    const txt = (root?.innerText || "")
-      .replace(/\u00a0/g, " ")
-      .replace(/\r/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(/[ \t]{2,}/g, " ")
-      .trim();
 
-    return { title: ttl, text: txt };
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    const lines = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      const t = (node.nodeValue || "").replace(/\s+/g, " ").trim();
+      if (t) lines.push(t);
+    }
+
+    const text = lines
+      .map((l) => l.replace(/\u00a0/g, " ").trim())
+      .filter((l) => l && l.length > 1)
+      .join("\n");
+
+    return { title: ttl, text };
   });
 }
 
-/** Summarize text briefly in English (token-efficient). */
-async function summarizeText(text) {
+/** Single-pass, loss-minimizing summary using GPT-4.1, similar to the 'history' approach. */
+async function summarizeLikeHistory(fullText, sourceUrl = null) {
   try {
     const ctx = new Context();
-    await ctx.add("system", "summarizer", "Summarize the text concisely in English. Keep names, figures, and URLs.");
-    await ctx.add("user", "source", text);
-    const out = await getAI(ctx, 900, "gpt-4o");
-    return out?.trim() || "[ERROR]: WEBPAGE_SUMMARY_EMPTY — No summary returned.";
+    await ctx.add(
+      "system",
+      "summarizer",
+      [
+        "You are a meticulous summarizer with a very large context window.",
+        "Summarize the following page with minimal information loss.",
+        "Preserve key names, figures, dates, terminology, and any URLs present.",
+        "Use compact, well-structured output (headings + bullet points where useful).",
+        "Write in the user's language if inferable (German if unsure).",
+      ].join(" ")
+    );
+    if (sourceUrl) {
+      await ctx.add("user", "url", `Source URL: ${sourceUrl}`);
+    }
+    await ctx.add("user", "full_text", fullText);
+
+    const out = await getAI(ctx, WEB_SUMMARY_TOKENS, WEB_SUMMARY_MODEL);
+    return (out || "").trim() || "[ERROR]: WEBPAGE_SUMMARY_EMPTY — No summary returned.";
   } catch (e) {
     await reportError(e, null, "WEBPAGE_SUMMARY_FAIL", "ERROR");
     return `[ERROR]: WEBPAGE_SUMMARY_FAIL — ${e?.message || "Summarization failed."}`;
