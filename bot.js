@@ -790,7 +790,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // !summarize-remove  ← NEU
+    // !summarize-remove  ← NEU (Hinweis wie "Summary completed")
     if (rawText.trim() === "!summarize-remove") {
       if (!channelMeta.summariesEnabled) {
         await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
@@ -800,17 +800,13 @@ client.on("messageCreate", async (message) => {
       try {
         const deletedId = await chatContext.deleteLastSummary();
         if (deletedId) {
-          await setReplyAsWebhookEmbed(
-            message,
+          await reportInfo(
+            message.channel,
             `Removed last summary (id **${deletedId}**). You can now run **!summarize** to regenerate with the updated window.`,
-            { botname: channelMeta.botname, color: 0xff3b30 }
+            "SUMMARY"
           );
         } else {
-          await setReplyAsWebhookEmbed(
-            message,
-            "No summary found to remove.",
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
+          await reportInfo(message.channel, "No summary found to remove.", "SUMMARY");
         }
       } catch (e) {
         await reportError(e, message.channel, "CMD_SUMMARIZE_REMOVE", { emit: "channel" });
@@ -818,6 +814,7 @@ client.on("messageCreate", async (message) => {
       }
       return;
     }
+
 
 
     // !summarize-replace
