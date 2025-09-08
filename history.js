@@ -1,241 +1,289 @@
-// history.js — v2.3 (structured parts + safe builder + automatic channel filter + console logging)
-// READ-ONLY MySQL SELECT over channel history (context_log, summaries).
-// - Structured mode: { select, from, where, bindings } -> wir bauen finalen SQL sicher.
-// - Legacy mode: args.sql -> wir PARSEN "SELECT … FROM … [WHERE …]" und bauen sicher neu.
-// - channel_id wird AUTOMATISCH aus ctx.channelId (oder runtime.channel_id) genommen und immer
-//   als zusätzlicher Filter eingefügt (kein :channel_id mehr erforderlich im Prompt).
-// - Loggt den finalen SELECT (mit '?') und die Werte ins Console-Log.
+// history.js — v2.0 (raw | passthrough | qa with channel-safe context windows)
+// - raw:         returns raw rows exactly as stored (no AI) — preserves current behavior incl. summaries
+// - passthrough: returns a single concatenated text block for direct context injection (no AI)
+// - qa:          finds matches by keywords, expands ±10 messages in same channel, dedupes & answers via GPT-4.1
+//
+// Notes:
+// * Multiple channels write to the same table -> context windows are fetched with channel filter & LIMIT
+// * ORDER BY and channel scoping are enforced here; the model never builds full SQL.
+//
+// Requires: mysql2/promise-based pool export from ./db.js as { pool }
+// Optional: getAI/Context for qa mode (no AI used in raw/passthrough)
 
-const mysql = require("mysql2/promise");
+const { pool } = require("./db.js");
+const { reportError } = require("./error.js");
+const { getAI } = require("./aiService.js");
+const Context = require("./context.js");
 
-let pool = null;
+// ---------- Tunables ----------
+const QA_MODEL = "gpt-4.1";
+const QA_TOKENS = 1200;
 
-/** Returns a singleton MySQL pool. */
-async function getPool() {
-  if (!pool) {
-    pool = mysql.createPool({
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      waitForConnections: true,
-      connectionLimit: 5,
-      charset: "utf8mb4",
-    });
-  }
-  return pool;
-}
+const MATCH_LIMIT = 30;          // Max number of keyword matches to expand
+const CTX_BEFORE = 10;           // window size: messages before the match (same channel)
+const CTX_AFTER = 10;            // window size: messages after the match (same channel)
+const RAW_LIMIT_DEFAULT = 200;   // default limit when no time window is provided
 
-/* ----------------------------- Helpers ----------------------------- */
-
-function stripTrailingSemicolons(sql) {
-  return String(sql || "").replace(/;+\s*$/g, "");
-}
-
-/** Ensure ORDER BY `timestamp` ASC exists; inject before LIMIT if LIMIT present. */
-function ensureOrderByTimestamp(sql) {
-  const s = stripTrailingSemicolons(sql);
-  if (/\border\s+by\b/i.test(s)) return s;
-  if (/\blimit\b/i.test(s)) {
-    return s.replace(/\blimit\b/i, "ORDER BY `timestamp` ASC LIMIT");
-  }
-  return `${s} ORDER BY \`timestamp\` ASC`;
-}
-
-/** Compiles :named placeholders into '?', returns { sql, values }.
- *  Adds LIMIT 200 if missing.
- *  IMPORTANT: names must start with [A-Za-z_] to avoid matching time literals like "10:00".
- */
-function compileNamed(sql, bindings) {
-  const values = [];
-  const cleaned = stripTrailingSemicolons(sql);
-
-  // Only replace tokens like :from, :to, :channel_id — NOT :00, NOT :1, NOT ://
-  const out = cleaned.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_, name) => {
-    if (!(name in bindings)) {
-      throw new Error(`Missing binding for :${name}`);
-    }
-    values.push(bindings[name]);
-    return "?";
-  });
-
-  if (!/\blimit\b/i.test(out)) {
-    return { sql: `${out} LIMIT 200`, values };
-  }
-  return { sql: out, values };
-}
-
-/** Truncates long string fields in result rows. */
-function truncate(s, n = 1200) {
-  if (typeof s !== "string") return s;
-  return s.length > n ? s.slice(0, n) + "…" : s;
-}
-
-/** Safe console preview of values (avoid huge dumps). */
-function previewValues(arr, maxLen = 200) {
+// ---------- Utilities ----------
+function parseArgs(toolFunction) {
   try {
-    return (arr || []).map((v) => {
-      if (typeof v === "string") {
-        return v.length > maxLen ? v.slice(0, maxLen) + "…" : v;
-        }
-      return v;
-    });
+    return typeof toolFunction.arguments === "string"
+      ? JSON.parse(toolFunction.arguments || "{}")
+      : (toolFunction.arguments || {});
   } catch {
-    return arr;
+    return {};
   }
 }
 
-/* ----------------------------- Sanitizers (structured) ----------------------------- */
-
-const ALLOWED_TABLES = new Set(["context_log", "summaries"]);
-const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-function sanitizeSelect(selectRaw) {
-  const s = String(selectRaw || "").trim();
-  if (!s) throw new Error("select part missing");
-  if (/[;]|--|\/\*|\*\//.test(s)) throw new Error("disallowed characters in select");
-  if (/(\bunion\b|\bdrop\b|\balter\b|\binsert\b|\bupdate\b|\bdelete\b)/i.test(s)) {
-    throw new Error("dangerous keyword in select");
+/** Split query into AND-terms. Handles quoted phrases: "murphy ist vampir" */
+function extractTerms(q) {
+  const s = String(q || "").trim();
+  if (!s) return [];
+  const terms = [];
+  const re = /"([^"]+)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const term = (m[1] || m[2] || "").trim();
+    if (term) terms.push(term);
   }
-  if (!/^[\s\w.*,"'()`+\-/*.%<>!=:]+$/.test(s)) {
-    throw new Error("select contains invalid characters");
-  }
-  return s;
+  // Remove duplicates & trivial tokens
+  const uniq = [...new Set(terms.map(t => t.toLowerCase()))].filter(t => t.length >= 2);
+  return uniq;
 }
 
-/** FROM must be exactly one allowed table, optional alias. Accepts string or array. */
-function sanitizeFrom(fromRaw) {
-  let s = fromRaw;
-  if (Array.isArray(fromRaw)) {
-    if (fromRaw.length !== 1) throw new Error("exactly one table must be specified in from");
-    s = fromRaw[0];
+/** Build WHERE fragments for AND-like search on 'content' */
+function buildAndLike(whereTerms) {
+  if (!whereTerms?.length) return { sql: "1=1", params: [] };
+  const parts = whereTerms.map(() => "content LIKE ?");
+  const params = whereTerms.map(t => `%${t}%`);
+  return { sql: parts.join(" AND "), params };
+}
+
+/** Fetch last N messages in channel, ASC */
+async function fetchLastN(channelId, limit = RAW_LIMIT_DEFAULT) {
+  const [rows] = await pool.execute(
+    `SELECT id, channel_id, created_at, author, role, type, content
+       FROM history
+      WHERE channel_id = ?
+   ORDER BY id DESC
+      LIMIT ?`,
+    [channelId, Number(limit)]
+  );
+  // return ascending
+  return [...rows].reverse();
+}
+
+/** Fetch time-window messages in channel, ASC */
+async function fetchByTime(channelId, fromIso, toIso, limit = RAW_LIMIT_DEFAULT) {
+  const params = [channelId];
+  let where = "channel_id = ?";
+  if (fromIso) { where += " AND created_at >= ?"; params.push(fromIso); }
+  if (toIso)   { where += " AND created_at <= ?"; params.push(toIso); }
+
+  where += " ORDER BY id ASC";
+  const q = `SELECT id, channel_id, created_at, author, role, type, content
+               FROM history
+              WHERE ${where}
+              LIMIT ?`;
+
+  params.push(Number(limit));
+  const [rows] = await pool.execute(q, params);
+  return rows;
+}
+
+/** Fetch direct keyword matches (ids only) within channel, limited */
+async function fetchMatchIds(channelId, terms, limit = MATCH_LIMIT) {
+  const { sql, params } = buildAndLike(terms);
+  const [ids] = await pool.execute(
+    `SELECT id
+       FROM history
+      WHERE channel_id = ?
+        AND ${sql}
+   ORDER BY id ASC
+      LIMIT ?`,
+    [channelId, ...params, Number(limit)]
+  );
+  return ids.map(r => r.id);
+}
+
+/** Fetch a channel-safe context window (±before/after) around a given id */
+async function fetchContextWindow(channelId, matchId, before = CTX_BEFORE, after = CTX_AFTER) {
+  const [prev] = await pool.execute(
+    `SELECT id, channel_id, created_at, author, role, type, content
+       FROM history
+      WHERE channel_id = ? AND id < ?
+   ORDER BY id DESC
+      LIMIT ?`,
+    [channelId, matchId, Number(before)]
+  );
+  const [center] = await pool.execute(
+    `SELECT id, channel_id, created_at, author, role, type, content
+       FROM history
+      WHERE channel_id = ? AND id = ?`,
+    [channelId, matchId]
+  );
+  const [next] = await pool.execute(
+    `SELECT id, channel_id, created_at, author, role, type, content
+       FROM history
+      WHERE channel_id = ? AND id > ?
+   ORDER BY id ASC
+      LIMIT ?`,
+    [channelId, matchId, Number(after)]
+  );
+
+  const prevAsc = [...prev].reverse();
+  return [...prevAsc, ...center, ...next];
+}
+
+/** Merge multiple windows, dedupe by id, return ASC */
+function mergeDedupSort(windows) {
+  const map = new Map();
+  for (const arr of windows) {
+    for (const r of arr) map.set(r.id, r);
   }
-  s = String(s || "").trim();
-  if (!s) throw new Error("from part missing");
-  if (/[;]|--|\/\*|\*\//.test(s)) throw new Error("disallowed characters in from");
-  const m = s.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?$/i);
-  if (!m) throw new Error("invalid from syntax");
-  const table = m[1];
-  const alias = m[2];
-  if (!ALLOWED_TABLES.has(table)) throw new Error(`table '${table}' not allowed`);
-  if (alias && !IDENTIFIER_RE.test(alias)) throw new Error("invalid alias");
-  return alias ? `${table} ${alias}` : table;
+  return [...map.values()].sort((a, b) => a.id - b.id);
 }
 
-function sanitizeWhere(whereRaw) {
-  const s = String(whereRaw || "").trim();
-  if (!s) return "";
-  if (/[;]|--|\/\*|\*\//.test(s)) throw new Error("disallowed characters in where");
-  if (/(\bunion\b|\bdrop\b|\balter\b|\binsert\b|\bupdate\b|\bdelete\b)/i.test(s)) {
-    throw new Error("dangerous keyword in where");
-  }
-  if (!/^[\s\w."';(),%:+\-/*<>!=|&]+$/.test(s)) {
-    throw new Error("where contains invalid characters");
-  }
-  return s;
+/** Convert rows to a simple text block suitable for direct LLM context */
+function rowsToPassthroughText(rows) {
+  return rows.map(r => {
+    const ts = r.created_at ? new Date(r.created_at).toISOString() : "";
+    const speaker = r.author || r.role || "unknown";
+    return `[${ts}] ${speaker}: ${String(r.content || "").trim()}`;
+  }).join("\n");
 }
 
-/** Build final SQL from structured parts */
-function buildStructuredQuery(parts) {
-  const selectPart = sanitizeSelect(parts.select);
-  const fromPart = sanitizeFrom(parts.from);
-  const wherePart = sanitizeWhere(parts.where);
-  const whereClause = wherePart
-    ? `(${wherePart}) AND (\`channel_id\` = :channel_id)`
-    : `(\`channel_id\` = :channel_id)`;
-  let sql = `SELECT ${selectPart} FROM ${fromPart} WHERE ${whereClause}`;
-  sql = ensureOrderByTimestamp(sql);
-  return sql;
-}
-
-/* ----------------------------- Legacy SQL parsing ----------------------------- */
-
-/**
- * Parse a simple SELECT … FROM … [WHERE …] (ignores trailing ORDER BY / LIMIT).
- * Returns { select, from, where } or throws.
- */
-function parseLegacySql(sqlIn) {
-  const s = stripTrailingSemicolons(String(sqlIn || ""));
-  const re =
-    /^\s*select\s+([\s\S]+?)\s+from\s+([A-Za-z_][A-Za-z0-9_]*(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:where\s+([\s\S]*?))?(?:\border\s+by\b[\s\S]*)?$/i;
-  const m = s.match(re);
-  if (!m) throw new Error("Unsupported SQL shape. Provide 'select/from/where' parts or a simple 'SELECT … FROM … [WHERE …]'.");
-  const rawSelect = m[1];
-  const rawFrom = m[2];
-  const rawWhere = m[3] || "";
-  // sanitize using the same functions as structured mode
-  const select = sanitizeSelect(rawSelect);
-  const from = sanitizeFrom(rawFrom);
-  const where = sanitizeWhere(rawWhere);
-  return { select, from, where };
-}
-
-/* ----------------------------- Tool entry ----------------------------- */
-
-async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
-  console.log("GET HISTORY ENTERED");
+// ---------- Main tool ----------
+async function getHistory(toolFunction) {
   try {
-    const rawArgs =
-      typeof toolFunction.arguments === "string"
-        ? JSON.parse(toolFunction.arguments || "{}")
-        : toolFunction.arguments || {};
+    const args = parseArgs(toolFunction);
+    const mode = String(args.mode || "raw").toLowerCase();
+    const channelId = String(args.channel_id || "").trim();
+    const userId = String(args.user_id || "").trim(); // optional, for auditing or prompts
+    const query = String(args.query || "").trim();
 
-    // channel_id AUTOMATISCH aus Context; runtime nur Fallback
-    const channelId =
-      (ctxOrUndefined && ctxOrUndefined.channelId && String(ctxOrUndefined.channelId).trim()) ||
-      (runtime && runtime.channel_id && String(runtime.channel_id).trim()) ||
-      "";
-
-    if (!channelId) throw new Error("channel_id missing from context");
-
-    // Structured Mode?
-    const isStructured = rawArgs.select || rawArgs.from || rawArgs.where;
-
-    let finalSQL, values;
-    const userBindings = (rawArgs.bindings && typeof rawArgs.bindings === "object") ? rawArgs.bindings : {};
-
-    if (isStructured) {
-      finalSQL = buildStructuredQuery({
-        select: rawArgs.select,
-        from: rawArgs.from,
-        where: rawArgs.where,
-      });
-      const compiled = compileNamed(finalSQL, { ...userBindings, channel_id: channelId });
-      finalSQL = compiled.sql;
-      values = compiled.values;
-    } else if (rawArgs.sql) {
-      // Legacy: parse "SELECT … FROM … [WHERE …]" und bau sicher neu (mit Channel-Filter)
-      const parsed = parseLegacySql(rawArgs.sql);
-      const rebuilt = buildStructuredQuery(parsed); // fügt channel_id automatisch hinzu
-      const compiled = compileNamed(rebuilt, { ...userBindings, channel_id: channelId });
-      finalSQL = compiled.sql;
-      values = compiled.values;
-    } else {
-      throw new Error("No query provided. Use structured parts {select, from, where, bindings} or legacy {sql, bindings}.");
+    if (!channelId) {
+      return JSON.stringify({ error: "HISTORY_INPUT — Missing 'channel_id'." });
     }
 
-    // ---- Console logging of the final query ----
-    console.log("[getHistory] SQL:", finalSQL);
-    console.log("[getHistory] VALUES:", previewValues(values));
+    // --- RAW MODE: preserve current behavior exactly; no AI processing; summaries remain intact ---
+    if (mode === "raw") {
+      const limit = Number(args.limit || RAW_LIMIT_DEFAULT);
+      const timeFrom = args.time_from ? String(args.time_from) : null;
+      const timeTo   = args.time_to   ? String(args.time_to)   : null;
 
-    const db = await getPool();
-    const [rows] = await db.execute(finalSQL, values);
-
-    const safe = (rows || []).map((r) => {
-      const obj = {};
-      for (const [k, v] of Object.entries(r)) {
-        obj[k] = v;
+      let rows;
+      if (timeFrom || timeTo) {
+        rows = await fetchByTime(channelId, timeFrom, timeTo, limit);
+      } else if (query) {
+        const terms = extractTerms(query);
+        const { sql, params } = buildAndLike(terms);
+        const [out] = await pool.execute(
+          `SELECT id, channel_id, created_at, author, role, type, content
+             FROM history
+            WHERE channel_id = ?
+              AND ${sql}
+         ORDER BY id ASC
+            LIMIT ?`,
+          [channelId, ...params, Number(limit)]
+        );
+        rows = out;
+      } else {
+        rows = await fetchLastN(channelId, limit);
       }
-      return obj;
-    });
 
-    return JSON.stringify({
-      rowCount: safe.length,
-      rows: safe,
-    });
+      // Return EXACT rows array — no wrapper object, no reformatting, no AI.
+      return JSON.stringify(rows);
+    }
+
+    // --- PASSTHROUGH MODE: still raw DB read, but concatenated into one big text block (no AI) ---
+    if (mode === "passthrough") {
+      const limit = Number(args.limit || RAW_LIMIT_DEFAULT);
+      const timeFrom = args.time_from ? String(args.time_from) : null;
+      const timeTo   = args.time_to   ? String(args.time_to)   : null;
+
+      let rows;
+      if (timeFrom || timeTo) {
+        rows = await fetchByTime(channelId, timeFrom, timeTo, limit);
+      } else if (query) {
+        const terms = extractTerms(query);
+        const { sql, params } = buildAndLike(terms);
+        const [out] = await pool.execute(
+          `SELECT id, channel_id, created_at, author, role, type, content
+             FROM history
+            WHERE channel_id = ?
+              AND ${sql}
+         ORDER BY id ASC
+            LIMIT ?`,
+          [channelId, ...params, Number(limit)]
+        );
+        rows = out;
+      } else {
+        rows = await fetchLastN(channelId, limit);
+      }
+
+      // Single text block for direct LLM context injection
+      const text = rowsToPassthroughText(rows);
+      return text || "";
+    }
+
+    // --- QA MODE: keyword matches + channel-safe context windows ±10; merged; answered via GPT-4.1 ---
+    if (mode === "qa") {
+      const q = query || String(args.question || "").trim();
+      if (!q) {
+        return JSON.stringify({ error: "HISTORY_QA_INPUT — Missing 'query' for QA mode." });
+      }
+
+      const terms = extractTerms(q);
+      if (!terms.length) {
+        return JSON.stringify({ error: "HISTORY_QA_INPUT — Query has no usable terms." });
+      }
+
+      // 1) Find match ids in this channel
+      const matchIds = await fetchMatchIds(channelId, terms, MATCH_LIMIT);
+      if (!matchIds.length) {
+        return JSON.stringify({ result: "Keine Treffer im Verlauf gefunden." });
+      }
+
+      // 2) For each id, fetch window ±10 in same channel
+      const windows = [];
+      for (const id of matchIds) {
+        const windowRows = await fetchContextWindow(channelId, id, CTX_BEFORE, CTX_AFTER);
+        windows.push(windowRows);
+      }
+
+      // 3) Merge, dedupe, ASC
+      const contextRows = mergeDedupSort(windows);
+
+      // 4) Build digest and ask the model
+      const digest = rowsToPassthroughText(contextRows);
+      const ctx = new Context();
+
+      await ctx.add(
+        "system",
+        "history_qa",
+        [
+          "You are given a set of chat log excerpts from a single Discord channel.",
+          "Answer the user's question ONLY based on these excerpts.",
+          "If the answer is not derivable, say so explicitly.",
+          "Be concise and quote exact wording if the user asked for quotes.",
+          "Language: respond in the user's language; prefer German if unsure.",
+        ].join(" ")
+      );
+
+      await ctx.add("user", "question", q);
+      await ctx.add("user", "context", digest);
+
+      const out = await getAI(ctx, QA_TOKENS, QA_MODEL);
+      const result = (out || "").trim() || "Keine Antwort ableitbar.";
+
+      return JSON.stringify({ result });
+    }
+
+    return JSON.stringify({ error: `HISTORY_MODE — Unknown mode: ${mode}` });
   } catch (err) {
-    console.error(err);
-    return JSON.stringify({ error: `[ERROR]: ${err?.message || String(err)}` });
+    await reportError(err, null, "HISTORY_UNHANDLED", "ERROR");
+    return JSON.stringify({ error: `HISTORY_UNHANDLED — ${err?.message || "Unexpected failure"}` });
   }
 }
 

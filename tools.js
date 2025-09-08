@@ -1,4 +1,7 @@
-// tools.js — refactored v1.8 (structured getHistory + name normalization + getPDF requires CSS + hardened prompting)
+// tools.js — refactored v1.9
+// - getWebpage: requires user_prompt, returns only { result, url }
+// - getYoutube: user_prompt-driven transcript Q&A (no chunking), returns only { result, video_url }
+// - getHistory: modes (raw | passthrough | qa); channel/order enforced in code
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -17,15 +20,17 @@ const tools = [
     type: "function",
     function: {
       name: "getWebpage",
-      description: "Fetch a webpage, remove menus/ads/scripts/HTML, and return cleaned text.",
+      description:
+        "Fetch a webpage, remove menus/ads/scripts/HTML, then EXECUTE the user_prompt against the cleaned text. " +
+        "Return only the answer and the source URL (no raw text).",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string", description: "Full URL to fetch and clean." },
           user_id: { type: "string", description: "User ID or display name." },
-          user_prompt: { type: "string", description: "Original natural-language user request." }
+          user_prompt: { type: "string", description: "Original natural-language user request to run against the page text." }
         },
-        required: ["url", "user_id"]
+        required: ["url", "user_id", "user_prompt"]
       }
     }
   },
@@ -33,7 +38,8 @@ const tools = [
     type: "function",
     function: {
       name: "getImage",
-      description: "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
+      description:
+        "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
       parameters: {
         type: "object",
         properties: {
@@ -68,13 +74,15 @@ const tools = [
     type: "function",
     function: {
       name: "getYoutube",
-      description: "Parse YouTube subtitles, summarize, and return timestamped blocks. Applies the user prompt per block.",
+      description:
+        "Parse YouTube subtitles (CC), EXECUTE the user_prompt directly against the full transcript (no chunking), " +
+        "and return only the answer and the video URL. Useful for summaries, quote search, scene extraction, etc.",
       parameters: {
         type: "object",
         properties: {
           video_url: { type: "string", description: "YouTube video URL." },
           user_id: { type: "string", description: "User ID or display name." },
-          user_prompt: { type: "string", description: "Original natural-language user request." }
+          user_prompt: { type: "string", description: "Original natural-language user request (e.g., summarize, extract quotes, find a scene)." }
         },
         required: ["video_url", "user_id", "user_prompt"]
       }
@@ -99,7 +107,8 @@ const tools = [
     type: "function",
     function: {
       name: "getLocation",
-      description: "Handle location tasks: route between locations or place pins without a route. Returns map URL, street-view URL, and text description. Always show both links in the answer.",
+      description:
+        "Handle location tasks: route between locations or place pins without a route. Returns map URL, street-view URL, and text description. Always show both links in the answer.",
       parameters: {
         type: "object",
         properties: {
@@ -116,78 +125,53 @@ const tools = [
     }
   },
 
-  // ==== getHistory expects structured parts instead of full SQL ====
+  // ==== getHistory: modes (raw | passthrough | qa); channel filter & ORDER BY enforced in code ====
   {
     type: "function",
     function: {
       name: "getHistory",
       description:
-        "Query the channel’s history (read-only). Provide mariadb-compatible SQL *parts* only and NOT a full query. " +
-        "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
-        "Allowed columns in summaries: timestamp, summary " +
-        "Allowed columns in context_log: timestamp, role, sender, content " +
-        "Required columns: timestamp always has to be included. " +
-        "The channel filter and ORDER BY timestamp are auto-injected. " +
-        "Try to restrict the results as less as possible (all messages from a timeframe are better than missing something because of too restrictive WHERE clauses), noise is ok as the result is filtered by AI . Use search parameters that bring as much results as possible for a topic. Take care of different spellings, synonyms or even languages.",
+        "Query the channel’s history with one of three modes: " +
+        "`raw` returns exact DB rows (no AI; preserves summaries 1:1); " +
+        "`passthrough` returns a single concatenated text block (no AI; for direct context dump); " +
+        "`qa` performs keyword matching plus channel-safe context windows (±10 around each match, same channel), " +
+        "deduplicates, and returns an AI-crafted answer. " +
+        "Channel scoping and ORDER BY are always injected by the runtime; the model must NOT build full SQL.",
       parameters: {
         type: "object",
         properties: {
-          select: {
+          mode: {
+            type: "string",
+            enum: ["raw", "passthrough", "qa"],
+            description: "raw = exact rows; passthrough = single text block; qa = KI-gestützte Antwort"
+          },
+          channel_id: { type: "string", description: "Target channel identifier. Required." },
+          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." },
+
+          // Common filters for raw/passthrough (optional)
+          limit: { type: "number", description: "Optional max rows for raw/passthrough modes (default enforced server-side)." },
+          time_from: { type: "string", description: "Optional ISO timestamp lower bound (raw/passthrough)." },
+          time_to: { type: "string", description: "Optional ISO timestamp upper bound (raw/passthrough)." },
+          query: {
             type: "string",
             description:
-              "Columns/expressions to select, e.g. `timestamp, role, sender, content` or `COUNT(*) AS cnt`. Use a mariadb-compatible format " +
-              "Allowed table: `context_log` or `summaries` (optionally with alias like `context_log cl`). " +
-              "Allowed columns in summaries: timestamp, summary " +
-              "Allowed columns in context_log: timestamp, role, sender, content " +
-              "Required columns: timestamp always has to be included."
-          },
-          from: {
-            description:
-              "One allowed table (optionally with alias). Use only `context_log` or `summaries`. Example: `context_log` or `summaries s`.",
-            oneOf: [
-              {
-                type: "string",
-                enum: ["context_log", "summaries", "context_log cl", "summaries s"]
-              },
-              {
-                type: "array",
-                items: {
-                  type: "string",
-                  enum: ["context_log", "summaries"]
-                },
-                minItems: 1,
-                maxItems: 1
-              }
-            ]
-          },
-          where: {
-            type: "string",
-            description:
-              "Optional WHERE predicates (without channel filter, ORDER BY, or LIMIT). Use mariadb-compatible syntax. " +
-              "Always just search for nouns, never for verbs or adjectives. " +
-              "Examples: `timestamp >= :sinceTs AND role = 'user'`."
-          },
-          bindings: {
-            type: "object",
-            description:
-              "Named parameters referenced in `where` (e.g. `{ \"sinceTs\": 1716400000000 }`).",
-            additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }] }
+              "Optional keyword string. In qa it is REQUIRED and used to locate matches; " +
+              "in raw/passthrough it broadens filtering (in addition to time/limit)."
           }
         },
-        required: ["select", "from"],
-        additionalProperties: false
+        required: ["mode", "channel_id"]
       }
     }
   },
 
-  // ==== getPDF now REQUIRES a CSS stylesheet; hardened call contract ====
+  // ==== getPDF (unverändert; CSS optional laut aktuellem Contract) ====
   {
     type: "function",
     function: {
       name: "getPDF",
       description:
         "Render a PDF from provided HTML and CSS. " +
-        "The CSS defines the design of the PDF. If you do not provide CSS a default style is used." +
+        "The CSS defines the design of the PDF. If you do not provide CSS a default style is used. " +
         "Ensure that everything is correctly escaped for JSON",
       parameters: {
         type: "object",
@@ -198,7 +182,7 @@ const tools = [
           },
           css: {
             type: "string",
-            description: "Required stylesheet."
+            description: "Optional stylesheet (a default will be used if omitted)."
           },
           filename: {
             type: "string",
