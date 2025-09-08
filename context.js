@@ -1,14 +1,11 @@
-// context.js — v6.3 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1)
+// context.js — v6.5 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1)
 // - Persistenter Verlauf in MySQL
 // - Inkrementelle Summaries (Fenster über last_context_id → MAX(id))
 // - KEIN Chunking: komplettes Fenster wird 1:1 in den Kontext gegeben
 // - summaryPrompt wird direkt auf das Fenster angewandt (Final-Pass only)
 // - Redo: löscht jüngste Summary und fasst exakt dasselbe Fenster erneut zusammen
 // - replaceLastSummaryWithLastLog: ersetzt nur den Summary-Text, behält last_context_id/timestamp
-// - NEU: Beim Summarize werden vorhandene Summaries (assistant/name=summary) ignoriert
-//
-// Hinweis: Nur Änderung #2 umgesetzt (Summaries beim Summarize ignorieren).
-// RAM-Handling & DB-Schema bleiben unverändert (keine zusätzliche Persistenz der Summary im context_log).
+// - NEU: Beim Summarize werden Meta-Summaries und Summary-Anzeige-Interaktionen (User & Assistant) ignoriert
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -48,7 +45,7 @@ async function ensureTables(pool) {
         summary MEDIUMTEXT NOT NULL,
         last_context_id INT NULL,
         INDEX idx_sum_ch_id (channel_id, id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; 
     `);
     // für ältere DBs
     await c.query(`ALTER TABLE summaries ADD COLUMN IF NOT EXISTS last_context_id INT NULL;`).catch(() => {});
@@ -141,6 +138,47 @@ function sanitizeName(input, fallback = "user") {
     .replace(/\s+/g, "_")
     .replace(/[^a-z0-9_]/gi, "")
     .slice(0, 64) || fallback;
+}
+
+/* ----------------------------- Summary display filters ----------------------------- */
+
+function _lc(s) {
+  return String(s || "").normalize("NFKC").toLowerCase();
+}
+
+/** Heuristik: User bittet um Anzeige einer Summary / triggert Summarize. */
+function isSummaryDisplayRequest(text) {
+  const s = _lc(text);
+  const triggers = [
+    "!summarize", "/summarize",
+    "zeige mir die letzte summary", "zeig mir die letzte summary",
+    "zeige mir die summary", "zeig mir die summary",
+    "zeige zusammenfassung", "zeig zusammenfassung",
+    "zeige die zusammenfassung", "zeig die zusammenfassung",
+    "zeige summaries", "zeig summaries",
+    "show last summary", "show the last summary", "show summary",
+    "post summary", "post summaries", "print summary", "summary please"
+  ];
+  if (triggers.some(t => s.includes(t))) return true;
+
+  const re = /(zeige|zeig|gib|display|show|post|drucke|print)\s+(mir\s+)?(die\s+)?(letzte[nr]?|neueste[nr]?)?\s*(zusammenfassung|summary)\b/i;
+  return re.test(text);
+}
+
+/** Heuristik: Assistant hat Summaries im Chat „angezeigt“ (Header/Prefix). */
+function isSummaryDisplayOutput(text) {
+  const str = String(text || "");
+  const firstLine = (str.split("\n")[0] || "").trim();
+
+  // Matches: "**Summary 1/3**", "Summary 1/3", "**Zusammenfassung**", "Zusammenfassung 2/2", etc.
+  const headerRe = /^\s*(\*\*|__)?\s*(summary|zusammenfassung)\s*(\d+\s*\/\s*\d+)?\s*(\*\*|__)?\s*$/i;
+  if (headerRe.test(firstLine)) return true;
+
+  // Also treat messages that start with "Summary" / "Zusammenfassung" as display headers.
+  const startRe = /^\s*(\*\*|__)?\s*(summary|zusammenfassung)\b/i;
+  if (startRe.test(str)) return true;
+
+  return false;
 }
 
 /* ----------------------------- Context class ----------------------------- */
@@ -294,7 +332,7 @@ class Context {
    * - startId = last_summary.last_context_id (or 0)
    * - endId   = MAX(context_log.id) at execution time (or explicit upperMaxContextId)
    * Applies the channel summaryPrompt directly over the full window.
-   * NEU: Summary-Zeilen (assistant/name=summary) werden vorab gefiltert und im Prompt strikt ignoriert.
+   * Ignoriert Meta-Summaries und Summary-Anzeige-Interaktionen.
    */
   async summarizeSince(cutoffMs, customPrompt = null, upperMaxContextId = null) {
     if (!this.persistent || this.isSummarizing) {
@@ -313,11 +351,13 @@ Preserve chronology and exact names/terms. Avoid filler and speculation.
 Output a clear, well-structured summary (bullets/sections allowed).
 `.trim();
 
-    // Fester Zusatz zum Ignorieren vorhandener Summaries
-    const IGNORE_SUMMARIES_RULE = [
-      "[STRICT RULE] Ignore any messages that are themselves summaries of earlier runs.",
-      'If a log line corresponds to ASSISTANT with sender/name "summary", do NOT use its content in the new summary.',
-      "Only base the new summary on actual user/assistant/tool interactions, not prior meta-summaries."
+    // Strikte Zusatz-Regel zum Ignorieren
+    const IGNORE_RULE = [
+      "[STRICT RULE] Ignore any messages that are themselves summaries or that merely display/print summaries.",
+      'Do NOT use content from assistant messages with name/sender "summary".',
+      "Do NOT use content from assistant messages that look like summary display headers (e.g., '**Summary 1/3**', 'Zusammenfassung …').",
+      "Do NOT use content from user commands that ask to show/print/post a summary (e.g., '!summarize', 'zeige mir die letzte summary').",
+      "Base the new summary ONLY on actual user/assistant/tool interactions, not prior meta-summaries or their display output."
     ].join(" ");
 
     try {
@@ -376,12 +416,21 @@ Output a clear, well-structured summary (bullets/sections allowed).
         return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: startId };
       }
 
-      // **NEU**: Summary-Zeilen defensiv entfernen (falls historisch in context_log vorhanden)
+      // Filter: Meta-Summaries + Anzeige-Interaktionen entfernen
       const filtered = rows.filter((r) => {
         const role = String(r.role || "").toLowerCase();
         const sender = String(r.sender || "").toLowerCase();
-        return !(role === "assistant" && sender === "summary");
+        const content = String(r.content || "");
+        if (role === "assistant" && sender === "summary") return false;                 // Meta-Summary
+        if (role === "user" && isSummaryDisplayRequest(content)) return false;          // User: Anzeige-Request
+        if (role === "assistant" && isSummaryDisplayOutput(content)) return false;      // Assistant: Anzeige-Header/Text
+        return true;
       });
+
+      if (!filtered.length) {
+        console.log(`[SUMMARY][${this.channelId}] nothing to summarize after filters.`);
+        return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: endId };
+      }
 
       // Roh-Lines aufbauen (mit IDs für Nachvollziehbarkeit) – nur gefilterte
       const makeLine = (r) => `[#${r.id}] ${String(r.role || "").toUpperCase()}(${r.sender}): ${r.content}`;
@@ -392,8 +441,8 @@ Output a clear, well-structured summary (bullets/sections allowed).
         (this.summaryPrompt && this.summaryPrompt.trim()) ||
         DEFAULT_FINAL_PROMPT;
 
-      // Final-Prompt = Basis + fester Zusatz
-      const finalPrompt = `${basePrompt}\n\n${IGNORE_SUMMARIES_RULE}`.trim();
+      // Final-Prompt = Basis + strikte Ignore-Regel
+      const finalPrompt = `${basePrompt}\n\n${IGNORE_RULE}`.trim();
 
       // Final-Pass: summaryPrompt direkt auf das komplette Fenster
       const finalCtx = new Context(
