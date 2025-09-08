@@ -1,10 +1,14 @@
-// context.js — v6.2 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1)
+// context.js — v6.3 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1)
 // - Persistenter Verlauf in MySQL
 // - Inkrementelle Summaries (Fenster über last_context_id → MAX(id))
 // - KEIN Chunking: komplettes Fenster wird 1:1 in den Kontext gegeben
 // - summaryPrompt wird direkt auf das Fenster angewandt (Final-Pass only)
 // - Redo: löscht jüngste Summary und fasst exakt dasselbe Fenster erneut zusammen
 // - replaceLastSummaryWithLastLog: ersetzt nur den Summary-Text, behält last_context_id/timestamp
+// - NEU: Beim Summarize werden vorhandene Summaries (assistant/name=summary) ignoriert
+//
+// Hinweis: Nur Änderung #2 umgesetzt (Summaries beim Summarize ignorieren).
+// RAM-Handling & DB-Schema bleiben unverändert (keine zusätzliche Persistenz der Summary im context_log).
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -290,6 +294,7 @@ class Context {
    * - startId = last_summary.last_context_id (or 0)
    * - endId   = MAX(context_log.id) at execution time (or explicit upperMaxContextId)
    * Applies the channel summaryPrompt directly over the full window.
+   * NEU: Summary-Zeilen (assistant/name=summary) werden vorab gefiltert und im Prompt strikt ignoriert.
    */
   async summarizeSince(cutoffMs, customPrompt = null, upperMaxContextId = null) {
     if (!this.persistent || this.isSummarizing) {
@@ -307,6 +312,13 @@ Keep factual details, decisions, tasks (owner & deadline), questions, numbers, U
 Preserve chronology and exact names/terms. Avoid filler and speculation.
 Output a clear, well-structured summary (bullets/sections allowed).
 `.trim();
+
+    // Fester Zusatz zum Ignorieren vorhandener Summaries
+    const IGNORE_SUMMARIES_RULE = [
+      "[STRICT RULE] Ignore any messages that are themselves summaries of earlier runs.",
+      'If a log line corresponds to ASSISTANT with sender/name "summary", do NOT use its content in the new summary.',
+      "Only base the new summary on actual user/assistant/tool interactions, not prior meta-summaries."
+    ].join(" ");
 
     try {
       const db = await getPool();
@@ -364,14 +376,24 @@ Output a clear, well-structured summary (bullets/sections allowed).
         return { messages: this.messages, lastSummary: null, insertedSummaryId: null, usedMaxContextId: startId };
       }
 
-      // Roh-Lines aufbauen (mit IDs für Nachvollziehbarkeit)
-      const makeLine = (r) => `[#${r.id}] ${r.role.toUpperCase()}(${r.sender}): ${r.content}`;
-      const allJoined = rows.map(makeLine).join("\n");
+      // **NEU**: Summary-Zeilen defensiv entfernen (falls historisch in context_log vorhanden)
+      const filtered = rows.filter((r) => {
+        const role = String(r.role || "").toLowerCase();
+        const sender = String(r.sender || "").toLowerCase();
+        return !(role === "assistant" && sender === "summary");
+      });
 
-      const finalPrompt =
+      // Roh-Lines aufbauen (mit IDs für Nachvollziehbarkeit) – nur gefilterte
+      const makeLine = (r) => `[#${r.id}] ${String(r.role || "").toUpperCase()}(${r.sender}): ${r.content}`;
+      const allJoined = filtered.map(makeLine).join("\n");
+
+      const basePrompt =
         (customPrompt && customPrompt.trim()) ||
         (this.summaryPrompt && this.summaryPrompt.trim()) ||
         DEFAULT_FINAL_PROMPT;
+
+      // Final-Prompt = Basis + fester Zusatz
+      const finalPrompt = `${basePrompt}\n\n${IGNORE_SUMMARIES_RULE}`.trim();
 
       // Final-Pass: summaryPrompt direkt auf das komplette Fenster
       const finalCtx = new Context(
