@@ -1,8 +1,9 @@
-// tools.js — refactored v2.0
+// tools.js — refactored v2.1
 // - getWebpage: requires user_prompt, returns only { result, url }
 // - getYoutube: user_prompt-driven transcript Q&A (no chunking), returns only { result, video_url }
 // - getHistory: modes (raw | passthrough | qa); channel/order enforced in code
-// - NEW: getSummaries — fetch last N summaries from 'summaries' table only (raw | passthrough)
+//   NEW: In qa-mode, `query` ist der Original-Prompt. Standard: letzte N Rows (rows_limit) → KI-Antwort/Summary.
+//         Optional: `match: true` schaltet auf Keyword-Fenster (altes Verhalten).
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -11,7 +12,7 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { getHistory, getSummaries } = require("./history.js");
+const { getHistory } = require("./history.js");
 const { reportError } = require("./error.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
@@ -133,32 +134,42 @@ const tools = [
       name: "getHistory",
       description:
         "Query the channel’s history with one of three modes: " +
-        "`raw` returns exact DB rows (no AI; preserves summaries 1:1 if selected from 'summaries'); " +
+        "`raw` returns exact DB rows (no AI); " +
         "`passthrough` returns a single concatenated text block (no AI; for direct context dump); " +
-        "`qa` performs keyword matching plus channel-safe context windows (±10 around each match, same channel), " +
-        "deduplicates, and returns an AI-crafted answer. " +
-        "When the user asks to SHOW a summary, do NOT use getHistory — use getSummaries instead. " +
-        "Channel scoping and ORDER BY are always injected by the runtime; the model must NOT build full SQL.",
+        "`qa` uses the provided `query` as the ORIGINAL user prompt (question/summary/analysis). " +
+        "In qa-mode, by default the tool takes the **last N rows** (rows_limit, default 250) from this channel " +
+        "and asks the model to answer or summarize **strictly based on those rows**. " +
+        "If you set `match: true`, it will instead do keyword matching on context_log and build ±10 windows around matches (legacy behavior). " +
+        "Channel scoping and ORDER BY are enforced by the runtime; the model must NOT build full SQL.",
       parameters: {
         type: "object",
         properties: {
           mode: {
             type: "string",
             enum: ["raw", "passthrough", "qa"],
-            description: "raw = exact rows; passthrough = single text block; qa = KI-gestützte Antwort"
+            description: "raw = exact rows; passthrough = single text block; qa = KI-gestützte Antwort/Summary auf Basis des Verlaufs"
           },
           channel_id: { type: "string", description: "Target channel identifier. Required." },
           user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." },
 
           // Common filters for raw/passthrough (optional)
           limit: { type: "number", description: "Optional max rows for raw/passthrough modes (default enforced server-side)." },
-          time_from: { type: "string", description: "Optional ISO timestamp lower bound (raw/passthrough)." },
-          time_to: { type: "string", description: "Optional ISO timestamp upper bound (raw/passthrough)." },
+          time_from: { type: "string", description: "Optional ISO timestamp lower bound (raw/passthrough/qa-last-rows)." },
+          time_to: { type: "string", description: "Optional ISO timestamp upper bound (raw/passthrough/qa-last-rows)." },
           query: {
             type: "string",
             description:
-              "Optional keyword string. In qa it is REQUIRED and used to locate matches; " +
-              "in raw/passthrough it broadens filtering (in addition to time/limit)."
+              "In qa: the ORIGINAL user prompt (question/summary task). In raw/passthrough: optional keyword filter."
+          },
+          match: {
+            type: "boolean",
+            description:
+              "qa-mode only: true = use keyword matching + context windows; false (default) = take last rows."
+          },
+          rows_limit: {
+            type: "number",
+            description:
+              "qa-mode (last-rows): how many most recent rows to build the digest from (default 250, max 1000)."
           }
         },
         required: ["mode", "channel_id"]
@@ -166,33 +177,7 @@ const tools = [
     }
   },
 
-  // ==== NEW: getSummaries (only 'summaries' table) ====
-  {
-    type: "function",
-    function: {
-      name: "getSummaries",
-      description:
-        "Fetch the latest channel summaries from the dedicated 'summaries' table. " +
-        "Use this when the user asks to show or print summaries (e.g., '!summarize', 'zeige mir die letzte summary'). " +
-        "Returns either raw rows (id, timestamp, summary) or a single concatenated text block.",
-      parameters: {
-        type: "object",
-        properties: {
-          channel_id: { type: "string", description: "Target channel identifier. Required." },
-          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." },
-          limit: { type: "number", description: "How many latest summaries to fetch. Default 1. Max 20." },
-          mode: {
-            type: "string",
-            enum: ["raw", "passthrough"],
-            description: "raw = rows as JSON; passthrough = one text block (default)."
-          }
-        },
-        required: ["channel_id"]
-      }
-    }
-  },
-
-  // ==== getPDF (unverändert; CSS optional laut aktuellem Contract) ====
+  // ==== getPDF (unverändert) ====
   {
     type: "function",
     function: {
@@ -241,8 +226,7 @@ const fullToolRegistry = {
   getImageDescription,
   getLocation,
   getPDF,
-  getHistory,
-  getSummaries
+  getHistory
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
@@ -251,9 +235,8 @@ function normalizeToolName(name) {
   const raw = String(name).trim();
   if (!raw) return "";
 
-  // Quick aliases
+  // Quick alias
   if (raw.toLowerCase() === "gethistory") return "getHistory";
-  if (raw.toLowerCase() === "getsummaries" || raw.toLowerCase() === "getsummary") return "getSummaries";
 
   // Case-insensitive match to known keys
   const keys = Object.keys(fullToolRegistry);

@@ -1,21 +1,11 @@
-// history.js — v3.0 (modes: raw | passthrough | qa)
-// READ-ONLY MySQL SELECT over channel history (context_log, summaries).
-// - raw:         identisch zum bisherigen Verhalten (structured parts oder legacy SQL),
-//                gibt { rowCount, rows } zurück, KEINE KI, Summaries bleiben 1:1 erhalten.
-// - passthrough: holt Datensätze wie raw, gibt aber EINEN Textblock zurück (ideal zum direkten Kontext-Dump).
-// - qa:          Keyword-Matches in context_log + kanalsicheres Kontextfenster (±10 via timestamp),
-//                dedupliziert + per GPT-4.1 beantwortet; Rückgabe: { result }.
+// history.js — v3.2 (modes: raw | passthrough | qa with last-rows default)
+// READ-ONLY MySQL SELECT over channel history (context_log[, summaries optional in raw/passthrough via from])
+// - raw:         structured/legacy SELECT → { rowCount, rows } (no AI)
+// - passthrough: wie raw, aber EIN Textblock (no AI)
+// - qa:          NEU: Standard = letzte N Rows (rows_limit, default 250) → Digest → GPT-4.1 mit ORIGINAL-PROMPT (query)
+//                Optional: match=true → Keyword-Matches + Kontextfenster (±10) wie bisher
 //
-// Sicherheiten:
-// - Structured mode: { select, from, where, bindings } -> finalen SQL sicher bauen.
-// - Legacy mode: args.sql -> "SELECT … FROM … [WHERE …]" parsen und sicher neu bauen.
-// - channel_id wird AUTOMATISCH aus ctx.channelId (oder runtime.channel_id oder args.channel_id) ermittelt
-//   und immer als zusätzlicher Filter injiziert (Order by timestamp wird erzwungen).
-// - LIMIT wird eingefügt, falls nicht vorhanden.
-// - Konsolen-Logs des finalen SELECT (mit '?') + Werte (gecapped).
-//
-// Erfordert: mysql2/promise (DB via ENV: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME)
-// Optional (nur für qa): ./aiService.js (getAI) und ./context.js (Context)
+// Erfordert: mysql2/promise, aiService.getAI, Context
 
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
@@ -63,7 +53,6 @@ function compileNamed(sql, bindings) {
   const values = [];
   const cleaned = stripTrailingSemicolons(sql);
 
-  // Only replace tokens like :from, :to, :channel_id — NOT :00, NOT :1, NOT ://
   const out = cleaned.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_, name) => {
     if (!(name in bindings)) {
       throw new Error(`Missing binding for :${name}`);
@@ -163,10 +152,6 @@ function buildStructuredQuery(parts) {
 
 /* ----------------------------- Legacy SQL parsing ----------------------------- */
 
-/**
- * Parse a simple SELECT … FROM … [WHERE …] (ignores trailing ORDER BY / LIMIT).
- * Returns { select, from, where } or throws.
- */
 function parseLegacySql(sqlIn) {
   const s = stripTrailingSemicolons(String(sqlIn || ""));
   const re =
@@ -176,16 +161,14 @@ function parseLegacySql(sqlIn) {
   const rawSelect = m[1];
   const rawFrom = m[2];
   const rawWhere = m[3] || "";
-  // sanitize using the same functions as structured mode
   const select = sanitizeSelect(rawSelect);
   const from = sanitizeFrom(rawFrom);
   const where = sanitizeWhere(rawWhere);
   return { select, from, where };
 }
 
-/* ----------------------------- Query helpers for modes ----------------------------- */
+/* ----------------------------- Query helpers ----------------------------- */
 
-/** Extract channelId with graceful fallback (ctx -> runtime -> args). */
 function resolveChannelId(ctxOrUndefined, runtime, args) {
   return (
     (ctxOrUndefined && ctxOrUndefined.channelId && String(ctxOrUndefined.channelId).trim()) ||
@@ -195,7 +178,6 @@ function resolveChannelId(ctxOrUndefined, runtime, args) {
   );
 }
 
-/** Turns rows into a single text block for direct LLM context. */
 function rowsToPassthroughText(rows) {
   return (rows || [])
     .map((r) => {
@@ -218,11 +200,9 @@ function extractTerms(q) {
     const term = (m[1] || m[2] || "").trim();
     if (term) terms.push(term);
   }
-  // lowercased unique terms, min length 2
   return [...new Set(terms.map((t) => t.toLowerCase()))].filter((t) => t.length >= 2);
 }
 
-/** AND-like clause for content LIKEs. */
 function buildAndLike(terms) {
   if (!terms?.length) return { clause: "1=1", params: [] };
   const clause = terms.map(() => "content LIKE ?").join(" AND ");
@@ -230,7 +210,6 @@ function buildAndLike(terms) {
   return { clause, params };
 }
 
-/** Fetch match timestamps (context_log) within channel by AND terms */
 async function fetchMatchTimestamps(db, channelId, terms, limit = 30) {
   const { clause, params } = buildAndLike(terms);
   const [rows] = await db.execute(
@@ -245,9 +224,7 @@ async function fetchMatchTimestamps(db, channelId, terms, limit = 30) {
   return (rows || []).map((r) => r.timestamp);
 }
 
-/** Fetch a context window (±before/after by timestamp) within same channel. */
 async function fetchContextWindowByTimestamp(db, channelId, matchTs, before = 10, after = 10) {
-  // 10 vorherige im selben Kanal (rückwärts)
   const [prev] = await db.execute(
     `SELECT timestamp, role, sender, content
        FROM context_log
@@ -257,7 +234,6 @@ async function fetchContextWindowByTimestamp(db, channelId, matchTs, before = 10
       LIMIT ?`,
     [channelId, matchTs, Number(before)]
   );
-  // die Match-Zeile selbst
   const [center] = await db.execute(
     `SELECT timestamp, role, sender, content
        FROM context_log
@@ -267,7 +243,6 @@ async function fetchContextWindowByTimestamp(db, channelId, matchTs, before = 10
       LIMIT 1`,
     [channelId, matchTs]
   );
-  // 10 nachfolgende im selben Kanal (vorwärts)
   const [next] = await db.execute(
     `SELECT timestamp, role, sender, content
        FROM context_log
@@ -282,23 +257,27 @@ async function fetchContextWindowByTimestamp(db, channelId, matchTs, before = 10
   return [...prevAsc, ...center, ...next];
 }
 
-/** Merge windows (by timestamp+sender+role+content string key), return ASC by timestamp. */
-function mergeDedupSortWindows(windows) {
-  const seen = new Set();
-  const all = [];
-  for (const win of windows) {
-    for (const r of win) {
-      const key = `${r.timestamp}::${r.sender ?? ""}::${r.role ?? ""}::${r.content ?? ""}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        all.push(r);
-      }
-    }
-  }
-  return all.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+/** NEW: fetch last N rows (optionally bounded by time range) ASC by timestamp. */
+async function fetchLastRows(db, channelId, rowsLimit = 250, timeFromISO = null, timeToISO = null) {
+  const limit = Math.max(1, Math.min(1000, Number(rowsLimit) || 250));
+  const conds = ["channel_id = ?"];
+  const params = [channelId];
+
+  if (timeFromISO) { conds.push("timestamp >= ?"); params.push(timeFromISO); }
+  if (timeToISO)   { conds.push("timestamp <= ?"); params.push(timeToISO); }
+
+  // Pull DESC for efficiency then reverse to ASC
+  const sql = `
+    SELECT timestamp, role, sender, content
+      FROM context_log
+     WHERE ${conds.join(" AND ")}
+  ORDER BY id DESC
+     LIMIT ?`;
+  const [rowsDesc] = await db.execute(sql, [...params, limit]);
+  return (rowsDesc || []).slice().reverse();
 }
 
-/* ----------------------------- Tool entry ----------------------------- */
+/* ----------------------------- Tool: getHistory ----------------------------- */
 
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   console.log("GET HISTORY ENTERED");
@@ -312,43 +291,48 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     const channelId = resolveChannelId(ctxOrUndefined, runtime, rawArgs);
     if (!channelId) throw new Error("channel_id missing (context/runtime/args)");
 
-    // ---------- MODE: QA ----------
+    // ---------- MODE: QA (DEFAULT = letzte N Rows → Digest → GPT) ----------
     if (mode === "qa") {
-      const question = String(rawArgs.query || rawArgs.question || "").trim();
-      if (!question) {
-        return JSON.stringify({ error: "HISTORY_QA_INPUT — Missing 'query' for QA mode." });
+      const userPrompt = String(rawArgs.query || rawArgs.question || "").trim();
+      if (!userPrompt) {
+        return JSON.stringify({ error: "HISTORY_QA_INPUT — Missing 'query' (original prompt) for QA mode." });
       }
 
-      const terms = extractTerms(question);
-      if (!terms.length) {
-        return JSON.stringify({ result: "Keine nutzbaren Suchbegriffe vorhanden." });
-      }
-
+      const matchMode = rawArgs.match === true;
       const db = await getPool();
 
-      // 1) Treffer nach AND-Keywords (nur context_log), limitierbar
-      const MATCH_LIMIT = Number(rawArgs.match_limit || 30);
-      const matchTimestamps = await fetchMatchTimestamps(db, channelId, terms, MATCH_LIMIT);
-      if (!matchTimestamps.length) {
-        return JSON.stringify({ result: "Keine Treffer im Verlauf gefunden." });
+      let digestRows = [];
+
+      if (matchMode) {
+        // Legacy keyword matching + windows
+        const terms = extractTerms(userPrompt);
+        if (!terms.length) {
+          return JSON.stringify({ result: "Keine nutzbaren Suchbegriffe vorhanden." });
+        }
+        const MATCH_LIMIT = Number(rawArgs.match_limit || 30);
+        const matchTimestamps = await fetchMatchTimestamps(db, channelId, terms, MATCH_LIMIT);
+        if (!matchTimestamps.length) {
+          return JSON.stringify({ result: "Keine Treffer im Verlauf gefunden." });
+        }
+        const before = Number(rawArgs.before || 10);
+        const after = Number(rawArgs.after || 10);
+
+        const windows = [];
+        for (const ts of matchTimestamps) {
+          // eslint-disable-next-line no-await-in-loop
+          const win = await fetchContextWindowByTimestamp(db, channelId, ts, before, after);
+          windows.push(win);
+        }
+        digestRows = mergeDedupSortWindows(windows);
+      } else {
+        // NEW default: last N rows
+        const rowsLimit = Math.max(1, Math.min(1000, Number(rawArgs.rows_limit || 250)));
+        const timeFrom = rawArgs.time_from ? String(rawArgs.time_from) : null;
+        const timeTo   = rawArgs.time_to ? String(rawArgs.time_to) : null;
+        digestRows = await fetchLastRows(db, channelId, rowsLimit, timeFrom, timeTo);
       }
 
-      // 2) Für jeden Treffer Window ±10 im selben Kanal (via timestamp)
-      const before = Number(rawArgs.before || 10);
-      const after = Number(rawArgs.after || 10);
-
-      const windows = [];
-      for (const ts of matchTimestamps) {
-        // eslint-disable-next-line no-await-in-loop
-        const win = await fetchContextWindowByTimestamp(db, channelId, ts, before, after);
-        windows.push(win);
-      }
-
-      // 3) Mergen + deduplizieren + chronologisch sortieren
-      const contextRows = mergeDedupSortWindows(windows);
-
-      // 4) Digest bauen und GPT-4.1 fragen
-      const digest = rowsToPassthroughText(contextRows);
+      const digest = rowsToPassthroughText(digestRows);
       const ctx = new Context();
 
       await ctx.add(
@@ -356,17 +340,17 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
         "history_qa",
         [
           "You are given chat log excerpts from a single Discord channel.",
-          "Answer the user's question ONLY based on these excerpts.",
+          "Answer the user's prompt STRICTLY based on these excerpts.",
+          "If asked to summarize, produce a precise, well-structured summary with decisions, tasks (owner & deadline), open questions, numbers/URLs/IDs/code refs/errors; preserve chronology and exact names/terms.",
           "If the answer is not derivable, say so explicitly.",
-          "Be concise and quote exact wording if the user asked for quotes.",
           "Language: respond in the user's language; prefer German if unsure.",
         ].join(" ")
       );
-      await ctx.add("user", "question", question);
-      await ctx.add("user", "context", digest);
+      await ctx.add("user", "prompt", userPrompt);
+      await ctx.add("user", "context", digest || "(no rows)");
 
       const QA_MODEL = "gpt-4.1";
-      const QA_TOKENS = 1200;
+      const QA_TOKENS = 1800;
       const out = await getAI(ctx, QA_TOKENS, QA_MODEL);
       const result = (out || "").trim() || "Keine Antwort ableitbar.";
 
@@ -375,7 +359,6 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     // ---------- MODE: PASSTHROUGH ----------
     if (mode === "passthrough") {
-      // Wie raw, aber Ausgabe als EIN Textblock (ohne KI).
       const { sql, values } = buildFinalSqlFromArgs(rawArgs, channelId);
       console.log("[getHistory][passthrough] SQL:", sql);
       console.log("[getHistory][passthrough] VALUES:", previewValues(values));
@@ -415,9 +398,8 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
   }
 }
 
-/* ----------------------------- SQL builder (reused by raw/passthrough) ----------------------------- */
+/* ----------------------------- SQL builder (raw/passthrough) ----------------------------- */
 
-/** Baut den finalen SQL + values basierend auf structured parts oder legacy sql. */
 function buildFinalSqlFromArgs(rawArgs, channelId) {
   const isStructured = rawArgs.select || rawArgs.from || rawArgs.where;
   const userBindings = rawArgs.bindings && typeof rawArgs.bindings === "object" ? rawArgs.bindings : {};
@@ -436,12 +418,12 @@ function buildFinalSqlFromArgs(rawArgs, channelId) {
 
   if (rawArgs.sql) {
     const parsed = parseLegacySql(rawArgs.sql);
-    const rebuilt = buildStructuredQuery(parsed); // fügt channel_id + ORDER BY automatisch hinzu
+    const rebuilt = buildStructuredQuery(parsed);
     const compiled = compileNamed(rebuilt, { ...userBindings, channel_id: channelId });
     return { sql: compiled.sql, values: compiled.values };
   }
 
-  // Fallback: letzter Verlauf aus context_log in diesem Channel (kompatibel, sinnvoll für passthrough)
+  // Fallback: letzter Verlauf aus context_log in diesem Channel
   const fallbackSql = ensureOrderByTimestamp(
     "SELECT timestamp, role, sender, content FROM context_log WHERE (`channel_id` = :channel_id)"
   );

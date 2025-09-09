@@ -1,7 +1,9 @@
-// bot.js — refactored v3.12 → v3.13
-// Neuerungen:
-// - 100% Inaktivität in Channels ohne Config (früher Return; keine Webhooks/Replies/Commands/Join).
-// - Endpoint-Support pro Block/global (wird an aiCore.getAIResponse übergeben).
+// bot.js — refactored v3.14
+// Änderungen:
+// - 100% Inaktivität in Channels ohne Config (früher Return).
+// - Endpoint-Support pro Block/global (aiCore.getAIResponse).
+// - Entfernt: !summarize / !summarize-redo / !summarize-remove / !summarize-replace.
+// - Entfernt: Cron-Integration (initCron, reloadCronForChannel) und jegliche summaryPrompt-Nutzung.
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -12,7 +14,8 @@ const crypto = require("crypto");
 const { getAIResponse } = require("./aiCore.js");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
-const { initCron, reloadCronForChannel } = require("./scheduler.js");
+// ⛔ Cron entfernt
+// const { initCron, reloadCronForChannel } = require("./scheduler.js");
 const Context = require("./context.js");
 const {
   getSpeech,
@@ -74,7 +77,7 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
             .sort(),
           botname: channelMeta.botname || "",
           voice: channelMeta.voice || "",
-          summaryPrompt: channelMeta.summaryPrompt || "",
+          // summaryPrompt entfernt
         })
       )
       .digest("hex");
@@ -86,7 +89,7 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
         channelMeta.tools,
         channelMeta.toolRegistry,
         channelId,
-        { persistToDB: true } // ⬅︎ Persistenz erzwingen
+        { persistToDB: true }
       );
       storage.set(key, { ctx, sig: signature });
     } else {
@@ -98,7 +101,7 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
           channelMeta.tools,
           channelMeta.toolRegistry,
           channelId,
-          { persistToDB: true } // ⬅︎ Persistenz erzwingen
+          { persistToDB: true }
         );
         entry.sig = signature;
       }
@@ -145,7 +148,7 @@ function metaSig(m) {
           .sort(),
         botname: m.botname || "",
         voice: m.voice || "",
-        summaryPrompt: m.summaryPrompt || "",
+        // summaryPrompt entfernt
       })
     )
     .digest("hex");
@@ -182,7 +185,7 @@ async function deleteAllMessages(channel) {
         .catch(() => null);
       if (!fetched || fetched.size === 0) break;
 
-    for (const msg of fetched.values()) {
+      for (const msg of fetched.values()) {
         if (msg.pinned) continue;
         try {
           await msg.delete();
@@ -226,12 +229,9 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     ch = await client.channels.fetch(evt.channelId).catch(() => null);
     if (!ch) return;
 
-    // If already busy, ignore silently — the BUSY notice is sent in the listener once per busy period.
     if (voiceBusy.get(evt.channelId)) return;
 
     const channelMeta = getChannelConfig(evt.channelId);
-
-    // 🔒 Absolute Inaktivität, wenn keine Config vorhanden
     if (!channelMeta?.hasConfig) return;
 
     chatContext = ensureChatContextForChannel(evt.channelId, storage, channelMeta);
@@ -242,7 +242,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       });
     }
 
-    // === Voice-Block NUR über SPEAKER (Discord-ID)
+    // Voice-Block nur via SPEAKER (Discord-ID)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const userId = String(evt.userId || "").trim();
 
@@ -260,19 +260,11 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     };
 
     const matchingBlock = pickBlockForSpeakerId();
-
-    // Kein Block → keine Antwort / kein Zugriff (Voice)
     if (!matchingBlock) return;
 
-    // Tools setzen (Block-spezifisch, sonst leer)
-    if (
-      matchingBlock &&
-      Array.isArray(matchingBlock.tools) &&
-      matchingBlock.tools.length > 0
-    ) {
-      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(
-        matchingBlock.tools
-      );
+    // Tools (Block-spezifisch, sonst leer)
+    if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
+      const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
       chatContext.toolRegistry = blockRegistry;
     } else {
@@ -292,7 +284,6 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
         : def;
     })();
 
-    // mark busy + presence *before* any await — ensures strict gating + presence
     voiceBusy.set(evt.channelId, true);
     incPresence();
 
@@ -311,7 +302,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       sequenceLimit,
       effectiveModel,
       effectiveApiKey,
-      { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint } // ⬅︎ Endpoint übergeben
+      { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint }
     );
     replyText = (replyText || "").trim();
     if (!replyText) return;
@@ -358,7 +349,6 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
   } catch (err) {
     await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT", { emit: "channel" });
   } finally {
-    // End of busy period → allow next voice, reset the one-shot BUSY flag, presence --
     try {
       voiceBusy.set(evt.channelId, false);
       busyNoticeSent.delete(evt.channelId);
@@ -374,7 +364,6 @@ client.on("messageCreate", async (message) => {
     const baseChannelId = message.channelId;
     const channelMeta = getChannelConfig(baseChannelId);
 
-    // 🔒 Absolute Inaktivität, wenn keine Config vorhanden
     if (!channelMeta?.hasConfig) return;
 
     const key = `channel:${baseChannelId}`;
@@ -387,7 +376,7 @@ client.on("messageCreate", async (message) => {
         channelMeta.tools,
         channelMeta.toolRegistry,
         baseChannelId,
-        { persistToDB: true } // ⬅︎ Persistenz erzwingen (typed chat Pfad)
+        { persistToDB: true }
       );
       contextStorage.set(key, { ctx, sig: signature });
     } else {
@@ -399,7 +388,7 @@ client.on("messageCreate", async (message) => {
           channelMeta.tools,
           channelMeta.toolRegistry,
           baseChannelId,
-          { persistToDB: true } // ⬅︎ Persistenz erzwingen (Rebuild)
+          { persistToDB: true }
         );
         entry.sig = signature;
       }
@@ -424,24 +413,16 @@ client.on("messageCreate", async (message) => {
     const selfIssued = message.author?.id === client.user?.id;
 
     if (isCommand) {
-      // Commands sind nur in konfigurierten Channels erlaubt – aber wir sind hier
-      // ohnehin nur drin, wenn hasConfig === true (früher Return oben).
       if (!channelMeta.hasConfig) return;
       if (!selfIssued && !isChannelAdmin(channelMeta, message.author.id)) {
-        // Optional: stumm bleiben statt Info – absolute Inaktivität
         return;
       }
     }
 
-    // We only store non-trigger normal chat into context immediately.
-    // Triggered AI turns will be passed as pendingUser to getAIResponse and committed after tools finish.
     const authorId = String(message.author?.id || "");
     const norm = (rawText || "").toLowerCase();
     const triggerName = (channelMeta.name || "bot").trim().toLowerCase();
     const isTrigger = norm.startsWith(triggerName) || norm.startsWith(`!${triggerName}`);
-
-    // ❌ (CONSENT FIX) — KEIN Logging mehr vor Consent!
-    // (Der bisherige Block `setAddUserMessage` vor dem Consent wurde entfernt.)
 
     // Consent quick-commands
     {
@@ -449,8 +430,6 @@ client.on("messageCreate", async (message) => {
 
       if (lower.startsWith("+consent_chat")) {
         await setChatConsent(authorId, baseChannelId, true);
-        // Optional: still bleiben? Dann return ohne Info:
-        // return;
         await reportInfo(message.channel, "Chat consent saved for this channel.", "CONSENT");
         return;
       }
@@ -495,20 +474,8 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // !reload-cron
-    if (rawText.trim() === "!reload-cron") {
-      try {
-        const ok = await reloadCronForChannel(client, contextStorage, baseChannelId);
-        await reportInfo(
-          message.channel,
-          ok ? "Cron reloaded for this channel." : "No crontab defined for this channel.",
-          "CRON"
-        );
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_RELOAD_CRON", { emit: "channel" });
-      }
-      return;
-    }
+    // ⛔ Entfernt: !reload-cron
+    // if (rawText.trim() === "!reload-cron") { ... }
 
     // !purge-db
     if (rawText.trim() === "!purge-db") {
@@ -528,7 +495,6 @@ client.on("messageCreate", async (message) => {
 
     // !joinvc
     if (rawText.trim() === "!joinvc") {
-      // Nur mit Config erlaubt; hier sind wir bereits nur bei hasConfig === true.
       try {
         let gm = null;
         try { gm = await message.guild.members.fetch(message.author.id); } catch {}
@@ -559,8 +525,6 @@ client.on("messageCreate", async (message) => {
         setStartListening(conn, message.guild.id, guildTextChannels, client, async (evt) => {
           try {
             const channelMeta = getChannelConfig(evt.channelId);
-
-            // 🔒 Voice-Listener: komplett stumm, wenn keine Config
             if (!channelMeta?.hasConfig) return;
 
             const chatContext = ensureChatContextForChannel(evt.channelId, contextStorage, channelMeta);
@@ -571,7 +535,6 @@ client.on("messageCreate", async (message) => {
 
             const TRIGGER = (channelMeta.name || "").trim();
 
-            // === Voice-Block nur via SPEAKER (Discord-ID); noTrigger berücksichtigen ===
             const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
             const userId = String(evt.userId || "").trim();
 
@@ -589,7 +552,6 @@ client.on("messageCreate", async (message) => {
             const bypassTrigger = !!voiceBlock && voiceBlock.noTrigger === true;
             const invoked = !!voiceBlock && (bypassTrigger || firstWordEqualsName(evt.text, TRIGGER));
 
-            // Immer loggen, wenn NICHT invoked
             if (!invoked) {
               try {
                 await chatContext.add(
@@ -598,15 +560,12 @@ client.on("messageCreate", async (message) => {
                   String(evt.text || "").trim(),
                   evt.startedAtMs || Date.now()
                 );
-                // optional debug log
-                // console.log("[VOICE→DB] stored transcript", { channelId: evt.channelId });
               } catch (e) {
                 await reportError(e, null, "VOICE_LOG_CONTEXT_NONINVOKED", { emit: "channel" });
               }
-              return; // keine Antwort generieren
+              return;
             }
 
-            // Strict busy gate:
             if (voiceBusy.get(evt.channelId)) {
               if (!busyNoticeSent.get(evt.channelId)) {
                 const ch = await client.channels.fetch(evt.channelId).catch(() => null);
@@ -616,13 +575,12 @@ client.on("messageCreate", async (message) => {
                     "I’m already answering someone. Please wait until I finish speaking — then try again. Thanks for your patience! 😊",
                     "BUSY"
                   );
-                  busyNoticeSent.set(evt.channelId, true); // one-shot during this busy period
+                  busyNoticeSent.set(evt.channelId, true);
                 }
               }
-              return; // do NOT log this utterance, do NOT queue anything
+              return;
             }
 
-            // Not busy → prepare pending user-turn (do NOT write to context yet)
             const textForLog = stripLeadingName(evt.text, TRIGGER);
             const pendingUserTurn = {
               name: evt.speaker || "user",
@@ -630,10 +588,7 @@ client.on("messageCreate", async (message) => {
               timestamp: evt.startedAtMs || Date.now(),
             };
 
-            // run the full voice pipeline (sets busy/presence and commits after tools finish)
             await handleVoiceTranscriptDirect({ ...evt, text: textForLog }, client, contextStorage, pendingUserTurn);
-
-            // one-shot notice is reset at end of busy period (also in finally of handler)
             busyNoticeSent.delete(evt.channelId);
           } catch (err) {
             await reportError(err, null, "VOICE_LISTENING_CALLBACK", { emit: "channel" });
@@ -663,199 +618,6 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // !summarize
-    if (rawText.trim() === "!summarize") {
-      if (!channelMeta.summariesEnabled) {
-        await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
-        return;
-      }
-
-      await reportInfo(message.channel, "**Summary in progress…** New messages won’t be considered.", "SUMMARY");
-
-      const cutoffMs = Date.now();
-      const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
-
-      try {
-        const before = await chatContext.getLastSummaries(1).catch(() => []);
-        await chatContext.summarizeSince(cutoffMs, customPrompt);
-        const after = await chatContext.getLastSummaries(1).catch(() => []);
-        const createdNew =
-          (before.length === 0 && after.length > 0) ||
-          (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
-
-        if (!createdNew) {
-          await setReplyAsWebhookEmbed(
-            message,
-            "No messages to summarize yet.",
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-          return;
-        }
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_RUN", { emit: "channel" });
-        await reportInfo(message.channel, "Summary failed.", "SUMMARY");
-        return;
-      }
-
-      try {
-        // Nur die letzte Summary anzeigen
-        const lastDesc = await chatContext.getLastSummaries(1);
-        const summariesAsc = (lastDesc || []).slice().reverse();
-
-        if (summariesAsc.length === 0) {
-          await setReplyAsWebhookEmbed(
-            message,
-            "No summaries available yet.",
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-        } else {
-          const combined = summariesAsc
-            .map((r, i) => `**Summary ${i + 1}/${summariesAsc.length} — ${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`)
-            .join("\n\n");
-
-          await setReplyAsWebhookEmbed(
-            message,
-            combined,
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-        }
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_POST", { emit: "channel" });
-      }
-
-      try { await chatContext.bumpCursorToCurrentMax(); } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_BUMP");
-      }
-
-      try {
-        await chatContext.collapseToSystemAndLastSummary();
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_COLLAPSE", { emit: "channel" });
-        await reportInfo(message.channel, "RAM context collapse failed (kept full memory).", "SUMMARY");
-      }
-
-      try { await reportInfo(message.channel, "**Summary completed.**", "SUMMARY"); } catch {}
-      return;
-    }
-
-    // !summarize-redo
-    if (rawText.trim() === "!summarize-redo") {
-      if (!channelMeta.summariesEnabled) {
-        await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
-        return;
-      }
-
-      await reportInfo(message.channel, "**Redo in progress…** New messages won’t be considered.", "SUMMARY");
-
-      const cutoffMs = Date.now();
-      const customPrompt = channelMeta?.summaryPrompt || channelMeta?.summary_prompt || null;
-
-      try {
-        const before = await chatContext.getLastSummaries(1).catch(() => []);
-        await chatContext.redoLastSummary(cutoffMs, customPrompt);
-        const after = await chatContext.getLastSummaries(1).catch(() => []);
-        const createdNew =
-          (before.length === 0 && after.length > 0) ||
-          (before.length > 0 && after.length > 0 && after[0].timestamp !== before[0].timestamp);
-
-        if (!createdNew) {
-          await setReplyAsWebhookEmbed(
-            message,
-            "No messages to summarize yet.",
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-          return;
-        }
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_REDO_RUN", { emit: "channel" });
-        await reportInfo(message.channel, "Redo failed.", "SUMMARY");
-        return;
-      }
-
-      try {
-        const last = await chatContext.getLastSummaries(1);
-        if (!last?.length) {
-          await setReplyAsWebhookEmbed(message, "No summaries available yet.", { botname: channelMeta.botname, color: 0x00b3ff });
-        } else {
-          const r = last[0];
-          await setReplyAsWebhookEmbed(
-            message,
-            `**Summary — ${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`,
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-        }
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_REDO_POST", { emit: "channel" });
-      }
-      return;
-    }
-
-    // !summarize-remove
-    if (rawText.trim() === "!summarize-remove") {
-      if (!channelMeta.summariesEnabled) {
-        await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
-        return;
-      }
-
-      try {
-        const deletedId = await chatContext.deleteLastSummary();
-        if (deletedId) {
-          await reportInfo(
-            message.channel,
-            `Removed last summary (id **${deletedId}**). You can now run **!summarize** to regenerate with the updated window.`,
-            "SUMMARY"
-          );
-        } else {
-          await reportInfo(message.channel, "No summary found to remove.", "SUMMARY");
-        }
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_REMOVE", { emit: "channel" });
-        await reportInfo(message.channel, "Remove failed.", "SUMMARY");
-      }
-      return;
-    }
-
-    // !summarize-replace
-    if (rawText.trim() === "!summarize-replace") {
-      if (!channelMeta.summariesEnabled) {
-        await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
-        return;
-      }
-
-      try {
-        const res = await chatContext.replaceLastSummaryWithLastLog();
-        if (!res?.ok) {
-          const reason = res?.reason || "Unknown";
-          await setReplyAsWebhookEmbed(
-            message,
-            `Replace failed (${reason}).`,
-            { botname: channelMeta.botname, color: 0xff3b30 }
-          );
-          return;
-        }
-
-        const last = await chatContext.getLastSummaries(1);
-        if (!last?.length) {
-          await setReplyAsWebhookEmbed(
-            message,
-            "No summaries available after replace.",
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-        } else {
-          const r = last[0];
-          await setReplyAsWebhookEmbed(
-            message,
-            `**Summary — ${new Date(r.timestamp).toLocaleString()}**\n${r.summary}`,
-            { botname: channelMeta.botname, color: 0x00b3ff }
-          );
-        }
-      } catch (e) {
-        await reportError(e, message.channel, "CMD_SUMMARIZE_REPLACE", { emit: "channel" });
-        await reportInfo(message.channel, "Replace failed.", "SUMMARY");
-      }
-      return;
-    }
-
     // =========================
     // Normal flow: typed chat
     // =========================
@@ -863,7 +625,11 @@ client.on("messageCreate", async (message) => {
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    // --- Block selection for typed chat — STRICTLY by user id (with wildcard)
+    if (!isTrigger) {
+      await setAddUserMessage(message, chatContext);
+    }
+
+    // Block selection for typed chat — STRICTLY by user id (with wildcard)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const pickBlockForUser = () => {
       let exact = null, wildcard = null;
@@ -877,26 +643,11 @@ client.on("messageCreate", async (message) => {
     };
     const matchingBlock = pickBlockForUser();
 
-    // Kein passender USER-Block → Non-trigger loggen (wie zuvor) und beenden
-    if (!matchingBlock) {
-      if (!isTrigger) {
-        await setAddUserMessage(message, chatContext);
-      }
-      return;
-    }
+    if (!matchingBlock) return;
 
-    // noTrigger: Triggerwort nicht nötig
     const bypassTrigger = matchingBlock.noTrigger === true;
+    if (!bypassTrigger && !isTrigger) return;
 
-    // ✅ Sofort-Log nur, wenn KEIN Turn folgt:
-    // - folgt Turn, wenn (isTrigger || bypassTrigger)
-    // - kein Turn → Non-trigger sofort loggen und beenden
-    if (!(isTrigger || bypassTrigger)) {
-      await setAddUserMessage(message, chatContext);
-      return;
-    }
-
-    // Reactions + presence
     await setMessageReaction(message, "⏳");
     incPresence();
 
@@ -910,7 +661,6 @@ client.on("messageCreate", async (message) => {
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    // Modell/Key/Endpoint pro Block/Channel holen
     const { model: effectiveModel, apikey: effectiveApiKey, endpoint: effectiveEndpoint } =
       resolveEffectiveLLM(channelMeta, matchingBlock);
 
@@ -923,7 +673,6 @@ client.on("messageCreate", async (message) => {
         : def;
     })();
 
-    // typed: use chatAppend only
     const instrBackup = chatContext.instructions;
     try {
       const add = (channelMeta.chatAppend || "").trim();
@@ -944,7 +693,7 @@ client.on("messageCreate", async (message) => {
         1000,
         effectiveModel,
         effectiveApiKey,
-        { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint } // ⬅︎ Endpoint übergeben
+        { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint }
       );
 
       if (output && String(output).trim()) {
@@ -976,7 +725,8 @@ function onClientReadyOnce() {
   onClientReadyOnce._ran = true;
   try {
     setBotPresence(client, "✅ Ready", "online");
-    initCron(client, contextStorage);
+    // ⛔ initCron entfernt
+    // initCron(client, contextStorage);
   } catch (err) {
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }
