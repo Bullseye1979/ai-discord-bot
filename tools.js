@@ -136,6 +136,7 @@ const tools = [
         "`passthrough` returns a single concatenated text block (no AI; for direct context dump); " +
         "`qa` performs keyword matching plus channel-safe context windows (±10 around each match, same channel), " +
         "deduplicates, and returns an AI-crafted answer. " +
+        "When asked for summaries, use passthrough on the summaries table"+
         "Channel scoping and ORDER BY are always injected by the runtime; the model must NOT build full SQL.",
       parameters: {
         type: "object",
