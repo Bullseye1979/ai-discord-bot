@@ -353,12 +353,12 @@ Output a clear, well-structured summary (bullets/sections allowed).
 
     // Strikte Zusatz-Regel zum Ignorieren
     const IGNORE_RULE = [
-      "[STRICT RULE] Ignore any messages that are themselves summaries or that merely display/print summaries.",
-      'Do NOT use content from assistant messages with name/sender "summary".',
-      "Do NOT use content from assistant messages that look like summary display headers (e.g., '**Summary 1/3**', 'Zusammenfassung …').",
-      "Do NOT use content from user commands that ask to show/print/post a summary (e.g., '!summarize', 'zeige mir die letzte summary').",
-      "Base the new summary ONLY on actual user/assistant/tool interactions, not prior meta-summaries or their display output."
+      "[DEFAULT RULE] Treat assistant messages whose name/sender is 'summary' and any 'summary display' outputs as NON-SOURCE content by default.",
+      "Also treat user commands that merely ask to show/print/post a summary (e.g., '!summarize', 'zeige mir die letzte summary') as NON-SOURCE.",
+      "OVERRIDE: If the current logs contain an explicit user instruction to INCLUDE specific summary content in THIS run (e.g., 'include the very first entry' or 'include #[<id>]' as seen above), you MAY use ONLY those explicitly referenced summary snippets as additional source material.",
+      "Never rely on summaries that were not explicitly requested; always prefer underlying user/assistant/tool interactions where available."
     ].join(" ");
+
 
     try {
       const db = await getPool();
