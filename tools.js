@@ -1,9 +1,10 @@
-// tools.js — refactored v2.1
-// - getWebpage: requires user_prompt, returns only { result, url }
-// - getYoutube: user_prompt-driven transcript Q&A (no chunking), returns only { result, video_url }
-// - getHistory: modes (raw | passthrough | qa); channel/order enforced in code
-//   NEW: In qa-mode, `query` ist der Original-Prompt. Standard: letzte N Rows (rows_limit) → KI-Antwort/Summary.
-//         Optional: `match: true` schaltet auf Keyword-Fenster (altes Verhalten).
+// tools.js — refactored v2.0 (single-mode getHistory: WHERE + PROMPT → GPT summary)
+// - getHistory: one mode only. You pass a SQL WHERE (without 'WHERE') and a natural-language 'prompt'.
+//               The tool will SELECT from `context_log` (scoped to the same channel), ORDER BY `timestamp` ASC,
+//               concatenate rows into a digest, then run your prompt over it with GPT-4.1.
+//               Returns only { result }.
+//
+// Other tools unchanged.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -127,57 +128,34 @@ const tools = [
     }
   },
 
-  // ==== getHistory: modes (raw | passthrough | qa); channel filter & ORDER BY enforced in code ====
+  // ==== getHistory (single mode): WHERE + PROMPT → GPT-4.1 summary (channel-scoped) ====
   {
     type: "function",
     function: {
       name: "getHistory",
       description:
-        "Query the channel’s history with one of three modes: " +
-        "`raw` returns exact DB rows (no AI); " +
-        "`passthrough` returns a single concatenated text block (no AI; for direct context dump); " +
-        "`qa` uses the provided `query` as the ORIGINAL user prompt (question/summary/analysis). " +
-        "In qa-mode, by default the tool takes the **last N rows** (rows_limit, default 250) from this channel " +
-        "and asks the model to answer or summarize **strictly based on those rows**. " +
-        "If you set `match: true`, it will instead do keyword matching on context_log and build ±10 windows around matches (legacy behavior). " +
-        "Channel scoping and ORDER BY are enforced by the runtime; the model must NOT build full SQL.",
+        "Summarize this channel's chat history from the database. You pass a SQL WHERE fragment (without the 'WHERE' keyword) " +
+        "that filters `context_log`, and a natural-language 'prompt'. The tool will run: " +
+        "`SELECT timestamp, role, sender, content FROM context_log WHERE (channel_id = :channel_id) AND (<your where>) ORDER BY timestamp ASC` " +
+        "(no LIMIT is added), concatenate rows to a digest, and apply GPT-4.1 to your prompt over that digest. " +
+        "Use named parameters in the WHERE via :param and provide them in 'bindings'.",
       parameters: {
         type: "object",
         properties: {
-          mode: {
-            type: "string",
-            enum: ["raw", "passthrough", "qa"],
-            description: "raw = exact rows; passthrough = single text block; qa = KI-gestützte Antwort/Summary auf Basis des Verlaufs"
+          where: { type: "string", description: "SQL WHERE fragment for context_log (without 'WHERE'). Example: `timestamp >= :from` AND `role` <> 'system' AND content NOT LIKE '%!summarize%'" },
+          prompt: { type: "string", description: "Natural-language instruction for how to summarize or extract info from the result set." },
+          bindings: {
+            type: "object",
+            description: "Optional named parameter bindings for the WHERE, e.g. { from: '2025-09-01 00:00:00' }"
           },
-          channel_id: { type: "string", description: "Target channel identifier. Required." },
-          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." },
-
-          // Common filters for raw/passthrough (optional)
-          limit: { type: "number", description: "Optional max rows for raw/passthrough modes (default enforced server-side)." },
-          time_from: { type: "string", description: "Optional ISO timestamp lower bound (raw/passthrough/qa-last-rows)." },
-          time_to: { type: "string", description: "Optional ISO timestamp upper bound (raw/passthrough/qa-last-rows)." },
-          query: {
-            type: "string",
-            description:
-              "In qa: the ORIGINAL user prompt (question/summary task). In raw/passthrough: optional keyword filter."
-          },
-          match: {
-            type: "boolean",
-            description:
-              "qa-mode only: true = use keyword matching + context windows; false (default) = take last rows."
-          },
-          rows_limit: {
-            type: "number",
-            description:
-              "qa-mode (last-rows): how many most recent rows to build the digest from (default 250, max 1000)."
-          }
+          user_id: { type: "string", description: "User ID or display name (optional; for attribution/logging only)." }
         },
-        required: ["mode", "channel_id"]
+        required: ["where", "prompt"]
       }
     }
   },
 
-  // ==== getPDF (unverändert) ====
+  // ==== getPDF (unchanged) ====
   {
     type: "function",
     function: {
