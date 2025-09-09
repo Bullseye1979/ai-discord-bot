@@ -1,9 +1,9 @@
-// bot.js — refactored v3.14
-// Änderungen:
-// - 100% Inaktivität in Channels ohne Config (früher Return).
-// - Endpoint-Support pro Block/global (aiCore.getAIResponse).
-// - Entfernt: !summarize / !summarize-redo / !summarize-remove / !summarize-replace.
-// - Entfernt: Cron-Integration (initCron, reloadCronForChannel) und jegliche summaryPrompt-Nutzung.
+// bot.js — refactored v3.16
+// Änderungen ggü. v3.14/v3.15:
+// - Immer VOR dem KI-Lauf loggen (auch bei Trigger/noTrigger-Bypass).
+// - Doppel-Logging verhindert (Flag preLogged).
+// - getAIResponse wird mit { pendingUser, noPendingUserInjection: true } aufgerufen.
+// - Summarize/Cron weiterhin entfernt.
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -14,7 +14,7 @@ const crypto = require("crypto");
 const { getAIResponse } = require("./aiCore.js");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
-// ⛔ Cron entfernt
+// Cron entfernt
 // const { initCron, reloadCronForChannel } = require("./scheduler.js");
 const Context = require("./context.js");
 const {
@@ -44,11 +44,11 @@ const client = new Client({
 });
 
 const contextStorage = new Map();
-const guildTextChannels = new Map();    // guildId -> textChannelId (for TTS/transcripts)
-const voiceBusy = new Map();            // channelId -> boolean (busy while LLM+TTS runs)
-const busyNoticeSent = new Map();       // channelId -> boolean (BUSY notice already shown during this busy period)
+const guildTextChannels = new Map();
+const voiceBusy = new Map();
+const busyNoticeSent = new Map();
 
-// ==== Presence counter (⏳ while >0 active tasks; ✅ when idle) ====
+// ==== Presence counter ====
 let _activeTasks = 0;
 function incPresence() {
   _activeTasks++;
@@ -77,7 +77,6 @@ function ensureChatContextForChannel(channelId, storage, channelMeta) {
             .sort(),
           botname: channelMeta.botname || "",
           voice: channelMeta.voice || "",
-          // summaryPrompt entfernt
         })
       )
       .digest("hex");
@@ -148,7 +147,6 @@ function metaSig(m) {
           .sort(),
         botname: m.botname || "",
         voice: m.voice || "",
-        // summaryPrompt entfernt
       })
     )
     .digest("hex");
@@ -171,9 +169,7 @@ async function deleteAllMessages(channel) {
       !perms?.has(PermissionsBitField.Flags.ManageMessages) ||
       !perms?.has(PermissionsBitField.Flags.ReadMessageHistory)
     ) {
-      throw new Error(
-        "Missing permissions: ManageMessages and/or ReadMessageHistory"
-      );
+      throw new Error("Missing permissions: ManageMessages and/or ReadMessageHistory");
     }
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -187,9 +183,7 @@ async function deleteAllMessages(channel) {
 
       for (const msg of fetched.values()) {
         if (msg.pinned) continue;
-        try {
-          await msg.delete();
-        } catch {}
+        try { await msg.delete(); } catch {}
         await sleep(120);
       }
       const oldest = fetched.reduce(
@@ -237,9 +231,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     chatContext = ensureChatContextForChannel(evt.channelId, storage, channelMeta);
 
     if (typeof chatContext.setUserWindow === "function") {
-      chatContext.setUserWindow(channelMeta.max_user_messages, {
-        prunePerTwoNonUser: true,
-      });
+      chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
     }
 
     // Voice-Block nur via SPEAKER (Discord-ID)
@@ -262,7 +254,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     const matchingBlock = pickBlockForSpeakerId();
     if (!matchingBlock) return;
 
-    // Tools (Block-spezifisch, sonst leer)
+    // Tools setzen
     if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
@@ -291,10 +283,22 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     const instrBackup = chatContext.instructions;
     try {
       const add = (channelMeta.speechAppend || "").trim();
-      if (add)
-        chatContext.instructions =
-          (chatContext.instructions || "") + "\n\n" + add;
+      if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
     } catch {}
+
+    // 🔴 PRE-LOG (invoked voice): immer vor dem KI-Lauf
+    try {
+      if (pendingUserTurn && pendingUserTurn.content) {
+        await chatContext.add(
+          "user",
+          pendingUserTurn.name || evt.speaker || "user",
+          pendingUserTurn.content,
+          pendingUserTurn.timestamp || evt.startedAtMs || Date.now()
+        );
+      }
+    } catch (e) {
+      await reportError(e, ch, "VOICE_PRELOG_FAILED", { emit: "channel" });
+    }
 
     let replyText = await getAIResponse(
       chatContext,
@@ -302,49 +306,37 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       sequenceLimit,
       effectiveModel,
       effectiveApiKey,
-      { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint }
+      {
+        pendingUser: pendingUserTurn || null,
+        endpoint: effectiveEndpoint,
+        noPendingUserInjection: true, // ⬅︎ WICHTIG: nicht erneut in den Arbeitskontext injizieren
+      }
     );
+
     replyText = (replyText || "").trim();
     if (!replyText) return;
 
     try {
-      await chatContext.add(
-        "assistant",
-        channelMeta.botname || "AI",
-        replyText,
-        Date.now()
-      );
+      await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
     } catch {}
 
     try {
       const msgShim = { channel: ch };
-      await setReplyAsWebhookEmbed(msgShim, replyText, {
-        botname: channelMeta.botname || "AI",
-      });
+      await setReplyAsWebhookEmbed(msgShim, replyText, { botname: channelMeta.botname || "AI" });
     } catch (e) {
       await reportError(e, ch, "VOICE_WEBHOOK_SEND", { emit: "channel" });
-      try {
-        await reportInfo(ch, replyText, "FALLBACK");
-      } catch {}
+      try { await reportInfo(ch, replyText, "FALLBACK"); } catch {}
     }
 
     try {
       const conn = getVoiceConnection(evt.guildId);
       if (conn) {
-        await getSpeech(
-          conn,
-          evt.guildId,
-          replyText,
-          client,
-          channelMeta.voice || ""
-        );
+        await getSpeech(conn, evt.guildId, replyText, client, channelMeta.voice || "");
       }
     } catch (e) {
       await reportError(e, ch, "VOICE_TTS", { emit: "channel" });
     } finally {
-      try {
-        chatContext.instructions = instrBackup;
-      } catch {}
+      try { chatContext.instructions = instrBackup; } catch {}
     }
   } catch (err) {
     await reportError(err, ch, "VOICE_TRANSCRIPT_DIRECT", { emit: "channel" });
@@ -363,7 +355,6 @@ client.on("messageCreate", async (message) => {
 
     const baseChannelId = message.channelId;
     const channelMeta = getChannelConfig(baseChannelId);
-
     if (!channelMeta?.hasConfig) return;
 
     const key = `channel:${baseChannelId}`;
@@ -395,8 +386,7 @@ client.on("messageCreate", async (message) => {
     }
     const chatContext = contextStorage.get(key).ctx;
 
-    const rawWindow =
-      channelMeta.max_user_messages ?? channelMeta.maxUserMessages ?? null;
+    const rawWindow = channelMeta.max_user_messages ?? channelMeta.maxUserMessages ?? null;
     const parsedWindow =
       rawWindow === null || rawWindow === undefined || rawWindow === ""
         ? null
@@ -450,7 +440,7 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // !clear-channel / !purge-channel
+    // !clear-channel
     if (rawText.trim() === "!clear-channel") {
       try {
         await deleteAllMessages(message.channel);
@@ -466,16 +456,12 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // !context (view only)
+    // !context
     if (rawText.trim() === "!context") {
       const chunks = await chatContext.getContextAsChunks();
-      for (const c of chunks)
-        await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
+      for (const c of chunks) await sendChunked(message.channel, `\`\`\`json\n${c}\n\`\`\``);
       return;
     }
-
-    // ⛔ Entfernt: !reload-cron
-    // if (rawText.trim() === "!reload-cron") { ... }
 
     // !purge-db
     if (rawText.trim() === "!purge-db") {
@@ -552,6 +538,7 @@ client.on("messageCreate", async (message) => {
             const bypassTrigger = !!voiceBlock && voiceBlock.noTrigger === true;
             const invoked = !!voiceBlock && (bypassTrigger || firstWordEqualsName(evt.text, TRIGGER));
 
+            // Nicht-invoked → nur loggen und fertig
             if (!invoked) {
               try {
                 await chatContext.add(
@@ -625,8 +612,11 @@ client.on("messageCreate", async (message) => {
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
+    // Pre-log immer, aber ohne Doppel-Logging
+    let preLogged = false;
     if (!isTrigger) {
-      await setAddUserMessage(message, chatContext);
+      await setAddUserMessage(message, chatContext); // bewährt für non-trigger
+      preLogged = true;
     }
 
     // Block selection for typed chat — STRICTLY by user id (with wildcard)
@@ -642,11 +632,26 @@ client.on("messageCreate", async (message) => {
       return exact || wildcard || null;
     };
     const matchingBlock = pickBlockForUser();
-
     if (!matchingBlock) return;
 
     const bypassTrigger = matchingBlock.noTrigger === true;
     if (!bypassTrigger && !isTrigger) return;
+
+    // Falls Trigger/noTrigger -> ggf. noch nicht geloggt → jetzt loggen
+    const textForLog = stripLeadingName(rawText, triggerName);
+    if (!preLogged) {
+      try {
+        await chatContext.add(
+          "user",
+          message.member?.displayName || message.author?.username || "user",
+          (textForLog || "").trim(),
+          message.createdTimestamp || Date.now()
+        );
+        preLogged = true;
+      } catch (e) {
+        await reportError(e, message?.channel, "CHAT_PRELOG_FAILED", { emit: "channel" });
+      }
+    }
 
     await setMessageReaction(message, "⏳");
     incPresence();
@@ -680,7 +685,6 @@ client.on("messageCreate", async (message) => {
     } catch {}
 
     try {
-      const textForLog = stripLeadingName(rawText, triggerName);
       const pendingUserTurn = {
         name: message.member?.displayName || message.author?.username || "user",
         content: (textForLog || "").trim(),
@@ -693,7 +697,11 @@ client.on("messageCreate", async (message) => {
         1000,
         effectiveModel,
         effectiveApiKey,
-        { pendingUser: pendingUserTurn, endpoint: effectiveEndpoint }
+        {
+          pendingUser: pendingUserTurn,
+          endpoint: effectiveEndpoint,
+          noPendingUserInjection: true // ⬅︎ nicht erneut in den Arbeitskontext injizieren
+        }
       );
 
       if (output && String(output).trim()) {
@@ -725,8 +733,7 @@ function onClientReadyOnce() {
   onClientReadyOnce._ran = true;
   try {
     setBotPresence(client, "✅ Ready", "online");
-    // ⛔ initCron entfernt
-    // initCron(client, contextStorage);
+    // Cron entfernt
   } catch (err) {
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }

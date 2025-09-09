@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.10 (endpoint override + conditional auth)
+// aiCore.js — refactored v2.11 (endpoint override + conditional auth)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -9,10 +9,10 @@
 // v2.8: Hardened tool_call flow (no empty tool_calls; strict ordering intent in loop).
 // v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
 // v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
+// v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
+//        Added options.noPendingUserInjection to avoid duplicating user content in working copy.
 
 require("dotenv").config();
-const fs = require("fs"); // retained for potential future file-priming
-const path = require("path");
 const axios = require("axios");
 const http = require("http");
 const https = require("https");
@@ -140,57 +140,40 @@ function normalizeEndpoint(raw) {
   let url = (raw || "").trim();
   if (!url) return fallback;
 
-  // if already a chat/completions endpoint, keep it
   if (/\/v1\/chat\/completions\/?$/.test(url)) return url.replace(/\/+$/, "");
-
-  // normalize /v1 or /v1/ → /v1/chat/completions
   if (/\/v1\/?$/.test(url)) return url.replace(/\/v1\/?$/, "/v1/chat/completions");
-
-  // normalize /v1/responses → /v1/chat/completions
   if (/\/v1\/responses\/?$/.test(url)) return url.replace(/\/v1\/responses\/?$/, "/v1/chat/completions");
-
-  // leave other URLs as-is (e.g., fully qualified non-OpenAI-compatible endpoints)
   return url.replace(/\/+$/, "");
 }
 
 /**
  * Strictly pair assistant.tool_calls with *all* of their immediate tool replies.
- * - After assistant.tool_calls, allow only directly following tool messages matching tool_call_id.
- * - Allow multiple tool replies in a row (for multiple tool_call IDs).
- * - Drop any other roles in between; orphan tool messages are dropped.
- * - Normal user/assistant/system messages are kept; any non-tool breaks the "tool chain".
  */
 function buildStrictToolPairedMessages(msgs) {
   const out = [];
-  let lastToolIds = null; // Set of tool_call_ids from the last assistant.tool_calls
+  let lastToolIds = null;
 
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
 
-    // assistant with tool_calls
     if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
       const asst = { role: "assistant", tool_calls: m.tool_calls };
       if (typeof m.content === "string" && m.content.trim()) asst.content = m.content.trim();
       out.push(asst);
 
       lastToolIds = new Set(m.tool_calls.map(tc => tc && tc.id).filter(Boolean));
-      // now expect one or more matching tool replies to follow; handled in next iterations
       continue;
     }
 
-    // tool replies: keep only those matching the last seen assistant.tool_calls
     if (m.role === "tool") {
       if (m.tool_call_id && lastToolIds && lastToolIds.has(m.tool_call_id)) {
         out.push({ role: "tool", tool_call_id: m.tool_call_id, content: m.content ?? "" });
       }
-      // don't change lastToolIds; allow multiple matching tool replies in sequence
       continue;
     }
 
-    // any other role breaks the expected tool chain
     lastToolIds = null;
 
-    // keep normal messages
     const keep = { role: m.role, content: m.content };
     if (m.name) keep.name = m.name;
     out.push(keep);
@@ -208,7 +191,6 @@ const MAX_TOOL_PERSIST_CHARS = Math.max(
   Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 8000))
 );
 
-/** Produce a compact, parseable wrapper for tool results */
 function formatToolResultForPersistence(toolName, content) {
   const header = `[TOOL_RESULT:${(toolName || "unknown").trim()}]`;
   let payloadStr;
@@ -225,7 +207,6 @@ function formatToolResultForPersistence(toolName, content) {
   const looksJSON = /^\s*[\[{]/.test((payloadStr || "").trim());
   let body = looksJSON ? `${header}\n${payloadStr}` : `${header}\n\`\`\`\n${payloadStr}\n\`\`\``;
 
-  // Hard cap to avoid giant blobs (e.g., long PDF text)
   if (body.length > MAX_TOOL_PERSIST_CHARS) {
     const tail = "\n…[truncated]";
     body = body.slice(0, MAX_TOOL_PERSIST_CHARS - tail.length) + tail;
@@ -241,12 +222,12 @@ function loadEnvPriming() {
 
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
- * @param {Context} context_orig          // persistent channel context (DB-backed)
+ * @param {Context} context_orig
  * @param {number}  tokenlimit
  * @param {number}  sequenceLimit
  * @param {string}  model
  * @param {string|null} apiKey
- * @param {object}  options               // { pendingUser?: {name, content, timestamp}, endpoint?: string }
+ * @param {object}  options               // { pendingUser?: {name, content, timestamp}, endpoint?: string, noPendingUserInjection?: boolean }
  */
 async function getAIResponse(
   context_orig,
@@ -258,6 +239,7 @@ async function getAIResponse(
 ) {
   let responseMessage = "";
   const pendingUser = options?.pendingUser || null;
+  const noPendingInject = options?.noPendingUserInjection === true;
 
   try {
     if (tokenlimit == null) tokenlimit = 4096;
@@ -285,7 +267,7 @@ async function getAIResponse(
 
     const toolRegistry = context.toolRegistry;
 
-    // Compose system: "General rules:\n{STANDARDPRIMING}" → channel persona → channel instructions
+    // Compose system
     try {
       const sysParts = [];
       const priming = loadEnvPriming();
@@ -296,19 +278,17 @@ async function getAIResponse(
       if (sysCombined) {
         context.messages.unshift({ role: "system", content: sysCombined });
       }
-    } catch {
-      // ignore priming errors
-    }
+    } catch {}
 
-    // Time hint (separate system line)
+    // Time hint
     const nowUtc = new Date().toISOString();
     context.messages.unshift({
       role: "system",
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
-    // Pending user only in working copy (not yet persisted)
-    if (pendingUser && pendingUser.content) {
+    // Pending user ONLY to working copy if requested (avoid duplicate when bot.js pre-logged)
+    if (pendingUser && pendingUser.content && !noPendingInject) {
       const safeName = cleanOpenAIName("user", pendingUser.name || "user");
       const msg = { role: "user", content: pendingUser.content };
       if (safeName) msg.name = safeName;
@@ -327,15 +307,12 @@ async function getAIResponse(
     do {
       hadToolCallsThisTurn = false;
 
-      // Build a *strictly paired* message list for the API
       const safeMsgs = buildStrictToolPairedMessages(context.messages);
 
-      // Map messages for API; omit empty name/tool_calls/tool_call_id
       const messagesToSend = safeMsgs.map((m) => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
         if (safeName) out.name = safeName;
-
         if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
           out.tool_calls = m.tool_calls;
         }
@@ -351,7 +328,6 @@ async function getAIResponse(
         tools: context.tools,
       };
 
-      // Resolve endpoint (options.endpoint > ENV > config > default) and normalize
       const configuredRaw =
         (options?.endpoint || "").trim() ||
         (process.env.OPENAI_API_URL || "").trim() ||
@@ -360,7 +336,6 @@ async function getAIResponse(
       const endpoint =
         normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
 
-      // === DEBUG SNAPSHOT (printed on failure) ===
       const __REQUEST_DEBUG_SNAPSHOT = {
         endpoint,
         model,
@@ -376,7 +351,7 @@ async function getAIResponse(
         handoverMessages: handoverContext.messages,
       };
 
-      // Headers (Authorization nur, wenn Key vorhanden)
+      // Headers
       const headers = {
         "Content-Type": "application/json",
         "Connection": "keep-alive",
@@ -388,18 +363,9 @@ async function getAIResponse(
       try {
         aiResponse = await postWithRetry(endpoint, payload, headers);
       } catch (err) {
-        const details = {
-          endpoint,
-          status: err?.response?.status,
-          data: err?.response?.data,
-        };
+        const details = { endpoint, status: err?.response?.status, data: err?.response?.data };
         await reportError(err, null, "OPENAI_CHAT", { details });
-
-        // Debug: dump request snapshot with payload/context
-        try {
-          console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify(__REQUEST_DEBUG_SNAPSHOT, null, 2));
-        } catch {}
-        // raw fallback for legacy grep
+        try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify(__REQUEST_DEBUG_SNAPSHOT, null, 2)); } catch {}
         console.log("\n\n=== CONTEXT RAW DUMP ===\n", context.messages, "\n=== /CONTEXT RAW DUMP ===\n");
         throw err;
       }
@@ -411,44 +377,28 @@ async function getAIResponse(
       const toolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
       const hasToolCalls = toolCalls.length > 0;
 
-      // Only push assistant tool_calls if NON-EMPTY
       if (hasToolCalls) {
-        context.messages.push({
-          role: "assistant",
-          tool_calls: toolCalls,
-        });
+        context.messages.push({ role: "assistant", tool_calls: toolCalls });
       }
 
-      // Append any assistant content to the aggregated response buffer
       if (typeof aiMessage.content === "string" && aiMessage.content.trim()) {
         responseMessage += aiMessage.content.trim();
       }
 
-      // Tool execution (strict pairing per loop; replies are appended to context.messages)
       if (hasToolCalls) {
         hadToolCallsThisTurn = true;
 
         for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
-          const toolFunction = toolRegistry ? toolRegistry[fnName] : undefined;
+          const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
 
           const replyTool = (content) => {
             const out =
               typeof content === "string" || content == null
                 ? content || ""
-                : (() => {
-                    try {
-                      return JSON.stringify(content);
-                    } catch {
-                      return String(content);
-                    }
-                  })();
+                : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
 
-            context.messages.push({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              content: out,
-            });
+            context.messages.push({ role: "tool", tool_call_id: toolCall.id, content: out });
             toolCommits.push({ name: fnName || "tool", content: out });
           };
 
@@ -459,7 +409,6 @@ async function getAIResponse(
 
           try {
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-            // handoverContext is read-only by convention; tools should not mutate it.
             const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
@@ -472,18 +421,14 @@ async function getAIResponse(
 
       sequenceCounter++;
 
-      // Auto-continue only if cut for length and within sequenceLimit
       const dueToLength = !hasToolCalls && finishReason === "length";
-
       if (sequenceLimit <= 1) {
         continueResponse = false;
       } else if (dueToLength) {
         if (sequenceCounter < sequenceLimit) {
-          // If we have content, commit it as assistant content for the next turn
           if (typeof aiMessage.content === "string" && aiMessage.content.trim()) {
             context.messages.push({ role: "assistant", content: aiMessage.content.trim() });
           }
-          // Ask the model to continue
           context.messages.push({ role: "user", content: "continue" });
           continueResponse = true;
         } else {
@@ -494,27 +439,14 @@ async function getAIResponse(
       }
     } while (hadToolCallsThisTurn || continueResponse);
 
-    // === Post-commit to the persistent context in correct temporal order ===
-    // 1) Commit pending user with original timestamp
-    if (pendingUser && pendingUser.content) {
-      try {
-        await context_orig.add(
-          "user",
-          pendingUser.name || "user",
-          pendingUser.content,
-          pendingUser.timestamp || Date.now()
-        );
-      } catch {
-        // ignore persistence errors to keep the chat responsive
-      }
-    }
-    // 2) Commit tool outputs right after, anchored to original time (+1ms each), as assistant/system
-    if (pendingUser && toolCommits.length > 0) {
-      let t0 = pendingUser.timestamp || Date.now();
+    // === Post-commit (NO user commit here) ===
+    // Persist tool outputs (assistant/system) with a sensible timestamp base
+    if (toolCommits.length > 0) {
+      let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
         const tmsg = toolCommits[i];
         const wrapped = formatToolResultForPersistence(tmsg.name, tmsg.content);
-        const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined; // name ignored for system
+        const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
         try {
           await context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, t0 + i + 1);
         } catch {
@@ -525,13 +457,9 @@ async function getAIResponse(
 
     return responseMessage;
   } catch (err) {
-    const details = {
-      status: err?.response?.status,
-      data: err?.response?.data,
-    };
+    const details = { status: err?.response?.status, data: err?.response?.data };
     await reportError(err, null, "GET_AI_RESPONSE", { details });
 
-    // Dump current working & handover contexts for forensics
     try {
       console.error(
         "[GET_AI_RESPONSE][CONTEXT_DEBUG]",
@@ -545,9 +473,7 @@ async function getAIResponse(
         )
       );
     } catch {}
-    // raw fallback
     console.log("\n\n=== CONTEXT OBJ RAW ===\n", context, "\n=== /CONTEXT OBJ RAW ===\n");
-
     throw err;
   }
 }
