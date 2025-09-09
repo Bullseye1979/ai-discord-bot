@@ -1,7 +1,8 @@
-// tools.js — refactored v1.9
+// tools.js — refactored v2.0
 // - getWebpage: requires user_prompt, returns only { result, url }
 // - getYoutube: user_prompt-driven transcript Q&A (no chunking), returns only { result, video_url }
 // - getHistory: modes (raw | passthrough | qa); channel/order enforced in code
+// - NEW: getSummaries — fetch last N summaries from 'summaries' table only (raw | passthrough)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -10,7 +11,7 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { getHistory } = require("./history.js");
+const { getHistory, getSummaries } = require("./history.js");
 const { reportError } = require("./error.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
@@ -132,11 +133,11 @@ const tools = [
       name: "getHistory",
       description:
         "Query the channel’s history with one of three modes: " +
-        "`raw` returns exact DB rows (no AI; preserves summaries 1:1); " +
+        "`raw` returns exact DB rows (no AI; preserves summaries 1:1 if selected from 'summaries'); " +
         "`passthrough` returns a single concatenated text block (no AI; for direct context dump); " +
         "`qa` performs keyword matching plus channel-safe context windows (±10 around each match, same channel), " +
         "deduplicates, and returns an AI-crafted answer. " +
-        "When asked for summaries, use passthrough on the summaries table"+
+        "When the user asks to SHOW a summary, do NOT use getHistory — use getSummaries instead. " +
         "Channel scoping and ORDER BY are always injected by the runtime; the model must NOT build full SQL.",
       parameters: {
         type: "object",
@@ -161,6 +162,32 @@ const tools = [
           }
         },
         required: ["mode", "channel_id"]
+      }
+    }
+  },
+
+  // ==== NEW: getSummaries (only 'summaries' table) ====
+  {
+    type: "function",
+    function: {
+      name: "getSummaries",
+      description:
+        "Fetch the latest channel summaries from the dedicated 'summaries' table. " +
+        "Use this when the user asks to show or print summaries (e.g., '!summarize', 'zeige mir die letzte summary'). " +
+        "Returns either raw rows (id, timestamp, summary) or a single concatenated text block.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Target channel identifier. Required." },
+          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." },
+          limit: { type: "number", description: "How many latest summaries to fetch. Default 1. Max 20." },
+          mode: {
+            type: "string",
+            enum: ["raw", "passthrough"],
+            description: "raw = rows as JSON; passthrough = one text block (default)."
+          }
+        },
+        required: ["channel_id"]
       }
     }
   },
@@ -214,7 +241,8 @@ const fullToolRegistry = {
   getImageDescription,
   getLocation,
   getPDF,
-  getHistory
+  getHistory,
+  getSummaries
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
@@ -223,8 +251,9 @@ function normalizeToolName(name) {
   const raw = String(name).trim();
   if (!raw) return "";
 
-  // Quick alias
+  // Quick aliases
   if (raw.toLowerCase() === "gethistory") return "getHistory";
+  if (raw.toLowerCase() === "getsummaries" || raw.toLowerCase() === "getsummary") return "getSummaries";
 
   // Case-insensitive match to known keys
   const keys = Object.keys(fullToolRegistry);
