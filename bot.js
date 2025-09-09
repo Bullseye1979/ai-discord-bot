@@ -182,7 +182,7 @@ async function deleteAllMessages(channel) {
         .catch(() => null);
       if (!fetched || fetched.size === 0) break;
 
-      for (const msg of fetched.values()) {
+    for (const msg of fetched.values()) {
         if (msg.pinned) continue;
         try {
           await msg.delete();
@@ -790,7 +790,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // !summarize-remove  ← NEU (Hinweis wie "Summary completed")
+    // !summarize-remove
     if (rawText.trim() === "!summarize-remove") {
       if (!channelMeta.summariesEnabled) {
         await reportInfo(message.channel, "Summaries are disabled in this channel.", "SUMMARY");
@@ -814,8 +814,6 @@ client.on("messageCreate", async (message) => {
       }
       return;
     }
-
-
 
     // !summarize-replace
     if (rawText.trim() === "!summarize-replace") {
@@ -865,13 +863,7 @@ client.on("messageCreate", async (message) => {
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    // ✅ (CONSENT FIX) — ab hier ist Consent sicher:
-    // Non-trigger Chat wird nun *nach* Consent geloggt.
-    if (!isTrigger) {
-      await setAddUserMessage(message, chatContext);
-    }
-
-    // Block selection for typed chat — STRICTLY by user id (with wildcard)
+    // --- Block selection for typed chat — STRICTLY by user id (with wildcard)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const pickBlockForUser = () => {
       let exact = null, wildcard = null;
@@ -885,12 +877,24 @@ client.on("messageCreate", async (message) => {
     };
     const matchingBlock = pickBlockForUser();
 
-    // Kein passender USER-Block → keine Antwort
-    if (!matchingBlock) return;
+    // Kein passender USER-Block → Non-trigger loggen (wie zuvor) und beenden
+    if (!matchingBlock) {
+      if (!isTrigger) {
+        await setAddUserMessage(message, chatContext);
+      }
+      return;
+    }
 
     // noTrigger: Triggerwort nicht nötig
     const bypassTrigger = matchingBlock.noTrigger === true;
-    if (!bypassTrigger && !isTrigger) return;
+
+    // ✅ Sofort-Log nur, wenn KEIN Turn folgt:
+    // - folgt Turn, wenn (isTrigger || bypassTrigger)
+    // - kein Turn → Non-trigger sofort loggen und beenden
+    if (!(isTrigger || bypassTrigger)) {
+      await setAddUserMessage(message, chatContext);
+      return;
+    }
 
     // Reactions + presence
     await setMessageReaction(message, "⏳");
