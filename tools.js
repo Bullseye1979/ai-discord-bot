@@ -134,6 +134,7 @@ const tools = [
     function: {
       name: "getHistory",
       description:
+        "Use this tool when asked for a summary or when you need information about previous events or dialogs that you can not find in your context."+
         "Summarize this channel's chat history from the database. You pass a SQL WHERE fragment (without the 'WHERE' keyword) " +
         "that filters `context_log`, and a natural-language 'prompt'. The tool will run: " +
         "`SELECT timestamp, role, sender, content FROM context_log WHERE (channel_id = :channel_id) AND (<your where>) ORDER BY timestamp ASC` " +
