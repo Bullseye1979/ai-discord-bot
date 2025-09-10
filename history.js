@@ -1,12 +1,15 @@
-// history.js — unified v5.0
-// READ-ONLY MySQL SELECT over channel history (context_log).
-// - getHistory({ user_prompt, keywords?, window?, match_limit?, start?, end?, chunk_rows?, chunk_chars?, model?, max_tokens?, log_hint? })
-//   * Wenn timeframe (start/end) fehlt → gesamte History mit Chunking verarbeiten
-//   * Keywords (AND) → Treffer + ±window Rows (selber Kanal) → "keyword digest"
-//   * Timeframe/Full-History → Seitenweise lesen, lokal chunken, pro Chunk user_prompt ausführen → partials → Merge
-//   * Wenn beides vorhanden → beide Stränge zusammenführen (final merge)
-// - Kein Schreiben; nur SELECT (dateStrings=true)
-// - Umfangreiche Logs mit txId
+// history.js — search windows + timeframe analyzer v6.0
+// - getTimeframes({ keywords[], around_seconds?, merge_gap_seconds?, match_limit?, log_hint? })
+//   RETURNS a JSON string: { windows: [{ start, end, hits, sample }], total_matches }
+// - getHistory({ user_prompt, start?, end?, chunk_rows?, chunk_chars?, model?, max_tokens?, log_hint? })
+//   Loads the timeframe (or FULL history if start/end omitted) in pages, locally chunks (rows/chars),
+//   runs user_prompt per chunk via LLM, and merges partials to ONE final answer.
+//
+// ENV (optional):
+//   TIMEFRAME_CHUNK_CHARS (default 15000)
+//   TIMEFRAME_CHUNK_ROWS  (default 500)
+//   TIMEFRAME_MODEL       (default "gpt-4.1")
+//   TIMEFRAME_TOKENS      (default 1200)
 
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
@@ -15,7 +18,6 @@ const Context = require("./context.js");
 
 let pool = null;
 
-/** Returns a singleton MySQL pool (dateStrings=true). */
 async function getPool() {
   if (!pool) {
     pool = mysql.createPool({
@@ -49,17 +51,22 @@ function resolveChannelId(ctxOrUndefined, runtime, args) {
   );
 }
 
-/** Safe AND tokenization for keywords (min length 2). */
+/** Normalize keywords (AND semantics) */
 function normalizeKeywords(arr) {
   if (!Array.isArray(arr)) return [];
   return [...new Set(arr.map((s) => String(s || "").trim().toLowerCase()).filter((s) => s.length >= 2))];
 }
 
-/** Formats rows -> text lines with timestamps. */
+function toIso(tsStr) {
+  // DB liefert "YYYY-MM-DD HH:MM:SS" (UTC oder Server-Zeit). Wir behandeln es wie UTC.
+  return new Date(tsStr.replace(" ", "T") + "Z").toISOString();
+}
+
+/** rows → single digest text */
 function rowsToText(rows) {
   return (rows || [])
     .map((r) => {
-      const ts = r.timestamp ? new Date(r.timestamp.replace(" ", "T") + "Z").toISOString() : "";
+      const ts = r.timestamp ? toIso(r.timestamp) : "";
       const who = (r.sender || r.role || "unknown").trim();
       const role = (r.role || "").trim().toLowerCase();
       const prefix = role && who && role !== who ? `${role}/${who}` : who || role || "unknown";
@@ -69,7 +76,7 @@ function rowsToText(rows) {
     .join("\n");
 }
 
-/** Dedup by (timestamp, role, sender, content). */
+/** Dedup rows by a composite key */
 function dedupRows(rows) {
   const seen = new Set();
   const out = [];
@@ -83,81 +90,109 @@ function dedupRows(rows) {
   return out;
 }
 
-/* ----------------------------- Core SELECTs ----------------------------- */
+/* ----------------------------- getTimeframes ----------------------------- */
 
-async function selectKeywordWindows(db, channelId, keywords, window, matchLimit, tag) {
-  const clause = keywords.map(() => "content LIKE ?").join(" AND ");
-  const likeVals = keywords.map((t) => `%${t}%`);
+async function getTimeframes(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
+  const tag = `getTimeframes#${txid()}`;
+  try {
+    const args = typeof toolFunction.arguments === "string"
+      ? JSON.parse(toolFunction.arguments || "{}")
+      : (toolFunction.arguments || {});
 
-  const sql = `SELECT id, timestamp, role, sender, content
-                 FROM context_log
-                WHERE channel_id = ? AND ${clause}
-            ORDER BY timestamp ASC
-                LIMIT ?`;
+    const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
+    const keywords  = normalizeKeywords(args.keywords || []);
+    const aroundSec = Number.isFinite(Number(args.around_seconds)) ? Math.max(1, Math.floor(Number(args.around_seconds))) : 900;  // 15 min
+    const mergeGap  = Number.isFinite(Number(args.merge_gap_seconds)) ? Math.max(0, Math.floor(Number(args.merge_gap_seconds))) : 300; // 5 min
+    const matchLim  = Number.isFinite(Number(args.match_limit)) ? Math.max(1, Math.floor(Number(args.match_limit))) : 100;
 
-  console.log(`[history][${tag}:matchSQL]`, JSON.stringify({ sql: sql.replace(/\s+/g, " "), values: [channelId, ...likeVals, matchLimit] }, null, 2));
-  const t0 = Date.now();
-  const [matchRows] = await db.execute(sql, [channelId, ...likeVals, matchLimit]);
-  const dur = `${Date.now() - t0}ms`;
-  console.log(`[history][${tag}:matchRES]`, JSON.stringify({
-    rowCount: matchRows?.length || 0,
-    dur,
-    first: JSON.stringify(matchRows?.[0] || {}),
-    last: JSON.stringify(matchRows && matchRows.length ? matchRows[matchRows.length - 1] : {})
-  }, null, 2));
+    if (!channelId) return JSON.stringify({ error: "channel_id missing" });
+    if (!keywords.length) return JSON.stringify({ error: "No keywords provided" });
 
-  if (!matchRows || matchRows.length === 0) return "";
+    console.log(`[timeframes][${tag}:args]`, JSON.stringify({
+      log_hint: args.log_hint || "",
+      channelId, keywords, aroundSec, mergeGap, matchLim
+    }, null, 2));
 
-  async function fetchWindow(ts) {
-    const [prev] = await db.execute(
-      `SELECT id, timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id = ? AND timestamp < ?
-     ORDER BY timestamp DESC
-        LIMIT ?`,
-      [channelId, ts, window]
-    );
-    const [center] = await db.execute(
-      `SELECT id, timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id = ? AND timestamp = ?
-     ORDER BY timestamp ASC
-        LIMIT 1`,
-      [channelId, ts]
-    );
-    const [next] = await db.execute(
-      `SELECT id, timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id = ? AND timestamp > ?
-     ORDER BY timestamp ASC
-        LIMIT ?`,
-      [channelId, ts, window]
-    );
-    const prevAsc = [...prev].reverse();
-    return [...prevAsc, ...center, ...next];
+    const db = await getPool();
+
+    const clause = keywords.map(() => "content LIKE ?").join(" AND ");
+    const likeVals = keywords.map(k => `%${k}%`);
+    const sql = `SELECT id, timestamp, role, sender, content
+                   FROM context_log
+                  WHERE channel_id = ? AND ${clause}
+              ORDER BY timestamp ASC
+                  LIMIT ?`;
+    const t0 = Date.now();
+    const [rows] = await db.execute(sql, [channelId, ...likeVals, matchLim]);
+    const dur = `${Date.now() - t0}ms`;
+
+    console.log(`[timeframes][${tag}:matchSQL]`, JSON.stringify({
+      sql: sql.replace(/\s+/g, " "),
+      values: [channelId, ...likeVals, matchLim]
+    }, null, 2));
+    console.log(`[timeframes][${tag}:matchRES]`, JSON.stringify({
+      rowCount: rows?.length || 0,
+      dur,
+      first: rows?.[0] ? { id: rows[0].id, timestamp: rows[0].timestamp } : {},
+      last: rows?.length ? { id: rows[rows.length - 1].id, timestamp: rows[rows.length - 1].timestamp } : {}
+    }, null, 2));
+
+    if (!rows || rows.length === 0) {
+      return JSON.stringify({ windows: [], total_matches: 0 });
+    }
+
+    // Baue Roh-Fenster
+    const secs = (s) => s * 1000;
+    const rawWindows = rows.map(r => {
+      const t = new Date(r.timestamp.replace(" ", "T") + "Z").getTime();
+      return {
+        startMs: t - secs(aroundSec),
+        endMs:   t + secs(aroundSec),
+        hits:    1,
+        sample:  `[${toIso(r.timestamp)}] ${(r.sender || r.role || "unknown")}: ${String(r.content || "").slice(0, 140)}`
+      };
+    });
+
+    // Mergen (überlappende/nahe Fenster)
+    rawWindows.sort((a, b) => a.startMs - b.startMs);
+    const merged = [];
+    for (const w of rawWindows) {
+      if (!merged.length) { merged.push({ ...w }); continue; }
+      const last = merged[merged.length - 1];
+      if (w.startMs <= last.endMs + secs(mergeGap)) {
+        last.endMs = Math.max(last.endMs, w.endMs);
+        last.hits += w.hits;
+        // sample behalten (erstes)
+      } else {
+        merged.push({ ...w });
+      }
+    }
+
+    const out = {
+      windows: merged.map(w => ({
+        start: new Date(w.startMs).toISOString(),
+        end:   new Date(w.endMs).toISOString(),
+        hits:  w.hits,
+        sample: w.sample
+      })),
+      total_matches: rows.length
+    };
+
+    console.log(`[timeframes][${tag}:windows]`, JSON.stringify({
+      merged: out.windows.length,
+      total_matches: out.total_matches
+    }, null, 2));
+
+    return JSON.stringify(out);
+  } catch (err) {
+    console.error(`[timeframes][${tag}:ERROR]`, err?.stack || err?.message || String(err));
+    return JSON.stringify({ error: err?.message || String(err) });
   }
-
-  const windows = [];
-  for (const m of matchRows) {
-    // eslint-disable-next-line no-await-in-loop
-    const w = await fetchWindow(m.timestamp);
-    windows.push(w);
-  }
-
-  const merged = dedupRows(windows.flat()).sort((a, b) =>
-    a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0
-  );
-
-  const digest = rowsToText(merged);
-  console.log(`[history][${tag}:keywordDigest]`, JSON.stringify({
-    lines: digest ? digest.split("\n").length : 0,
-    chars: digest.length
-  }, null, 2));
-  return digest || "";
 }
 
+/* ----------------------------- getHistory (timeframe/full + chunking) ----------------------------- */
+
 async function iterateHistoryChunks(db, channelId, start, end, CHUNK_ROWS, CHUNK_CHARS, tag) {
-  // page-by-id (no huge offsets)
   let lastId = 0;
   const pageSize = Math.max(2000, CHUNK_ROWS * 2);
 
@@ -170,8 +205,8 @@ async function iterateHistoryChunks(db, channelId, start, end, CHUNK_ROWS, CHUNK
   let bufferRows = [];
   let bufferChars = 0;
 
-  function flushBuffer() {
-    if (bufferRows.length === 0) return;
+  function flush() {
+    if (!bufferRows.length) return;
     const text = rowsToText(bufferRows);
     chunkTexts.push(text);
     bufferRows = [];
@@ -196,24 +231,23 @@ async function iterateHistoryChunks(db, channelId, start, end, CHUNK_ROWS, CHUNK
     }, null, 2));
 
     if (!rows || rows.length === 0) {
-      flushBuffer();
+      flush();
       break;
     }
 
     for (const r of rows) {
       const line = rowsToText([r]);
-      const lineLen = line.length + 1;
-      const wouldOverflow = (bufferChars + lineLen > CHUNK_CHARS) || (bufferRows.length + 1 > CHUNK_ROWS);
-      if (wouldOverflow) flushBuffer();
+      const len = line.length + 1;
+      const overflow = (bufferChars + len > CHUNK_CHARS) || (bufferRows.length + 1 > CHUNK_ROWS);
+      if (overflow) flush();
       bufferRows.push(r);
-      bufferChars += lineLen;
+      bufferChars += len;
       lastId = r.id;
     }
-
-    binds[1] = lastId; // id > lastId for next page
+    binds[1] = lastId;
 
     if (rows.length < pageSize) {
-      flushBuffer();
+      flush();
       break;
     }
   }
@@ -227,26 +261,16 @@ async function iterateHistoryChunks(db, channelId, start, end, CHUNK_ROWS, CHUNK
   return chunkTexts;
 }
 
-/* ----------------------------- LLM steps ----------------------------- */
-
-async function runPromptOnChunks(chunks, userPrompt, model, maxTokens, tag, focusHintsText = "") {
+async function runPromptOnChunks(chunks, userPrompt, model, maxTokens, tag) {
   const partials = [];
-
   for (let i = 0; i < chunks.length; i++) {
     const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
-
-    const sysLines = [
+    await ctx.add("system", "history_slice", [
       "You will analyze a slice of chat history from a single Discord channel.",
       "Follow the user's instruction precisely on THIS slice only.",
-      "Keep facts, decisions, tasks (owner/deadline), numbers, URLs/IDs, quotes when relevant.",
+      "Keep facts, decisions, tasks (owner/deadline), numbers, URLs/IDs, and quotes when relevant.",
       "Be concise but complete for this slice."
-    ];
-    if (focusHintsText) {
-      sysLines.push("Focus hints (optional): prioritize events related to the provided focused excerpts.");
-    }
-
-    await ctx.add("system", "history_slice", sysLines.join(" "));
-    if (focusHintsText) await ctx.add("user", "focus_hints", focusHintsText);
+    ].join(" "));
     await ctx.add("user", "instruction", userPrompt);
     await ctx.add("user", "slice", chunks[i]);
 
@@ -262,56 +286,26 @@ async function runPromptOnChunks(chunks, userPrompt, model, maxTokens, tag, focu
       dur
     }, null, 2));
   }
-
   return partials;
 }
 
-async function mergePartialsAndKeyword(partials, keywordSummary, userPrompt, model, maxTokens, tag) {
-  // Wenn es nur eine Quelle gibt, direkt zurück
-  if ((!keywordSummary || !keywordSummary.trim()) && partials.length === 1) {
-    return partials[0] || "No result.";
-  }
-  if ((!keywordSummary || !keywordSummary.trim()) && partials.length > 1) {
-    const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
-    await ctx.add("system", "merge", [
-      "You will merge multiple partial analyses of different slices of a chat history (all from the same channel).",
-      "Combine them into ONE coherent answer that fulfills the original user_prompt.",
-      "Remove duplicates, keep exact facts/timestamps/actors where present, and preserve chronology when it matters."
-    ].join(" "));
-    await ctx.add("user", "user_prompt", userPrompt);
-    await ctx.add("user", "partials", partials.join("\n\n--- PARTIAL ---\n\n"));
-    const t0 = Date.now();
-    const final = await getAI(ctx, Math.max(maxTokens, 1400), model);
-    const dur = `${Date.now() - t0}ms`;
-    console.log(`[history][${tag}:mergePartials]`, JSON.stringify({ dur, len: (final || "").length }, null, 2));
-    return (final || "").trim() || "No merged result.";
-  }
-
-  // Keyword-Zusammenfassung vorhanden → finaler Merge beider Stränge
+async function mergePartials(partials, userPrompt, model, maxTokens, tag) {
+  if (partials.length === 1) return partials[0] || "No result.";
   const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
-  await ctx.add("system", "merge_all", [
-    "You will merge:",
-    " (1) an aggregated summary synthesized from full/timeframed history chunks, and",
-    " (2) a focused summary built from keyword-centered windows.",
-    "Output ONE coherent answer that fulfills the user_prompt.",
-    "Remove duplicates, keep exact facts/timestamps/actors where present, and preserve chronology where relevant."
+  await ctx.add("system", "merge", [
+    "You will merge multiple partial analyses of different slices of a chat history (all from the same channel).",
+    "Combine them into ONE coherent answer that fulfills the original user_prompt.",
+    "Remove duplicates, keep exact facts/timestamps/actors where present, and preserve chronology where it matters."
   ].join(" "));
   await ctx.add("user", "user_prompt", userPrompt);
-  if (partials.length === 1) {
-    await ctx.add("user", "history_synthesis", partials[0]);
-  } else {
-    await ctx.add("user", "history_synthesis", partials.join("\n\n--- PARTIAL ---\n\n"));
-  }
-  await ctx.add("user", "keyword_focus", keywordSummary);
+  await ctx.add("user", "partials", partials.join("\n\n--- PARTIAL ---\n\n"));
 
   const t0 = Date.now();
-  const final = await getAI(ctx, Math.max(maxTokens, 1600), model);
+  const final = await getAI(ctx, Math.max(maxTokens, 1400), model);
   const dur = `${Date.now() - t0}ms`;
-  console.log(`[history][${tag}:mergeFinal]`, JSON.stringify({ dur, len: (final || "").length }, null, 2));
+  console.log(`[history][${tag}:merge]`, JSON.stringify({ dur, len: (final || "").length }, null, 2));
   return (final || "").trim() || "No merged result.";
 }
-
-/* ----------------------------- Unified Tool ----------------------------- */
 
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   const tag = `getHistory#${txid()}`;
@@ -319,16 +313,11 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     const args = typeof toolFunction.arguments === "string"
       ? JSON.parse(toolFunction.arguments || "{}")
       : (toolFunction.arguments || {});
-    const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
+
+    const channelId  = resolveChannelId(ctxOrUndefined, runtime, args);
     const userPrompt = String(args.user_prompt || "").trim();
-
-    const rawKeywords = Array.isArray(args.keywords) ? args.keywords : [];
-    const keywords = normalizeKeywords(rawKeywords);
-    const window = Number.isFinite(Number(args.window)) ? Math.max(0, Math.floor(Number(args.window))) : 10;
-    const matchLimit = Number.isFinite(Number(args.match_limit)) ? Math.max(1, Math.floor(Number(args.match_limit))) : 30;
-
-    const start = args.start ? String(args.start).trim() : null;
-    const end   = args.end ? String(args.end).trim() : null;
+    const start      = args.start ? String(args.start).trim() : null;
+    const end        = args.end   ? String(args.end).trim()   : null;
 
     const CHUNK_ROWS = Number.isFinite(Number(args.chunk_rows))
       ? Math.max(50, Math.floor(Number(args.chunk_rows)))
@@ -348,59 +337,23 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     console.log(`[history][${tag}:args]`, JSON.stringify({
       log_hint: args.log_hint || "",
-      channelId, keywords, window, matchLimit, start, end,
-      CHUNK_ROWS, CHUNK_CHARS, MODEL, MAX_TOKENS
+      channelId, start, end, CHUNK_ROWS, CHUNK_CHARS, MODEL, MAX_TOKENS
     }, null, 2));
 
     const db = await getPool();
 
-    // --- (A) Keyword-digest (optional) ---
-    let keywordDigest = "";
-    if (keywords.length) {
-      keywordDigest = await selectKeywordWindows(db, channelId, keywords, window, matchLimit, tag);
-    } else {
-      console.log(`[history][${tag}:keywords] {"skip":"no keywords"}`);
-    }
-
-    // --- (B) Timeframe / Full history chunks ---
-    // Falls kein timeframe angegeben → gesamte History chunken
+    // 1) Zeitfenster laden (oder gesamte History)
     const chunks = await iterateHistoryChunks(db, channelId, start, end, CHUNK_ROWS, CHUNK_CHARS, tag);
     if (!chunks.length) {
-      console.log(`[history][${tag}:noChunks] {"info":"No rows in the selected range/history."}`);
-      // Wenn dennoch ein keywordDigest existiert, antworte zumindest darauf:
-      if (keywordDigest) {
-        console.log(`[history][${tag}:fallbackKeywordOnly] {"info":"Only keyword digest available"}`);
-        const partials = await runPromptOnChunks([keywordDigest], userPrompt, MODEL, MAX_TOKENS, `${tag}:kwOnly`, "");
-        return partials[0] || "No result.";
-      }
+      console.log(`[history][${tag}:empty] {"info":"No data in range/full history."}`);
       return "No data.";
     }
 
-    // --- (C) Pro Chunk prompten (optional mit Focus-Hinweisen aus KeywordDigest, aber nur als Hint) ---
-    const focusHints = keywordDigest ? keywordDigest.slice(0, 3000) : "";
-    const partials = await runPromptOnChunks(chunks, userPrompt, MODEL, MAX_TOKENS, tag, focusHints);
+    // 2) Prompt pro Chunk
+    const partials = await runPromptOnChunks(chunks, userPrompt, MODEL, MAX_TOKENS, tag);
 
-    // --- (D) Optional: KeywordDigest separat verdichten ---
-    let keywordSummary = "";
-    if (keywordDigest) {
-      const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
-      await ctx.add("system", "keyword_focus", [
-        "You will summarize focused excerpts around keyword matches.",
-        "Produce a concise synthesis relevant to the user's instruction."
-      ].join(" "));
-      await ctx.add("user", "user_prompt", userPrompt);
-      await ctx.add("user", "focused_excerpts", keywordDigest);
-      const t0 = Date.now();
-      const out = await getAI(ctx, Math.max(MAX_TOKENS, 800), MODEL);
-      const dur = `${Date.now() - t0}ms`;
-      keywordSummary = (out || "").trim();
-      console.log(`[history][${tag}:keywordSummary]`, JSON.stringify({ lenIn: keywordDigest.length, lenOut: keywordSummary.length, dur }, null, 2));
-    } else {
-      console.log(`[history][${tag}:keywordSummary] {"skip":"no digest"}`);
-    }
-
-    // --- (E) Final Merge ---
-    const final = await mergePartialsAndKeyword(partials, keywordSummary, userPrompt, MODEL, MAX_TOKENS, tag);
+    // 3) Merge → final
+    const final = await mergePartials(partials, userPrompt, MODEL, MAX_TOKENS, tag);
     return final || "No result.";
   } catch (err) {
     console.error(`[history][${tag}:ERROR]`, err?.stack || err?.message || String(err));
@@ -408,4 +361,4 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
   }
 }
 
-module.exports = { getHistory };
+module.exports = { getTimeframes, getHistory };

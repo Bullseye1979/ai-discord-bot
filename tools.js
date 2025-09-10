@@ -1,9 +1,12 @@
-// tools.js — unified history tool v3.1
-// - Eine Funktion: getHistory
-// - Nimmt optional: keywords[] + window + match_limit
-// - Nimmt optional: start/end (Timeframe); fehlt der Timeframe -> gesamte History (mit Chunking)
-// - user_prompt ist Pflicht: darauf wird der gesamte Prozess ausgerichtet
-// - Liefert einen einzigen finalen Text als Antwort (kein JSON-Objekt), damit das Modell direkt damit arbeiten kann
+// tools.js — search→zoom flow v2.0 (angepasst)
+// - getTimeframes: Liefert gemergte Zeitfenster (start/end) für AND-Suchbegriffe.
+// - getHistory:    Analysiert einen Timeframe ODER die gesamte History (falls start/end fehlen) via Chunking + LLM.
+//
+// Rückgaben:
+// - getTimeframes: JSON-String { windows: [{start, end, hits, sample}], total_matches }
+// - getHistory:    Ein einzelner Text (finale Antwort)
+//
+// Channel-Scoping und Sicherheitsfilter passieren in history.js (serverseitig).
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -12,60 +15,80 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { getHistory } = require("./history.js"); // ← vereinheitlicht
+
+// ✨ Neu:
+const { getTimeframes, getHistory } = require("./history.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
 
 const tools = [
+  // ---- Neu: getTimeframes ---------------------------------------------------
+  {
+    type: "function",
+    function: {
+      name: "getTimeframes",
+      description:
+        "Search the channel history for AND-matched keywords and return MERGED time windows around each hit. " +
+        "Use this first to discover relevant time ranges. Then call getHistory with a selected window and a user_prompt.",
+      parameters: {
+        type: "object",
+        properties: {
+          keywords: {
+            type: "array",
+            description: "List of keywords (AND). Min token length = 2.",
+            items: { type: "string" }
+          },
+          around_seconds: {
+            type: "number",
+            description: "Seconds before/after each hit to expand the window (default 900 = 15 min)."
+          },
+          merge_gap_seconds: {
+            type: "number",
+            description: "Merge windows whose gap is <= this value (default 300 = 5 min)."
+          },
+          match_limit: {
+            type: "number",
+            description: "Max matched rows to consider/expand (default 100)."
+          },
+          log_hint: {
+            type: "string",
+            description: "Optional text to appear in server logs for debugging."
+          }
+        },
+        required: ["keywords"]
+      }
+    }
+  },
+
+  // ---- Neu: getHistory (Timeframe/Full + Chunking) -------------------------
   {
     type: "function",
     function: {
       name: "getHistory",
       description:
-        "Query the channel’s history from MySQL and answer a user_prompt. " +
-        "You may provide keywords (AND matching; with ±window rows around each hit) and/or a timeframe (start/end). " +
-        "If no timeframe is provided, the entire history is processed using chunking. " +
-        "The tool merges the keyword-focused result and the timeframe/full-history result into ONE final answer.",
+        "Analyze a timeframe — or the entire channel if no 'start'/'end' is given — with chunking and return a single final answer. " +
+        "Provide a clear user_prompt describing what to extract/summarize from the selected history slice.",
       parameters: {
         type: "object",
         properties: {
-          // --- Core ---
-          user_prompt: { type: "string", description: "Instruction/question to apply to the retrieved history." },
+          user_prompt: { type: "string", description: "Instruction/question to apply to the selected history slice." },
+          start: { type: "string", description: "Inclusive lower bound timestamp (MySQL DATETIME or ISO). Optional." },
+          end:   { type: "string", description: "Inclusive upper bound timestamp (MySQL DATETIME or ISO). Optional." },
 
-          // --- Keywords block (optional) ---
-          keywords: {
-            type: "array",
-            description: "List of keyword tokens (AND match). Min length per token = 2.",
-            items: { type: "string" }
-          },
-          window: {
-            type: "number",
-            description: "Rows before and after each keyword match (default 10)."
-          },
-          match_limit: {
-            type: "number",
-            description: "Maximum number of keyword matches to expand (default 30)."
-          },
+          // Optional tuning
+          chunk_rows:  { type: "number", description: "Max rows per chunk (default env TIMEFRAME_CHUNK_ROWS or 500; min 50)." },
+          chunk_chars: { type: "number", description: "Soft cap characters per chunk (default env TIMEFRAME_CHUNK_CHARS or 15000; min 1000)." },
+          model:       { type: "string", description: "Model for per-chunk and merge steps (default env TIMEFRAME_MODEL or 'gpt-4.1')." },
+          max_tokens:  { type: "number", description: "Max tokens per step (default env TIMEFRAME_TOKENS or 1200; min 256)." },
 
-          // --- Timeframe block (optional) ---
-          start: { type: "string", description: "Inclusive lower bound (MySQL DATETIME or ISO). If omitted with 'end', means open start." },
-          end:   { type: "string", description: "Inclusive upper bound (MySQL DATETIME or ISO). If both start/end omitted → full history." },
-
-          // --- Chunking / model tuning (optional) ---
-          chunk_rows:  { type: "number", description: "Max rows per chunk (default from env TIMEFRAME_CHUNK_ROWS or 500; min 50)." },
-          chunk_chars: { type: "number", description: "Soft cap characters per chunk (default from env TIMEFRAME_CHUNK_CHARS or 15000; min 1000)." },
-          model:       { type: "string", description: "LLM for per-chunk and merge steps (default env TIMEFRAME_MODEL or 'gpt-4.1')." },
-          max_tokens:  { type: "number", description: "Max tokens for per-chunk and merge steps (default env TIMEFRAME_TOKENS or 1200; min 256)." },
-
-          // --- Diagnostics (optional) ---
-          log_hint: { type: "string", description: "Optional free-form string to help identify the call in logs." }
+          log_hint: { type: "string", description: "Optional text to appear in server logs for debugging." }
         },
         required: ["user_prompt"]
       }
     }
   },
 
-  // andere Tools unverändert (falls im Channel genutzt)
+  // ---- Bestehende Tools (unverändert) --------------------------------------
   {
     type: "function",
     function: {
@@ -215,7 +238,11 @@ const tools = [
 // ---- Runtime registry (implementation functions) ----------------------------
 
 const fullToolRegistry = {
-  getHistory,      // ← unified
+  // ✨ Neu:
+  getTimeframes,
+  getHistory,
+
+  // Bestand:
   getWebpage,
   getImage,
   getGoogle,
@@ -230,11 +257,8 @@ function normalizeToolName(name) {
   if (!name) return "";
   const raw = String(name).trim();
   if (!raw) return "";
-  // Legacy aliases (falls noch irgendwo konfiguriert)
-  if (raw.toLowerCase() === "gettimeframe") return "getHistory";
-  if (raw.toLowerCase() === "getchannelhistory") return "getHistory";
 
-  // Case-insensitive match
+  // Case-insensitive match to known keys
   const keys = Object.keys(fullToolRegistry);
   const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
   return hit || raw;
@@ -244,9 +268,11 @@ function normalizeToolName(name) {
 function getToolRegistry(toolNames = []) {
   try {
     if (!Array.isArray(toolNames)) {
+      // still return an empty toolset on bad input
       return { tools: [], registry: {} };
     }
 
+    // Normalize names, keep order, drop duplicates
     const seen = new Set();
     const wanted = toolNames
       .map((n) => normalizeToolName(n))
@@ -258,15 +284,18 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
+    // Warn for unknown tools? (Optional: reportError)
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
 
+    // Build callable registry
     const registry = {};
-    for (const name of availableNames) registry[name] = fullToolRegistry[name];
+    for (const name of availableNames) {
+      registry[name] = fullToolRegistry[name];
+    }
 
     return { tools: filteredTools, registry };
-  } catch (err) {
-    // Minimal fallback
+  } catch {
     return { tools: [], registry: {} };
   }
 }
