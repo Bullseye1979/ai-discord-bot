@@ -1,10 +1,8 @@
-// tools.js — refactored v2.0 (single-mode getHistory: WHERE + PROMPT → GPT summary)
-// - getHistory: one mode only. You pass a SQL WHERE (without 'WHERE') and a natural-language 'prompt'.
-//               The tool will SELECT from `context_log` (scoped to the same channel), ORDER BY `timestamp` ASC,
-//               concatenate rows into a digest, then run your prompt over it with GPT-4.1.
-//               Returns only { result }.
-//
-// Other tools unchanged.
+// tools.js — simplified v2.3
+// - Alle bisherigen Tools (Webpage, Image, Google, Youtube, Vision, Location, PDF).
+// - getHistory (keyword-basierte Suche + Kontextfenster, liefert Digest mit Timestamps).
+// - getTimeframe (Zeitfenster ODER gesamte History; Notfall-Chunking; Prompt pro Chunk; Merge).
+// - Keine Summary-Sonderfälle.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -13,10 +11,9 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { getHistory } = require("./history.js");
-const { reportError } = require("./error.js");
+const { getHistory, getTimeframe } = require("./history.js");
 
-// ---- OpenAI tool specs ------------------------------------------------------
+// ---- OpenAI Tool-Spezifikationen -------------------------------------------
 
 const tools = [
   {
@@ -128,35 +125,65 @@ const tools = [
     }
   },
 
-  // ==== getHistory (single mode): WHERE + PROMPT → GPT-4.1 summary (channel-scoped) ====
+  // ==== getHistory (Keywords + Kontextfenster; Digest mit Timestamps) ====
   {
     type: "function",
     function: {
       name: "getHistory",
       description:
-        "Use this tool when asked for a summary or when you need information about previous events or dialogs that you can not find in your context."+
-        "Summarize this channel's chat history from the database. You pass a SQL WHERE fragment (without the 'WHERE' keyword) " +
-        "that filters `context_log`, and a natural-language 'prompt'. The tool will run: " +
-        "`SELECT timestamp, role, sender, content FROM context_log WHERE (channel_id = :channel_id) AND (<your where>) ORDER BY timestamp ASC` " +
-        "(no LIMIT is added), concatenate rows to a digest, and apply GPT-4.1 to your prompt over that digest. " +
-        "Use named parameters in the WHERE via :param and provide them in 'bindings'.",
+        "Fetch channel chat history snippets by KEYWORDS and return a digest of matching lines plus ±window surrounding lines (same channel). " +
+        "Always returns lines with timestamps so you can later zoom in with getTimeframe. " +
+        "Use this when you need quick evidence around specific keywords.",
       parameters: {
         type: "object",
         properties: {
-          where: { type: "string", description: "SQL WHERE fragment for context_log (without 'WHERE'). Example: `timestamp >= :from` AND `role` <> 'system' AND content NOT LIKE '%!summarize%'" },
-          prompt: { type: "string", description: "Natural-language instruction for how to summarize or extract info from the result set." },
-          bindings: {
-            type: "object",
-            description: "Optional named parameter bindings for the WHERE, e.g. { from: '2025-09-01 00:00:00' }"
+          channel_id: { type: "string", description: "Target channel ID. If omitted, runtime/ctx channel is used." },
+          keywords: {
+            type: "array",
+            description: "Keywords for AND-matching against message content (case-insensitive).",
+            items: { type: "string" }
           },
-          user_id: { type: "string", description: "User ID or display name (optional; for attribution/logging only)." }
+          window: {
+            type: "number",
+            description: "Number of surrounding rows before/after each match to include (default 10)."
+          },
+          match_limit: {
+            type: "number",
+            description: "Max number of distinct matches to consider before expanding windows (default 30)."
+          }
         },
-        required: ["where", "prompt"]
+        required: ["keywords"]
       }
     }
   },
 
-  // ==== getPDF (unchanged) ====
+  // ==== getTimeframe (Zeitfenster ODER ganze History; Notfall-Chunking) ====
+  {
+    type: "function",
+    function: {
+      name: "getTimeframe",
+      description:
+        "Fetch rows within a time range (start..end) OR the entire channel history if start/end are omitted, and APPLY the provided user_prompt. " +
+        "Uses emergency chunking: splits the dataset into manageable chunks, runs the prompt per chunk, then merges into a final answer.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Target channel ID. If omitted, runtime/ctx channel is used." },
+          start: { type: "string", description: "Optional start timestamp (ISO/MySQL DATETIME). Omit for full history." },
+          end: { type: "string", description: "Optional end timestamp (ISO/MySQL DATETIME). Omit for full history." },
+          user_prompt: { type: "string", description: "What you want extracted/summarized from the timeframe or whole history." },
+          // Optional tuning:
+          chunk_chars: { type: "number", description: "Soft char cap per chunk (default from env or 15000)." },
+          chunk_rows: { type: "number", description: "Soft row cap per chunk (default from env or 500)." },
+          model: { type: "string", description: "Optional model override for chunk analysis (default gpt-4.1)." },
+          max_tokens: { type: "number", description: "Optional max tokens per chunk analysis (default 1200)." }
+        },
+        required: ["user_prompt"]
+      }
+    }
+  },
+
+  // ==== getPDF (unverändert) ====
   {
     type: "function",
     function: {
@@ -195,7 +222,7 @@ const tools = [
   }
 ];
 
-// ---- Runtime registry (implementation functions) ----------------------------
+// ---- Laufzeit-Registry (Implementierungen) ----------------------------------
 
 const fullToolRegistry = {
   getWebpage,
@@ -205,33 +232,33 @@ const fullToolRegistry = {
   getImageDescription,
   getLocation,
   getPDF,
-  getHistory
+  getHistory,
+  getTimeframe
 };
 
-/** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
+/** Normalisiert Tool-Namen (Alias + Case-insensitive) zur Registry-Key-Form. */
 function normalizeToolName(name) {
   if (!name) return "";
   const raw = String(name).trim();
   if (!raw) return "";
 
-  // Quick alias
-  if (raw.toLowerCase() === "gethistory") return "getHistory";
+  const lower = raw.toLowerCase();
+  if (lower === "gethistory") return "getHistory";
+  if (lower === "gettimeframe") return "getTimeframe";
 
-  // Case-insensitive match to known keys
   const keys = Object.keys(fullToolRegistry);
-  const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
+  const hit = keys.find((k) => k.toLowerCase() === lower);
   return hit || raw;
 }
 
-/** Build a filtered tool list and callable registry for a given allowlist */
+/** Baut gefilterte Tool-Liste + callable Registry für eine Allowlist. */
 function getToolRegistry(toolNames = []) {
   try {
     if (!Array.isArray(toolNames)) {
-      reportError(new Error("toolNames must be an array"), null, "GET_TOOL_REGISTRY_BAD_INPUT", "WARN");
+      console.warn("[GET_TOOL_REGISTRY] toolNames must be an array");
       return { tools: [], registry: {} };
     }
 
-    // Normalize names, keep order, drop duplicates
     const seen = new Set();
     const wanted = toolNames
       .map((n) => normalizeToolName(n))
@@ -243,18 +270,15 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
-    // Warn for unknown tools
     for (const name of wanted) {
       if (!fullToolRegistry[name]) {
-        reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
+        console.warn(`[GET_TOOL_REGISTRY] Unknown tool '${name}'`);
       }
     }
 
-    // Filter OpenAI tool specs to requested/available set
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
 
-    // Build callable registry
     const registry = {};
     for (const name of availableNames) {
       registry[name] = fullToolRegistry[name];
@@ -262,7 +286,7 @@ function getToolRegistry(toolNames = []) {
 
     return { tools: filteredTools, registry };
   } catch (err) {
-    reportError(err, null, "GET_TOOL_REGISTRY", "ERROR");
+    console.error("[GET_TOOL_REGISTRY] ERROR:", err?.message || err);
     return { tools: [], registry: {} };
   }
 }
