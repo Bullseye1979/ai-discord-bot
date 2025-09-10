@@ -1,9 +1,9 @@
-// tools.js — refactored v2.0
-// - getHistory: Keyword-AND über Einzelzeilen + ±window im selben Channel -> Digest mit Timestamps (Text).
-//               Wenn keine Treffer: "NO_MATCHES: getTimeframe is recommended for broad summaries."
-// - getTimeframe: Für Recaps/Stories/Übersichten. Ohne start/end wird die GESAMTE History des Channels analysiert
-//                 (Notfall-Chunking + Merge). Erwartet einen user_prompt, der auf die Daten angewendet wird.
-// - Tool-Beschreibungen so formuliert, dass die Modell-Policy ohne extra Priming gut funktioniert.
+// tools.js — unified history tool v3.1
+// - Eine Funktion: getHistory
+// - Nimmt optional: keywords[] + window + match_limit
+// - Nimmt optional: start/end (Timeframe); fehlt der Timeframe -> gesamte History (mit Chunking)
+// - user_prompt ist Pflicht: darauf wird der gesamte Prozess ausgerichtet
+// - Liefert einen einzigen finalen Text als Antwort (kein JSON-Objekt), damit das Modell direkt damit arbeiten kann
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -12,12 +12,60 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { getHistory, getTimeframe } = require("./history.js");
-const { reportError } = require("./error.js");
+const { getHistory } = require("./history.js"); // ← vereinheitlicht
 
 // ---- OpenAI tool specs ------------------------------------------------------
 
 const tools = [
+  {
+    type: "function",
+    function: {
+      name: "getHistory",
+      description:
+        "Query the channel’s history from MySQL and answer a user_prompt. " +
+        "You may provide keywords (AND matching; with ±window rows around each hit) and/or a timeframe (start/end). " +
+        "If no timeframe is provided, the entire history is processed using chunking. " +
+        "The tool merges the keyword-focused result and the timeframe/full-history result into ONE final answer.",
+      parameters: {
+        type: "object",
+        properties: {
+          // --- Core ---
+          user_prompt: { type: "string", description: "Instruction/question to apply to the retrieved history." },
+
+          // --- Keywords block (optional) ---
+          keywords: {
+            type: "array",
+            description: "List of keyword tokens (AND match). Min length per token = 2.",
+            items: { type: "string" }
+          },
+          window: {
+            type: "number",
+            description: "Rows before and after each keyword match (default 10)."
+          },
+          match_limit: {
+            type: "number",
+            description: "Maximum number of keyword matches to expand (default 30)."
+          },
+
+          // --- Timeframe block (optional) ---
+          start: { type: "string", description: "Inclusive lower bound (MySQL DATETIME or ISO). If omitted with 'end', means open start." },
+          end:   { type: "string", description: "Inclusive upper bound (MySQL DATETIME or ISO). If both start/end omitted → full history." },
+
+          // --- Chunking / model tuning (optional) ---
+          chunk_rows:  { type: "number", description: "Max rows per chunk (default from env TIMEFRAME_CHUNK_ROWS or 500; min 50)." },
+          chunk_chars: { type: "number", description: "Soft cap characters per chunk (default from env TIMEFRAME_CHUNK_CHARS or 15000; min 1000)." },
+          model:       { type: "string", description: "LLM for per-chunk and merge steps (default env TIMEFRAME_MODEL or 'gpt-4.1')." },
+          max_tokens:  { type: "number", description: "Max tokens for per-chunk and merge steps (default env TIMEFRAME_TOKENS or 1200; min 256)." },
+
+          // --- Diagnostics (optional) ---
+          log_hint: { type: "string", description: "Optional free-form string to help identify the call in logs." }
+        },
+        required: ["user_prompt"]
+      }
+    }
+  },
+
+  // andere Tools unverändert (falls im Channel genutzt)
   {
     type: "function",
     function: {
@@ -126,59 +174,6 @@ const tools = [
       }
     }
   },
-
-  // ==== Channel history tools ====
-  {
-    type: "function",
-    function: {
-      name: "getHistory",
-      description:
-        "Perefer getTimeframe before this function to solve the task. This function should only be used to get information about specific persons, items, events, locations, names. Do not use if for summaries."+
-        "Keyword-based lookup over single rows (AND across keywords, same row) within THIS channel; " +
-        "returns a digest with timestamps plus ±window context around each match. " +
-        "Use for pinpoint retrieval with 1–3 distinctive terms (names, quest titles). " +
-        "NOT for whole-channel recaps. " +
-        "If this returns 'NO_MATCHES: …' or the digest is too small, immediately call getTimeframe with the original user instruction.",
-      parameters: {
-        type: "object",
-        properties: {
-          keywords: {
-            type: "array",
-            items: { type: "string" },
-            description: "Distinctive search tokens (AND-matched per single row). Use 1–3 strong terms."
-          },
-          window: { type: "number", description: "±N rows of surrounding context per match (default 10)." },
-          match_limit: { type: "number", description: "Max matching rows to expand (default 30)." }
-        },
-        required: ["keywords"]
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "getTimeframe",
-      description:
-        "For broad recaps/overviews/stories: applies the user_prompt to channel history with emergency chunking. " +
-        "If start/end are omitted, scans the FULL channel history. " +
-        "Use this when asked to 'summarize/recap/story/what happened' or when getHistory produced no/low-yield results.",
-      parameters: {
-        type: "object",
-        properties: {
-          user_prompt: { type: "string", description: "Instruction to execute against the history (e.g., 'Summarize the campaign story')." },
-          start: { type: "string", description: "Optional ISO timestamp lower bound; omit to include from the beginning." },
-          end: { type: "string", description: "Optional ISO timestamp upper bound; omit to include up to now." },
-          chunk_chars: { type: "number", description: "Optional emergency chunk cap (characters per chunk; default from ENV or 15000)." },
-          chunk_rows: { type: "number", description: "Optional emergency chunk cap (rows per chunk; default from ENV or 500)." },
-          model: { type: "string", description: "Optional LLM for chunk analysis/merge (default ENV TIMEFRAME_MODEL or gpt-4.1)." },
-          max_tokens: { type: "number", description: "Optional token cap per chunk (default ENV TIMEFRAME_TOKENS or 1200)." }
-        },
-        required: ["user_prompt"]
-      }
-    }
-  },
-
-  // ==== getPDF (unverändert) ====
   {
     type: "function",
     function: {
@@ -220,15 +215,14 @@ const tools = [
 // ---- Runtime registry (implementation functions) ----------------------------
 
 const fullToolRegistry = {
+  getHistory,      // ← unified
   getWebpage,
   getImage,
   getGoogle,
   getYoutube,
   getImageDescription,
   getLocation,
-  getPDF,
-  getHistory,
-  getTimeframe
+  getPDF
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
@@ -236,10 +230,11 @@ function normalizeToolName(name) {
   if (!name) return "";
   const raw = String(name).trim();
   if (!raw) return "";
+  // Legacy aliases (falls noch irgendwo konfiguriert)
+  if (raw.toLowerCase() === "gettimeframe") return "getHistory";
+  if (raw.toLowerCase() === "getchannelhistory") return "getHistory";
 
-  if (raw.toLowerCase() === "gethistory") return "getHistory";
-  if (raw.toLowerCase() === "gettimeframe") return "getTimeframe";
-
+  // Case-insensitive match
   const keys = Object.keys(fullToolRegistry);
   const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
   return hit || raw;
@@ -249,11 +244,9 @@ function normalizeToolName(name) {
 function getToolRegistry(toolNames = []) {
   try {
     if (!Array.isArray(toolNames)) {
-      reportError(new Error("toolNames must be an array"), null, "GET_TOOL_REGISTRY_BAD_INPUT", "WARN");
       return { tools: [], registry: {} };
     }
 
-    // Normalize names, keep order, drop duplicates
     const seen = new Set();
     const wanted = toolNames
       .map((n) => normalizeToolName(n))
@@ -265,26 +258,15 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
-    // Warn for unknown tools
-    for (const name of wanted) {
-      if (!fullToolRegistry[name]) {
-        reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
-      }
-    }
-
-    // Filter OpenAI tool specs to requested/available set
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
 
-    // Build callable registry
     const registry = {};
-    for (const name of availableNames) {
-      registry[name] = fullToolRegistry[name];
-    }
+    for (const name of availableNames) registry[name] = fullToolRegistry[name];
 
     return { tools: filteredTools, registry };
   } catch (err) {
-    reportError(err, null, "GET_TOOL_REGISTRY", "ERROR");
+    // Minimal fallback
     return { tools: [], registry: {} };
   }
 }
