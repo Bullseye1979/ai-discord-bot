@@ -90,7 +90,7 @@ async function getAI(context, tokenlimit = 4096, model = "gpt-4o") {
   try {
     const aiResponse = await axios.post(OPENAI_API_URL, payload, {
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      timeout: 60000,
+      timeout: 180000,
     });
     const choice = aiResponse?.data?.choices?.[0];
     const content = choice?.message?.content || "";
@@ -124,7 +124,7 @@ async function getAIImage(prompt, size = "1024x1024", model = "dall-e-3") {
           Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           "Content-Type": "application/json",
         },
-        timeout: 60000,
+        timeout: 180000,
       }
     );
 

@@ -1,7 +1,8 @@
-// tools.js — v2.1 (History single-pass + Timeframe search)
-// - getTimeframe: findet Zeitfenster (Start/End) zu Keywords im Channel (±window Nachrichten), merged benachbarte Fenster.
-// - getHistory: lädt Volltext (optional nach timeframe/keywords), EIN großer Digest, EIN LLM-Pass mit user_prompt.
-// - Alle anderen Tools unverändert.
+// tools.js — smart history v2.0
+// - findTimeframes: Keywords -> list of {start,end} windows (channel-scoped), no summarization
+// - getHistory: timeframe-only summarization (no chunking, single LLM pass; full history if no start/end)
+//
+// Unveränderte Tools bleiben erhalten.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -10,7 +11,7 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { getHistory, getTimeframe } = require("./history.js");
+const { findTimeframes, getHistory } = require("./history.js"); // ⬅︎ neu
 const { reportError } = require("./error.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
@@ -21,7 +22,8 @@ const tools = [
     function: {
       name: "getWebpage",
       description:
-        "Fetch a webpage, remove menus/ads/scripts/HTML, then EXECUTE the user_prompt against the cleaned text. Return only the answer and the source URL (no raw text).",
+        "Fetch a webpage, remove menus/ads/scripts/HTML, then EXECUTE the user_prompt against the cleaned text. " +
+        "Return only the answer and the source URL (no raw text).",
       parameters: {
         type: "object",
         properties: {
@@ -37,7 +39,8 @@ const tools = [
     type: "function",
     function: {
       name: "getImage",
-      description: "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
+      description:
+        "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
       parameters: {
         type: "object",
         properties: {
@@ -73,7 +76,8 @@ const tools = [
     function: {
       name: "getYoutube",
       description:
-        "Parse YouTube subtitles (CC), EXECUTE the user_prompt directly against the full transcript (no chunking), and return only the answer and the video URL. Useful for summaries, quote search, scene extraction, etc.",
+        "Parse YouTube subtitles (CC), EXECUTE the user_prompt directly against the full transcript (no chunking), " +
+        "and return only the answer and the video URL. Useful for summaries, quote search, scene extraction, etc.",
       parameters: {
         type: "object",
         properties: {
@@ -122,21 +126,28 @@ const tools = [
     }
   },
 
-  // ==== Timeline tools ====
+  // ==== History (smart) ======================================================
   {
     type: "function",
     function: {
-      name: "getTimeframe",
+      name: "findTimeframes",
       description:
-        "Find timeframes for given keywords within the current channel. For each match, expands ±window messages to create a [start,end] range; merges adjacent/overlapping ranges (merge_gap_minutes). Returns JSON: { timeframes: [{start,end,count}], total_matches }.",
+        "Find relevant timeframes in THIS Discord channel by AND-matching the provided keywords on message content, " +
+        "then expanding each hit to a window of ±N rows (same channel). Returns JSON with merged {start,end} ISO timestamps for each timeframe. " +
+        "Use this to locate episodes (e.g., an arc with 'murphy'), then call getHistory with one of the returned timeframes.",
       parameters: {
         type: "object",
         properties: {
-          keywords: { type: "array", items: { type: "string" }, description: "Keywords (AND). At least one required." },
-          window: { type: "number", description: "Messages before/after each match to include (default 10)." },
-          merge_gap_minutes: { type: "number", description: "Merge ranges if the gap between them is <= this many minutes (default 5)." },
-          match_limit: { type: "number", description: "Optional cap on matched rows before expansion; if omitted, no LIMIT." },
-          channel_id: { type: "string", description: "Optional channel override; usually injected by runtime." }
+          keywords: {
+            type: "array",
+            description: "Keywords to AND-match (min length per token = 2). Example: ['murphy','vampir']",
+            items: { type: "string" }
+          },
+          window: {
+            type: "number",
+            description: "Rows before and after each match to include in the timeframe (default 30)."
+          },
+          channel_id: { type: "string", description: "Channel ID (injected by runtime if omitted)." }
         },
         required: ["keywords"]
       }
@@ -147,38 +158,56 @@ const tools = [
     function: {
       name: "getHistory",
       description:
-        "Load the channel history (optionally filtered by timeframe and/or keywords), build ONE large chronological digest, then execute the user_prompt exactly ONCE on that full text. Returns only the model's answer.",
+        "Summarize THIS Discord channel over a TIMEFRAME using a single LLM pass (no chunking). " +
+        "Provide a 'user_prompt' that states exactly what to produce. " +
+        "If no start/end are provided, the FULL channel history is used — be sure your prompt is precise.",
       parameters: {
         type: "object",
         properties: {
-          user_prompt: { type: "string", description: "Instruction for the summary/QA over the digest.", minLength: 1 },
-          start: { type: "string", description: "Optional ISO timestamp lower bound." },
-          end: { type: "string", description: "Optional ISO timestamp upper bound." },
-          keywords: { type: "array", items: { type: "string" }, description: "Optional AND-filter over content." },
-          model: { type: "string", description: "Optional override model (default gpt-4.1)." },
-          max_tokens: { type: "number", description: "Optional generation cap; output length (default 1600)." },
-          channel_id: { type: "string", description: "Optional channel override; usually injected by runtime." }
+          user_prompt: { type: "string", description: "Exact natural-language instruction for the summarization (required)." },
+          start: { type: "string", description: "ISO timestamp (inclusive) — optional." },
+          end: { type: "string", description: "ISO timestamp (inclusive) — optional." },
+          model: { type: "string", description: "Optional model override (default gpt-4.1 via aiService.js)." },
+          max_tokens: { type: "number", description: "Optional max output tokens (default from aiService.js)." },
+          channel_id: { type: "string", description: "Channel ID (injected by runtime if omitted)." }
         },
         required: ["user_prompt"]
       }
     }
   },
 
-  // ==== getPDF (unverändert) ====
+  // ==== getPDF (unverändert) ================================================
   {
     type: "function",
     function: {
       name: "getPDF",
       description:
-        "Render a PDF from provided HTML and CSS. The CSS defines the design of the PDF. If you do not provide CSS a default style is used. Ensure that everything is correctly escaped for JSON",
+        "Render a PDF from provided HTML and CSS. " +
+        "The CSS defines the design of the PDF. If you do not provide CSS a default style is used. " +
+        "Ensure that everything is correctly escaped for JSON",
       parameters: {
         type: "object",
         properties: {
-          html: { type: "string", description: "Full HTML body content (with or without <html>/<body> wrapper). Required." },
-          css: { type: "string", description: "Optional stylesheet (a default will be used if omitted)." },
-          filename: { type: "string", description: "Optional filename without extension. Will be normalized." },
-          title: { type: "string", description: "Optional <title> for the document head." },
-          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." }
+          html: {
+            type: "string",
+            description: "Full HTML body content (with or without <html>/<body> wrapper). Required."
+          },
+          css: {
+            type: "string",
+            description: "Optional stylesheet (a default will be used if omitted)."
+          },
+          filename: {
+            type: "string",
+            description: "Optional filename without extension. Will be normalized."
+          },
+          title: {
+            type: "string",
+            description: "Optional <title> for the document head."
+          },
+          user_id: {
+            type: "string",
+            description: "Optional: User ID or display name (for logging/attribution)."
+          }
         },
         required: ["html"]
       }
@@ -186,7 +215,7 @@ const tools = [
   }
 ];
 
-// ---- Runtime registry (implementation functions) ----------------------------
+// ---- Runtime registry -------------------------------------------------------
 
 const fullToolRegistry = {
   getWebpage,
@@ -196,8 +225,8 @@ const fullToolRegistry = {
   getImageDescription,
   getLocation,
   getPDF,
-  getTimeframe,
-  getHistory
+  findTimeframes, // ⬅︎ neu
+  getHistory      // ⬅︎ neu (timeframe summarization)
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
@@ -205,8 +234,12 @@ function normalizeToolName(name) {
   if (!name) return "";
   const raw = String(name).trim();
   if (!raw) return "";
+
+  // Quick aliases
+  if (raw.toLowerCase() === "findtimeframes") return "findTimeframes";
   if (raw.toLowerCase() === "gethistory") return "getHistory";
-  if (raw.toLowerCase() === "gettimeframe") return "getTimeframe";
+
+  // Case-insensitive match to known keys
   const keys = Object.keys(fullToolRegistry);
   const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
   return hit || raw;
@@ -220,7 +253,7 @@ function getToolRegistry(toolNames = []) {
       return { tools: [], registry: {} };
     }
 
-    // Normalize names, keep order, drop duplicates
+    // Normalize, keep order, drop duplicates
     const seen = new Set();
     const wanted = toolNames
       .map((n) => normalizeToolName(n))
@@ -232,7 +265,7 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
-    // Warn for unknown tools
+    // Warn for unknown
     for (const name of wanted) {
       if (!fullToolRegistry[name]) {
         reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
@@ -241,12 +274,10 @@ function getToolRegistry(toolNames = []) {
 
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
-
     const registry = {};
     for (const name of availableNames) {
       registry[name] = fullToolRegistry[name];
     }
-
     return { tools: filteredTools, registry };
   } catch (err) {
     reportError(err, null, "GET_TOOL_REGISTRY", "ERROR");
