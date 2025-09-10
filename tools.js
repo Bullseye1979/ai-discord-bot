@@ -1,12 +1,7 @@
-// tools.js — search→zoom flow v2.0 (angepasst)
-// - getTimeframes: Liefert gemergte Zeitfenster (start/end) für AND-Suchbegriffe.
-// - getHistory:    Analysiert einen Timeframe ODER die gesamte History (falls start/end fehlen) via Chunking + LLM.
-//
-// Rückgaben:
-// - getTimeframes: JSON-String { windows: [{start, end, hits, sample}], total_matches }
-// - getHistory:    Ein einzelner Text (finale Antwort)
-//
-// Channel-Scoping und Sicherheitsfilter passieren in history.js (serverseitig).
+// tools.js — v2.1 (History single-pass + Timeframe search)
+// - getTimeframe: findet Zeitfenster (Start/End) zu Keywords im Channel (±window Nachrichten), merged benachbarte Fenster.
+// - getHistory: lädt Volltext (optional nach timeframe/keywords), EIN großer Digest, EIN LLM-Pass mit user_prompt.
+// - Alle anderen Tools unverändert.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -15,87 +10,18 @@ const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-
-// ✨ Neu:
-const { getTimeframes, getHistory } = require("./history.js");
+const { getHistory, getTimeframe } = require("./history.js");
+const { reportError } = require("./error.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
 
 const tools = [
-  // ---- Neu: getTimeframes ---------------------------------------------------
-  {
-    type: "function",
-    function: {
-      name: "getTimeframes",
-      description:
-        "Search the channel history for AND-matched keywords and return MERGED time windows around each hit. " +
-        "Use this first to discover relevant time ranges. Then call getHistory with a selected window and a user_prompt.",
-      parameters: {
-        type: "object",
-        properties: {
-          keywords: {
-            type: "array",
-            description: "List of keywords (AND). Min token length = 2.",
-            items: { type: "string" }
-          },
-          around_seconds: {
-            type: "number",
-            description: "Seconds before/after each hit to expand the window (default 900 = 15 min)."
-          },
-          merge_gap_seconds: {
-            type: "number",
-            description: "Merge windows whose gap is <= this value (default 300 = 5 min)."
-          },
-          match_limit: {
-            type: "number",
-            description: "Max matched rows to consider/expand (default 100)."
-          },
-          log_hint: {
-            type: "string",
-            description: "Optional text to appear in server logs for debugging."
-          }
-        },
-        required: ["keywords"]
-      }
-    }
-  },
-
-  // ---- Neu: getHistory (Timeframe/Full + Chunking) -------------------------
-  {
-    type: "function",
-    function: {
-      name: "getHistory",
-      description:
-        "Analyze a timeframe — or the entire channel if no 'start'/'end' is given — with chunking and return a single final answer. " +
-        "Provide a clear user_prompt describing what to extract/summarize from the selected history slice.",
-      parameters: {
-        type: "object",
-        properties: {
-          user_prompt: { type: "string", description: "Instruction/question to apply to the selected history slice." },
-          start: { type: "string", description: "Inclusive lower bound timestamp (MySQL DATETIME or ISO). Optional." },
-          end:   { type: "string", description: "Inclusive upper bound timestamp (MySQL DATETIME or ISO). Optional." },
-
-          // Optional tuning
-          chunk_rows:  { type: "number", description: "Max rows per chunk (default env TIMEFRAME_CHUNK_ROWS or 500; min 50)." },
-          chunk_chars: { type: "number", description: "Soft cap characters per chunk (default env TIMEFRAME_CHUNK_CHARS or 15000; min 1000)." },
-          model:       { type: "string", description: "Model for per-chunk and merge steps (default env TIMEFRAME_MODEL or 'gpt-4.1')." },
-          max_tokens:  { type: "number", description: "Max tokens per step (default env TIMEFRAME_TOKENS or 1200; min 256)." },
-
-          log_hint: { type: "string", description: "Optional text to appear in server logs for debugging." }
-        },
-        required: ["user_prompt"]
-      }
-    }
-  },
-
-  // ---- Bestehende Tools (unverändert) --------------------------------------
   {
     type: "function",
     function: {
       name: "getWebpage",
       description:
-        "Fetch a webpage, remove menus/ads/scripts/HTML, then EXECUTE the user_prompt against the cleaned text. " +
-        "Return only the answer and the source URL (no raw text).",
+        "Fetch a webpage, remove menus/ads/scripts/HTML, then EXECUTE the user_prompt against the cleaned text. Return only the answer and the source URL (no raw text).",
       parameters: {
         type: "object",
         properties: {
@@ -111,8 +37,7 @@ const tools = [
     type: "function",
     function: {
       name: "getImage",
-      description:
-        "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
+      description: "Generate a high-quality image from a textual prompt. Default size 1024x1024. Do not call if another tool is already creating this same document.",
       parameters: {
         type: "object",
         properties: {
@@ -148,8 +73,7 @@ const tools = [
     function: {
       name: "getYoutube",
       description:
-        "Parse YouTube subtitles (CC), EXECUTE the user_prompt directly against the full transcript (no chunking), " +
-        "and return only the answer and the video URL. Useful for summaries, quote search, scene extraction, etc.",
+        "Parse YouTube subtitles (CC), EXECUTE the user_prompt directly against the full transcript (no chunking), and return only the answer and the video URL. Useful for summaries, quote search, scene extraction, etc.",
       parameters: {
         type: "object",
         properties: {
@@ -197,37 +121,64 @@ const tools = [
       }
     }
   },
+
+  // ==== Timeline tools ====
+  {
+    type: "function",
+    function: {
+      name: "getTimeframe",
+      description:
+        "Find timeframes for given keywords within the current channel. For each match, expands ±window messages to create a [start,end] range; merges adjacent/overlapping ranges (merge_gap_minutes). Returns JSON: { timeframes: [{start,end,count}], total_matches }.",
+      parameters: {
+        type: "object",
+        properties: {
+          keywords: { type: "array", items: { type: "string" }, description: "Keywords (AND). At least one required." },
+          window: { type: "number", description: "Messages before/after each match to include (default 10)." },
+          merge_gap_minutes: { type: "number", description: "Merge ranges if the gap between them is <= this many minutes (default 5)." },
+          match_limit: { type: "number", description: "Optional cap on matched rows before expansion; if omitted, no LIMIT." },
+          channel_id: { type: "string", description: "Optional channel override; usually injected by runtime." }
+        },
+        required: ["keywords"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getHistory",
+      description:
+        "Load the channel history (optionally filtered by timeframe and/or keywords), build ONE large chronological digest, then execute the user_prompt exactly ONCE on that full text. Returns only the model's answer.",
+      parameters: {
+        type: "object",
+        properties: {
+          user_prompt: { type: "string", description: "Instruction for the summary/QA over the digest.", minLength: 1 },
+          start: { type: "string", description: "Optional ISO timestamp lower bound." },
+          end: { type: "string", description: "Optional ISO timestamp upper bound." },
+          keywords: { type: "array", items: { type: "string" }, description: "Optional AND-filter over content." },
+          model: { type: "string", description: "Optional override model (default gpt-4.1)." },
+          max_tokens: { type: "number", description: "Optional generation cap; output length (default 1600)." },
+          channel_id: { type: "string", description: "Optional channel override; usually injected by runtime." }
+        },
+        required: ["user_prompt"]
+      }
+    }
+  },
+
+  // ==== getPDF (unverändert) ====
   {
     type: "function",
     function: {
       name: "getPDF",
       description:
-        "Render a PDF from provided HTML and CSS. " +
-        "The CSS defines the design of the PDF. If you do not provide CSS a default style is used. " +
-        "Ensure that everything is correctly escaped for JSON",
+        "Render a PDF from provided HTML and CSS. The CSS defines the design of the PDF. If you do not provide CSS a default style is used. Ensure that everything is correctly escaped for JSON",
       parameters: {
         type: "object",
         properties: {
-          html: {
-            type: "string",
-            description: "Full HTML body content (with or without <html>/<body> wrapper). Required."
-          },
-          css: {
-            type: "string",
-            description: "Optional stylesheet (a default will be used if omitted)."
-          },
-          filename: {
-            type: "string",
-            description: "Optional filename without extension. Will be normalized."
-          },
-          title: {
-            type: "string",
-            description: "Optional <title> for the document head."
-          },
-          user_id: {
-            type: "string",
-            description: "Optional: User ID or display name (for logging/attribution)."
-          }
+          html: { type: "string", description: "Full HTML body content (with or without <html>/<body> wrapper). Required." },
+          css: { type: "string", description: "Optional stylesheet (a default will be used if omitted)." },
+          filename: { type: "string", description: "Optional filename without extension. Will be normalized." },
+          title: { type: "string", description: "Optional <title> for the document head." },
+          user_id: { type: "string", description: "Optional: User ID or display name (for logging/attribution)." }
         },
         required: ["html"]
       }
@@ -238,18 +189,15 @@ const tools = [
 // ---- Runtime registry (implementation functions) ----------------------------
 
 const fullToolRegistry = {
-  // ✨ Neu:
-  getTimeframes,
-  getHistory,
-
-  // Bestand:
   getWebpage,
   getImage,
   getGoogle,
   getYoutube,
   getImageDescription,
   getLocation,
-  getPDF
+  getPDF,
+  getTimeframe,
+  getHistory
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
@@ -257,8 +205,8 @@ function normalizeToolName(name) {
   if (!name) return "";
   const raw = String(name).trim();
   if (!raw) return "";
-
-  // Case-insensitive match to known keys
+  if (raw.toLowerCase() === "gethistory") return "getHistory";
+  if (raw.toLowerCase() === "gettimeframe") return "getTimeframe";
   const keys = Object.keys(fullToolRegistry);
   const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
   return hit || raw;
@@ -268,7 +216,7 @@ function normalizeToolName(name) {
 function getToolRegistry(toolNames = []) {
   try {
     if (!Array.isArray(toolNames)) {
-      // still return an empty toolset on bad input
+      reportError(new Error("toolNames must be an array"), null, "GET_TOOL_REGISTRY_BAD_INPUT", "WARN");
       return { tools: [], registry: {} };
     }
 
@@ -284,18 +232,24 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
-    // Warn for unknown tools? (Optional: reportError)
+    // Warn for unknown tools
+    for (const name of wanted) {
+      if (!fullToolRegistry[name]) {
+        reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
+      }
+    }
+
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
 
-    // Build callable registry
     const registry = {};
     for (const name of availableNames) {
       registry[name] = fullToolRegistry[name];
     }
 
     return { tools: filteredTools, registry };
-  } catch {
+  } catch (err) {
+    reportError(err, null, "GET_TOOL_REGISTRY", "ERROR");
     return { tools: [], registry: {} };
   }
 }
