@@ -1,4 +1,4 @@
-// history.js — v4.0
+// history.js — v4.1 (verbose logging)
 // READ-ONLY MySQL SELECT over channel history (context_log).
 // - getHistory(keywords, window, match_limit): AND-Matches in context_log + ±window im selben Channel -> Digest mit Timestamps (Text).
 // - getTimeframe({start,end,user_prompt}) ODER gesamte History ohne start/end:
@@ -13,12 +13,65 @@
 //   TIMEFRAME_CHUNK_ROWS  (default 500)
 //   TIMEFRAME_MODEL       (default "gpt-4.1")
 //   TIMEFRAME_TOKENS      (default 1200)
+//   HISTORY_VERBOSE       (default "0") — wenn "1": zusätzliche Detail-Logs in getHistory
 
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
 const Context = require("./context.js");
 
 let pool = null;
+
+/** ---------- Logging helpers (safe, capped) ---------- */
+const VERBOSE = String(process.env.HISTORY_VERBOSE || "0").trim() === "1";
+const PREVIEW_LEN = 300;
+
+function capStr(s, n = PREVIEW_LEN) {
+  try {
+    const str = String(s ?? "");
+    if (str.length <= n) return str;
+    return str.slice(0, n) + "…";
+  } catch {
+    return String(s ?? "");
+  }
+}
+
+function previewValues(arr, maxLen = PREVIEW_LEN) {
+  try {
+    return (arr || []).map((v) => {
+      if (typeof v === "string") {
+        return v.length > maxLen ? v.slice(0, maxLen) + "…" : v;
+      }
+      return v;
+    });
+  } catch {
+    return arr;
+  }
+}
+
+function nowMs() { return Date.now(); }
+function durMs(t0) { return `${Date.now() - t0}ms`; }
+
+function info(tag, obj) {
+  try {
+    console.log(`[history][${tag}]`, JSON.stringify(obj, null, 2));
+  } catch {
+    console.log(`[history][${tag}]`, obj);
+  }
+}
+function warn(tag, obj) {
+  try {
+    console.warn(`[history][WARN][${tag}]`, JSON.stringify(obj, null, 2));
+  } catch {
+    console.warn(`[history][WARN][${tag}]`, obj);
+  }
+}
+function err(tag, e) {
+  try {
+    console.error(`[history][ERROR][${tag}]`, e?.message || e);
+  } catch {
+    console.error(`[history][ERROR][${tag}]`, e);
+  }
+}
 
 /** Returns a singleton MySQL pool (dateStrings=true). */
 async function getPool() {
@@ -33,6 +86,7 @@ async function getPool() {
       charset: "utf8mb4",
       dateStrings: true,
     });
+    info("pool", { created: true, dateStrings: true });
   }
   return pool;
 }
@@ -86,36 +140,63 @@ function dedupRows(rows) {
 /* ----------------------------- getHistory (keywords + window) ----------------------------- */
 
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
+  const runId = Math.random().toString(36).slice(2, 8);
+  const tStart = nowMs();
   try {
     const args = typeof toolFunction.arguments === "string"
       ? JSON.parse(toolFunction.arguments || "{}")
       : (toolFunction.arguments || {});
+
     const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
-    if (!channelId) return "ERROR: channel_id missing (context/runtime/args).";
-
     const keywords = normalizeKeywords(args.keywords || []);
-    if (!keywords.length) return "No keywords provided (min length 2 per token).";
-
     const window = Number.isFinite(Number(args.window)) ? Math.max(0, Math.floor(Number(args.window))) : 10;
     const matchLimit = Number.isFinite(Number(args.match_limit)) ? Math.max(1, Math.floor(Number(args.match_limit))) : 30;
+
+    info(`getHistory#${runId}:args`, {
+      channelId,
+      keywords,
+      window,
+      matchLimit
+    });
+
+    if (!channelId) {
+      warn(`getHistory#${runId}`, { reason: "channel_id missing (context/runtime/args)" });
+      return "ERROR: channel_id missing (context/runtime/args).";
+    }
+    if (!keywords.length) {
+      warn(`getHistory#${runId}`, { reason: "no keywords" });
+      return "No keywords provided (min length 2 per token).";
+    }
 
     const db = await getPool();
 
     // 1) finde Treffer-Zeiten via AND-LIKE auf content
     const clause = keywords.map(() => "content LIKE ?").join(" AND ");
     const likeVals = keywords.map((t) => `%${t}%`);
-    const [matchRows] = await db.execute(
-      `SELECT id, timestamp, role, sender, content
-         FROM context_log
-        WHERE channel_id = ? AND ${clause}
-     ORDER BY timestamp ASC
-        LIMIT ?`,
-      [channelId, ...likeVals, matchLimit]
-    );
+    const sqlMatch =
+      "SELECT id, timestamp, role, sender, content FROM context_log WHERE channel_id = ? AND " +
+      clause + " ORDER BY timestamp ASC LIMIT ?";
+    const valsMatch = [channelId, ...likeVals, matchLimit];
+
+    const tMatch = nowMs();
+    info(`getHistory#${runId}:matchSQL`, {
+      sql: sqlMatch,
+      values: previewValues(valsMatch),
+    });
+
+    const [matchRows] = await db.execute(sqlMatch, valsMatch);
+    info(`getHistory#${runId}:matchRES`, {
+      rowCount: matchRows?.length || 0,
+      dur: durMs(tMatch),
+      first: capStr(JSON.stringify(matchRows?.[0] || {})),
+      last: capStr(JSON.stringify(matchRows?.[matchRows.length - 1] || {}))
+    });
+
     if (!matchRows || matchRows.length === 0) return "No matches found.";
 
     // 2) Für jeden Treffer: Fenster ±window (per timestamp, gleicher Kanal)
     async function fetchWindow(ts) {
+      const t0 = nowMs();
       const [prev] = await db.execute(
         `SELECT id, timestamp, role, sender, content
            FROM context_log
@@ -141,44 +222,73 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
         [channelId, ts, window]
       );
       const prevAsc = [...prev].reverse();
-      return [...prevAsc, ...center, ...next];
+      const out = [...prevAsc, ...center, ...next];
+
+      if (VERBOSE) {
+        info(`getHistory#${runId}:window`, {
+          ts,
+          prev: prev.length,
+          center: center.length,
+          next: next.length,
+          total: out.length,
+          dur: durMs(t0)
+        });
+      }
+      return out;
     }
 
+    const tWin = nowMs();
     const windows = [];
     for (const m of matchRows) {
       // eslint-disable-next-line no-await-in-loop
       const w = await fetchWindow(m.timestamp);
       windows.push(w);
     }
+    info(`getHistory#${runId}:windows`, {
+      matches: matchRows.length,
+      windows: windows.length,
+      dur: durMs(tWin)
+    });
 
     // 3) mergen + deduplizieren + sortieren
-    const merged = dedupRows(windows.flat()).sort((a, b) =>
+    const merged0 = windows.flat();
+    const merged = dedupRows(merged0).sort((a, b) =>
       a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0
     );
+    info(`getHistory#${runId}:merge`, {
+      before: merged0.length,
+      after_dedup: merged.length
+    });
 
     // 4) Digest (mit Timestamps) für die KI-Weiterverwendung
     const digest = rowsToText(merged);
+    info(`getHistory#${runId}:digest`, {
+      chars: digest.length,
+      lines: (digest.match(/\n/g) || []).length + (digest ? 1 : 0),
+      dur_total: durMs(tStart),
+      preview: capStr(digest, 600)
+    });
+
     return digest || "No content.";
-  } catch (err) {
-    console.error("[getHistory] ERROR:", err?.message || err);
-    return `ERROR: ${err?.message || String(err)}`;
+  } catch (e) {
+    err(`getHistory#${runId}`, e);
+    return `ERROR: ${e?.message || String(e)}`;
   }
 }
 
 /* ----------------------------- getTimeframe (range OR full, with chunking) ----------------------------- */
 
 async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
+  const runId = Math.random().toString(36).slice(2, 8);
+  const tStart = nowMs();
   try {
     const args = typeof toolFunction.arguments === "string"
       ? JSON.parse(toolFunction.arguments || "{}")
       : (toolFunction.arguments || {});
+
     const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
-    if (!channelId) return "ERROR: channel_id missing (context/runtime/args).";
-
     const userPrompt = String(args.user_prompt || "").trim();
-    if (!userPrompt) return "ERROR: user_prompt is required.";
 
-    // optional timeframe (full history if omitted)
     const start = args.start ? String(args.start).trim() : null;
     const end   = args.end ? String(args.end).trim() : null;
 
@@ -195,11 +305,25 @@ async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtim
       ? Math.max(256, Math.floor(Number(args.max_tokens)))
       : Math.max(256, Math.floor(Number(process.env.TIMEFRAME_TOKENS || 1200)));
 
+    info(`getTimeframe#${runId}:args`, {
+      channelId,
+      start: start || null,
+      end: end || null,
+      CHUNK_CHARS,
+      CHUNK_ROWS,
+      MODEL,
+      MAX_TOKENS,
+      userPrompt_preview: capStr(userPrompt, 200)
+    });
+
+    if (!channelId) return "ERROR: channel_id missing (context/runtime/args).";
+    if (!userPrompt) return "ERROR: user_prompt is required.";
+
     const db = await getPool();
 
     // Page-by-id iterieren, um riesige Offsets zu vermeiden
     let lastId = 0;
-    const pageSize = Math.max(2000, CHUNK_ROWS * 2); // mehr als ein Chunk, wir chunking'en lokal
+    const pageSize = Math.max(2000, CHUNK_ROWS * 2); // mehr als ein Chunk, wir chunken lokal
 
     const chunkTexts = [];
     let bufferRows = [];
@@ -209,29 +333,49 @@ async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtim
       if (bufferRows.length === 0) return;
       const text = rowsToText(bufferRows);
       chunkTexts.push(text);
+      info(`getTimeframe#${runId}:flush`, {
+        chunkIndex: chunkTexts.length - 1,
+        bufferRows: bufferRows.length,
+        textChars: text.length
+      });
       bufferRows = [];
       bufferChars = 0;
     }
 
     // Grund-SQL: kanal + id>lastId, optional timeframe, ORDER BY id ASC LIMIT ?
-    const whereParts = ["channel_id = ?","id > ?"];
+    const baseWhere = ["channel_id = ?", "id > ?"];
     const bindBase = [channelId, lastId];
-    if (start) { whereParts.push("timestamp >= ?"); bindBase.push(start); }
-    if (end)   { whereParts.push("timestamp <= ?"); bindBase.push(end); }
+    if (start) { baseWhere.push("timestamp >= ?"); bindBase.push(start); }
+    if (end)   { baseWhere.push("timestamp <= ?"); bindBase.push(end); }
 
-    // Schleife über alle Seiten
+    const sqlPage =
+      `SELECT id, timestamp, role, sender, content
+         FROM context_log
+        WHERE ${baseWhere.join(" AND ")}
+     ORDER BY id ASC
+        LIMIT ?`;
+
+    info(`getTimeframe#${runId}:pageSQL`, {
+      sql: sqlPage,
+      baseValues: previewValues(bindBase),
+      pageSize
+    });
+
+    let pageCount = 0;
     while (true) {
-      const [rows] = await db.execute(
-        `SELECT id, timestamp, role, sender, content
-           FROM context_log
-          WHERE ${whereParts.join(" AND ")}
-       ORDER BY id ASC
-          LIMIT ?`,
-        [...bindBase, pageSize]
-      );
+      const tPage = nowMs();
+      const [rows] = await db.execute(sqlPage, [...bindBase, pageSize]);
+      pageCount++;
+
+      info(`getTimeframe#${runId}:pageRES`, {
+        page: pageCount,
+        rows: rows.length,
+        firstId: rows[0]?.id ?? null,
+        lastId: rows[rows.length - 1]?.id ?? null,
+        dur: durMs(tPage)
+      });
 
       if (!rows || rows.length === 0) {
-        // restlicher Buffer als letzter Chunk
         flushBufferToChunks();
         break;
       }
@@ -242,9 +386,8 @@ async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtim
         const lineLen = line.length + 1;
         const wouldOverflow = (bufferChars + lineLen > CHUNK_CHARS) || (bufferRows.length + 1 > CHUNK_ROWS);
 
-        if (wouldOverflow) {
-          flushBufferToChunks();
-        }
+        if (wouldOverflow) flushBufferToChunks();
+
         bufferRows.push(r);
         bufferChars += lineLen;
         lastId = r.id;
@@ -260,11 +403,17 @@ async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtim
       }
     }
 
+    info(`getTimeframe#${runId}:chunks`, {
+      chunks: chunkTexts.length,
+      dur_build: durMs(tStart)
+    });
+
     if (chunkTexts.length === 0) return "No data in the selected range / history.";
 
     // Pro Chunk user_prompt ausführen → partial results
     const partials = [];
     for (let i = 0; i < chunkTexts.length; i++) {
+      const tChunk = nowMs();
       const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
 
       await ctx.add(
@@ -280,17 +429,33 @@ async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtim
       await ctx.add("user", "instruction", userPrompt);
       await ctx.add("user", "slice", chunkTexts[i]);
 
-      // use getAI directly (history tools shouldn't mutate global context)
       const out = await getAI(ctx, MAX_TOKENS, MODEL);
-      partials.push((out || "").trim());
+      const trimmed = (out || "").trim();
+      partials.push(trimmed);
+
+      info(`getTimeframe#${runId}:aiChunk`, {
+        chunk: i + 1,
+        of: chunkTexts.length,
+        promptChars: userPrompt.length,
+        sliceChars: chunkTexts[i].length,
+        resultChars: trimmed.length,
+        dur: durMs(tChunk),
+        resultPreview: capStr(trimmed, 400)
+      });
     }
 
     // Wenn nur ein Chunk → direkt zurück
     if (partials.length === 1) {
+      info(`getTimeframe#${runId}:final(single)`, {
+        dur_total: durMs(tStart),
+        resultChars: partials[0].length,
+        preview: capStr(partials[0], 600)
+      });
       return partials[0] || "No result.";
     }
 
     // Mehrere Chunks → zusammenführen
+    const tMerge = nowMs();
     const mergeCtx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
     await mergeCtx.add(
       "system",
@@ -305,10 +470,20 @@ async function getTimeframe(toolFunction, ctxOrUndefined, _getAIResponse, runtim
     await mergeCtx.add("user", "partials", partials.join("\n\n--- PARTIAL ---\n\n"));
 
     const final = await getAI(mergeCtx, Math.max(MAX_TOKENS, 1400), MODEL);
-    return (final || "").trim() || "No merged result.";
-  } catch (err) {
-    console.error("[getTimeframe] ERROR:", err?.message || err);
-    return `ERROR: ${err?.message || String(err)}`;
+    const finalTrimmed = (final || "").trim();
+
+    info(`getTimeframe#${runId}:final(merged)`, {
+      dur_merge: durMs(tMerge),
+      dur_total: durMs(tStart),
+      parts: partials.length,
+      resultChars: finalTrimmed.length,
+      preview: capStr(finalTrimmed, 600)
+    });
+
+    return finalTrimmed || "No merged result.";
+  } catch (e) {
+    err(`getTimeframe#${runId}`, e);
+    return `ERROR: ${e?.message || String(e)}`;
   }
 }
 
