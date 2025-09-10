@@ -133,6 +133,7 @@ const tools = [
     function: {
       name: "getHistory",
       description:
+        "Perefer getTimeframe before this function to solve the task. This function should only be used to get information about specific persons, items, events, locations, names."+
         "Keyword-based lookup over single rows (AND across keywords, same row) within THIS channel; " +
         "returns a digest with timestamps plus ±window context around each match. " +
         "Use for pinpoint retrieval with 1–3 distinctive terms (names, quest titles). " +
