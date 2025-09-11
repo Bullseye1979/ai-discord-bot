@@ -240,14 +240,14 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
         "You are given the chat logs from a single Discord channel for a specific timeframe (or full history).",
         "Follow the user instruction precisely. Keep factual details, decisions, tasks (owner & deadline), questions, numbers, URLs/IDs, code refs, and errors.",
         "Preserve chronology when relevant. If information is insufficient, say so briefly.",
-        "Respond in the user's language; prefer German if unsure."
+        "Respond in the user's language; prefer English if unsure."
       ].join(" ")
     );
     await ctx.add("user", "instruction", userPrompt);
     await ctx.add("user", "logs", digest);
 
     const out = await getAI(ctx, maxTokens, model);
-    const result = (out || "").trim() || "Keine Antwort ableitbar.";
+    const result = (out || "").trim() || "No asnwer possible.";
     console.log(`[history][getHistory#${reqId}:done]`, JSON.stringify({ outLen: result.length }, null, 2));
     return result;
   } catch (err) {
