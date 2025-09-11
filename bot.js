@@ -469,7 +469,7 @@ client.on("messageCreate", async (message) => {
         const res = await chatContext.purgeChannelData();
         await reportInfo(
           message.channel,
-          `Purged database for this channel.\n- context_log deleted: **${res.contextDeleted}**\n- summaries deleted: **${res.summariesDeleted}**`,
+          `Purged database for this channel.\n- context_log deleted: **${res.contextDeleted}**\n`,
           "MAINTENANCE"
         );
       } catch (e) {

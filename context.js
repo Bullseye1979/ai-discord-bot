@@ -578,13 +578,12 @@ Output a clear, well-structured summary (bullets/sections allowed).
     try {
       const db = await getPool();
       const [r1] = await db.execute(`DELETE FROM context_log WHERE channel_id=?`, [this.channelId]);
-      const [r2] = await db.execute(`DELETE FROM summaries WHERE channel_id=?`, [this.channelId]);
       this._rebuildSystemOnly();
-      return { contextDeleted: r1?.affectedRows ?? 0, summariesDeleted: r2?.affectedRows ?? 0 };
+      return { contextDeleted: r1?.affectedRows ?? 0 };
     } catch (e) {
       console.error("[PURGE] failed:", e.message);
       this._rebuildSystemOnly();
-      return { contextDeleted: 0, summariesDeleted: 0 };
+      return { contextDeleted: 0 };
     }
   }
 
