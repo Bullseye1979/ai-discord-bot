@@ -254,25 +254,37 @@ async function setBotPresence(
   client,
   activityText = "✅ Ready",
   status = "online",
-  activityType = 4 // Default = CUSTOM
+  activityType = 4 // default: CUSTOM
 ) {
   try {
     if (!client?.user) return;
 
-    // Für CUSTOM (type 4) muss "state" statt "name" verwendet werden
-    const activity =
-      activityType === 4
-        ? { type: 4, state: activityText } // nur Text, kein "Spielt ..."
-        : { type: activityType, name: activityText };
+    let activities = [];
+
+    if (activityType === 4) {
+      // Custom Status
+      activities.push({
+        type: 4,
+        state: activityText,       // <- wichtig!
+        emoji: undefined           // oder { name: "⏳" } wenn du Emoji trennen willst
+      });
+    } else {
+      // Normale Activities (PLAYING, WATCHING, LISTENING …)
+      activities.push({
+        type: activityType,
+        name: activityText
+      });
+    }
 
     await client.user.setPresence({
-      activities: [activity],
-      status,
+      activities,
+      status
     });
   } catch (err) {
     reportError(err, null, "SET_BOT_PRESENCE");
   }
 }
+
 
 
 /** Add user message (attachments included) to context */
