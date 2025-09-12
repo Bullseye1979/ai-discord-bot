@@ -275,6 +275,25 @@ async function setBotPresence(
 }
 
 
+/** Add user message (attachments included) to context */
+async function setAddUserMessage(message, chatContext) {
+  try {
+    const raw = (message?.content || "").trim();
+    if (raw.startsWith("!")) return;
+
+    let content = raw;
+    if (message.attachments?.size > 0) {
+      const links = [...message.attachments.values()].map(a => a.url).join("\n");
+      content = `${links}\n${content}`.trim();
+    }
+
+    const senderName = message.member?.displayName || message.author?.username || "user";
+    await chatContext.add("user", senderName, content);
+  } catch (err) {
+    await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE");
+  }
+}
+
 /** Temp file */
 async function makeTmpFile(ext = ".wav") {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dgpt-"));
