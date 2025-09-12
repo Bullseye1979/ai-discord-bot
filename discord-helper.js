@@ -524,7 +524,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    const makeEmbed = (desc, i, n) => {
+    const makeEmbed = (desc) => {
       const baseName = meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI");
 
       // Datum (englisch, UTC)
@@ -537,21 +537,20 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       const mm  = String(d.getUTCMinutes()).padStart(2, "0");
       const datePart = `${dd} ${mon} ${yr}, ${hh}:${mm} UTC`;
 
-      // Modell am Ende, leicht abgesetzt und in Klammern
-      const modelSuffix = model && String(model).trim() ? `  (${String(model).trim()})` : "";
-
-      const footerText = `${baseName} - ${datePart}${modelSuffix}`;
+      // Modell in Klammern direkt hinter dem Namen
+      const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
+      const footerText = `${baseName}${modelPart} - ${datePart}`;
 
       return {
         color: themeColor,
         author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
         description: desc,
-        timestamp: new Date().toISOString(), // bleibt lokalisiert pro Client (gewollt)
+        timestamp: new Date().toISOString(), // bleibt drin
         footer: { text: footerText }
       };
     };
 
-    const embeds = descChunks.map((d, idx) => makeEmbed(d, idx + 1, descChunks.length));
+    const embeds = descChunks.map((d) => makeEmbed(d));
     if (firstImage?.url && embeds.length) embeds[0].image = { url: firstImage.url };
 
     for (let i = 0; i < embeds.length; i += 10) {
@@ -570,6 +569,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
+
 
 
 
