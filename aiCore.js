@@ -237,7 +237,7 @@ async function getAIResponse(
   model = "gpt-4o",
   apiKey = null,
   options = {},
-  client
+  client = null
 ) {
   let responseMessage = "";
   const pendingUser = options?.pendingUser || null;
@@ -392,7 +392,9 @@ async function getAIResponse(
 
         for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
-          setBotPresence(client, "⌛" + fnName, "online");
+          if (client!=null) {
+           setBotPresence(client, "⌛" + fnName, "online");
+          }
           const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
 
           const replyTool = (content) => {
