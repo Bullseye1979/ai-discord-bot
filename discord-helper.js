@@ -526,9 +526,21 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
 
     const makeEmbed = (desc, i, n) => {
       const baseName = meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI");
-      const modelSuffix = model && String(model).trim() ? ` • Model: ${String(model).trim()}` : "";
-      const partSuffix = n > 1 ? ` — Part ${i}/${n}` : "";
-      const footerText = `${baseName}${modelSuffix}${partSuffix}`;
+
+      // Datum (englisch, UTC)
+      const d = new Date();
+      const mons = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+      const dd  = String(d.getUTCDate()).padStart(2, "0");
+      const mon = mons[d.getUTCMonth()];
+      const yr  = d.getUTCFullYear();
+      const hh  = String(d.getUTCHours()).padStart(2, "0");
+      const mm  = String(d.getUTCMinutes()).padStart(2, "0");
+      const datePart = `${dd} ${mon} ${yr}, ${hh}:${mm} UTC`;
+
+      // Modell am Ende, leicht abgesetzt und in Klammern
+      const modelSuffix = model && String(model).trim() ? `  (${String(model).trim()})` : "";
+
+      const footerText = `${baseName} - ${datePart}${modelSuffix}`;
 
       return {
         color: themeColor,
@@ -558,6 +570,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
+
 
 
 /** TTS-Queueing */
