@@ -310,7 +310,8 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
         pendingUser: pendingUserTurn || null,
         endpoint: effectiveEndpoint,
         noPendingUserInjection: true, // ⬅︎ WICHTIG: nicht erneut in den Arbeitskontext injizieren
-      }
+      }, 
+      client
     );
 
     replyText = (replyText || "").trim();
@@ -701,7 +702,8 @@ client.on("messageCreate", async (message) => {
           pendingUser: pendingUserTurn,
           endpoint: effectiveEndpoint,
           noPendingUserInjection: true // ⬅︎ nicht erneut in den Arbeitskontext injizieren
-        }
+        },
+        client
       );
 
       if (output && String(output).trim()) {

@@ -236,7 +236,8 @@ async function getAIResponse(
   sequenceLimit = 1000,
   model = "gpt-4o",
   apiKey = null,
-  options = {}
+  options = {},
+  client
 ) {
   let responseMessage = "";
   const pendingUser = options?.pendingUser || null;
