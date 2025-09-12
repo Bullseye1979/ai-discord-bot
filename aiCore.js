@@ -19,6 +19,7 @@ const https = require("https");
 const { OPENAI_API_URL } = require("./config.js");
 const Context = require("./context.js");
 const { reportError } = require("./error.js");
+const { setBotPresence } = require("./discord-helper.js");
 
 /** Sanitize 'name' per OpenAI schema; omit for system/tool roles */
 function cleanOpenAIName(role, name) {
@@ -390,6 +391,7 @@ async function getAIResponse(
 
         for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
+          setBotPresence(client, "⌛" + fnName, "online");
           const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
 
           const replyTool = (content) => {
