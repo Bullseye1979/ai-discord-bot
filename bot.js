@@ -323,7 +323,11 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
 
     try {
       const msgShim = { channel: ch };
-      await setReplyAsWebhookEmbed(msgShim, replyText, { botname: channelMeta.botname || "AI" });
+      // ➜ Modell im Embed-Footer anzeigen
+      await setReplyAsWebhookEmbed(msgShim, replyText, {
+        botname: channelMeta.botname || "AI",
+        model: effectiveModel
+      });
     } catch (e) {
       await reportError(e, ch, "VOICE_WEBHOOK_SEND", { emit: "channel" });
       try { await reportInfo(ch, replyText, "FALLBACK"); } catch {}
@@ -707,9 +711,11 @@ client.on("messageCreate", async (message) => {
       );
 
       if (output && String(output).trim()) {
+        // ➜ Modell im Embed-Footer anzeigen
         await setReplyAsWebhookEmbed(message, output, {
           botname: channelMeta.botname,
           color: 0x00b3ff,
+          model: effectiveModel
         });
         await chatContext.add("assistant", channelMeta?.botname || "AI", output);
         await setMessageReaction(message, "✅");
