@@ -250,33 +250,30 @@ async function postSummariesIndividually(channel, summaries, headerPrefix = null
 }
 
 /** Presence */
-async function setBotPresence(client, activityText = "✅ Ready", status = "online", activityType = 0) {
+async function setBotPresence(
+  client,
+  activityText = "✅ Ready",
+  status = "online",
+  activityType = 4 // Default = CUSTOM
+) {
   try {
     if (!client?.user) return;
-    await client.user.setPresence({ activities: [{ name: activityText, type: activityType }], status });
+
+    // Für CUSTOM (type 4) muss "state" statt "name" verwendet werden
+    const activity =
+      activityType === 4
+        ? { type: 4, state: activityText } // nur Text, kein "Spielt ..."
+        : { type: activityType, name: activityText };
+
+    await client.user.setPresence({
+      activities: [activity],
+      status,
+    });
   } catch (err) {
     reportError(err, null, "SET_BOT_PRESENCE");
   }
 }
 
-/** Add user message (attachments included) to context */
-async function setAddUserMessage(message, chatContext) {
-  try {
-    const raw = (message?.content || "").trim();
-    if (raw.startsWith("!")) return;
-
-    let content = raw;
-    if (message.attachments?.size > 0) {
-      const links = [...message.attachments.values()].map(a => a.url).join("\n");
-      content = `${links}\n${content}`.trim();
-    }
-
-    const senderName = message.member?.displayName || message.author?.username || "user";
-    await chatContext.add("user", senderName, content);
-  } catch (err) {
-    await reportError(err, message?.channel, "SET_ADD_USER_MESSAGE");
-  }
-}
 
 /** Temp file */
 async function makeTmpFile(ext = ".wav") {
