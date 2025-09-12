@@ -262,14 +262,13 @@ async function setBotPresence(
     let activities = [];
 
     if (activityType === 4) {
-      // Custom Status
+      // Custom Status → discord.js will trotzdem "name"
       activities.push({
         type: 4,
-        state: activityText,       // <- wichtig!
-        emoji: undefined           // oder { name: "⏳" } wenn du Emoji trennen willst
+        name: activityText,        // ja: hier MUSS "name" stehen
+        emoji: undefined           // oder { name: "⏳" }
       });
     } else {
-      // Normale Activities (PLAYING, WATCHING, LISTENING …)
       activities.push({
         type: activityType,
         name: activityText
