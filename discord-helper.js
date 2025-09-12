@@ -453,7 +453,8 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
 }
 
 /** Reply via webhook as embeds (mit Avatar-Update und Versioning) */
-async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) {
+async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
+  const { botname, color, model } = options || {};
   try {
     if (!aiText || !String(aiText).trim()) return;
 
@@ -467,7 +468,10 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
     const hooks = await hookChannel.fetchWebhooks();
     let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
     if (!hook) {
-      hook = await hookChannel.createWebhook({ name: botname || meta?.botname || "AI", avatar: personaAvatarUrl || undefined });
+      hook = await hookChannel.createWebhook({
+        name: botname || meta?.botname || "AI",
+        avatar: personaAvatarUrl || undefined
+      });
     } else {
       try { await hook.edit({ avatar: personaAvatarUrl }); } catch {}
     }
@@ -479,7 +483,12 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       if (!Array.isArray(list) || list.length === 0) return null;
       const mdImg = list.find(l => l.kind === "md_image"); if (mdImg) return mdImg;
       const withExt = list.find(l => l.isImageExt); if (withExt) return withExt;
-      for (const l of list) { try { const ct = await headContentType(l.url); if (ct && /^image\//i.test(ct)) return l; } catch {} }
+      for (const l of list) {
+        try {
+          const ct = await headContentType(l.url);
+          if (ct && /^image\//i.test(ct)) return l;
+        } catch {}
+      }
       return null;
     })(links);
 
@@ -515,13 +524,20 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
       if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    const makeEmbed = (desc, i, n) => ({
-      color: themeColor,
-      author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
-      description: desc,
-      timestamp: new Date().toISOString(),
-      footer: { text: (meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI")) + (n > 1 ? ` — Part ${i}/${n}` : "") }
-    });
+    const makeEmbed = (desc, i, n) => {
+      const baseName = meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI");
+      const modelSuffix = model && String(model).trim() ? ` • Model: ${String(model).trim()}` : "";
+      const partSuffix = n > 1 ? ` — Part ${i}/${n}` : "";
+      const footerText = `${baseName}${modelSuffix}${partSuffix}`;
+
+      return {
+        color: themeColor,
+        author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
+        description: desc,
+        timestamp: new Date().toISOString(), // bleibt lokalisiert pro Client (gewollt)
+        footer: { text: footerText }
+      };
+    };
 
     const embeds = descChunks.map((d, idx) => makeEmbed(d, idx + 1, descChunks.length));
     if (firstImage?.url && embeds.length) embeds[0].image = { url: firstImage.url };
@@ -542,6 +558,7 @@ async function setReplyAsWebhookEmbed(message, aiText, { botname, color } = {}) 
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
+
 
 /** TTS-Queueing */
 function setEnqueueTTS(guildId, task) {
