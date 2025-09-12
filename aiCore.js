@@ -393,7 +393,7 @@ async function getAIResponse(
         for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
           if (client!=null) {
-           setBotPresence(client, "⌛" + fnName, "online");
+           setBotPresence(client, "⌛ " + fnName, "online");
           }
           const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
 
