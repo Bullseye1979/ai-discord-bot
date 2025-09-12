@@ -526,26 +526,14 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
 
     const makeEmbed = (desc) => {
       const baseName = meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI");
-
-      // Datum (englisch, UTC)
-      const d = new Date();
-      const mons = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-      const dd  = String(d.getUTCDate()).padStart(2, "0");
-      const mon = mons[d.getUTCMonth()];
-      const yr  = d.getUTCFullYear();
-      const hh  = String(d.getUTCHours()).padStart(2, "0");
-      const mm  = String(d.getUTCMinutes()).padStart(2, "0");
-      const datePart = `${dd} ${mon} ${yr}, ${hh}:${mm} UTC`;
-
-      // Modell in Klammern direkt hinter dem Namen
       const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
-      const footerText = `${baseName}${modelPart} - ${datePart}`;
+      const footerText = `${baseName}${modelPart}`; // ⬅️ kein manueller Timestamp mehr
 
       return {
         color: themeColor,
         author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
         description: desc,
-        timestamp: new Date().toISOString(), // bleibt drin
+        timestamp: new Date().toISOString(), // Discord zeigt seinen eigenen, lokalisierten Timestamp
         footer: { text: footerText }
       };
     };
@@ -569,6 +557,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
+
 
 
 
