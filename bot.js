@@ -1,14 +1,6 @@
-// bot.js — refactored v3.17 (v3.16 + API-Endpoint)
-// Änderungen ggü. v3.16:
-// - Neuer HTTP-Endpoint: POST /api/:channelId
-//   * Auth via Bearer-Key aus Channel-Config._API.key (oder channelMeta.api.key, falls discord-helper künftig normalisiert)
-//   * Body: { system?: string, user: string } → Antwort: { reply: string }
-//   * Keine Posts im Discord-Channel; aber Persistenz in context_log (User="API", Assistant="<botname>")
-//   * Teilt sich Persona/Instructions/Summaries/Tools-Kontext mit dem Channel
-//   * API-spezifische Tools/Model/Tokenlimit via _API-Block, sonst Channel-Defaults
-//
-// Bestehender Chat-/Voice-Flow bleibt unverändert (inkl. "immer vor KI-Lauf loggen").
-// Summarize/Cron weiterhin nicht aktiv.
+// bot.js — refactored v3.17.1 (v3.16 + API-Endpoint + Express v3/v4 JSON-Fallback)
+// - Neuer HTTP-Endpoint: POST /api/:channelId (siehe unten)
+// - JSON-Middleware kompatibel für Express v3 (body-parser) und v4+ (express.json)
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -37,6 +29,25 @@ const {
 
 const { reportError, reportInfo, reportWarn } = require("./error.js");
 const { getToolRegistry } = require("./tools.js"); // block toolset
+
+// ---- JSON Middleware Shim (Express v3/v4 Kompatibilität) --------------------
+let bodyParser = null;
+try { bodyParser = require("body-parser"); } catch {}
+function useJson(app, limit = "2mb") {
+  if (!app || typeof app.use !== "function") return;
+  if (typeof express.json === "function") {
+    app.use(express.json({ limit }));
+  } else if (bodyParser && typeof bodyParser.json === "function") {
+    app.use(bodyParser.json({ limit }));
+  } else {
+    // Letzter Ausweg: verständliche Fehlermeldung mit Install-Hinweis
+    throw new Error(
+      "JSON parser middleware not available. Install body-parser (npm i body-parser) " +
+      "or upgrade to Express >= 4, then restart."
+    );
+  }
+}
+// -----------------------------------------------------------------------------
 
 const client = new Client({
   intents: [
@@ -765,17 +776,17 @@ client.once("clientReady", onClientReadyOnce);
 /* =============================================================================
  * HTTP-Server: Static /documents + API
  * =============================================================================
- * Du nutzt bereits einen Express-Server auf Port 3000 für /documents.
- * Wir erweitern ihn um JSON-Parsing, /healthz und den neuen /api/:channelId Endpoint.
+ * Wir nutzen deinen bestehenden Server auf :3000;
+ * JSON-Middleware via useJson() → kompatibel mit Express v3 und v4+.
  */
 
 const expressApp = express();
-expressApp.use(express.json({ limit: "2mb" }));
+useJson(expressApp, "2mb"); // <<<<<<  zentrale Änderung statt express.json(...)
 
 // Health
 expressApp.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// Static /documents (unverändert, nur vorgezogen, damit middleware Reihenfolge passt)
+// Static /documents
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(
   "/documents",
@@ -794,9 +805,9 @@ expressApp.use(
  * Auth: Authorization: Bearer <channel-config._API.key>
  * Body: { system?: string, user: string }
  * Reply: { reply: string }
- * - Persistiert beide Turns in der DB (user="API", assistant="<botname>")
+ * - Persistiert beide Turns (user="API", assistant="<botname>")
  * - Kein Posting in Discord
- * - Teilt Channel-Kontext (Persona/Instructions/Summaries/Tools)
+ * - Teilt Channel-Kontext (Persona/Instructions/Tools)
  */
 expressApp.post("/api/:channelId", async (req, res) => {
   const channelId = String(req.params.channelId || "").trim();
@@ -809,9 +820,9 @@ expressApp.post("/api/:channelId", async (req, res) => {
       return res.status(404).json({ error: "unknown_channel" });
     }
 
-    // _API-Block (heute evtl. noch roh aus JSON) oder künftige Normalisierung channelMeta.api
-    const apiBlock = channelMeta.api || channelMeta._API || channelMeta.Api || null;
-    const enabled = !!(apiBlock && (apiBlock.enabled === true));
+    // _API-Block (normalisiert von discord-helper.getChannelConfig)
+    const apiBlock = channelMeta.api || channelMeta._API || null;
+    const enabled = !!(apiBlock && apiBlock.enabled === true);
     const expectedKey = String(apiBlock?.key || "").trim();
 
     if (!enabled) return res.status(404).json({ error: "api_disabled" });
