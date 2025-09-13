@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.13 (single system prompt + safe catch logging + strip preexisting system msgs)
+// aiCore.js — refactored v2.13b (single system prompt + safe catch logging + strip preexisting system msgs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -11,7 +11,8 @@
 // v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
 // v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
 // v2.12: Merge both system prompts (persona/instructions + UTC) into ONE system message.
-// v2.13: Strip **all preexisting system messages** before injecting our single system; safer catch logging.
+// v2.13b: Strip **all preexisting system messages** before injecting our single system; safer catch logging;
+//         FIX: no duplicate `toolCommits` declaration.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -244,7 +245,7 @@ async function getAIResponse(
   const pendingUser = options?.pendingUser || null;
   const noPendingInject = options?.noPendingUserInjection === true;
 
-  // We will reference these in catch safely (may stay undefined)
+  // Safe refs for catch
   let context;
   let handoverContext;
 
@@ -271,8 +272,6 @@ async function getAIResponse(
       { skipInitialSummaries: true, persistToDB: false }
     );
     handoverContext.messages = [...context_orig.messages];
-
-    const toolRegistry = context.toolRegistry;
 
     // --- Strip ALL preexisting system messages (we inject a single merged one) ---
     context.messages = context.messages.filter(m => m?.role !== "system");
@@ -313,7 +312,9 @@ async function getAIResponse(
       handoverContext.messages.push({ ...msg });
     }
 
+    // Collect tool results to persist
     const toolCommits = []; // { name: fnName, content: string }
+
     let continueResponse = false;
     let sequenceCounter = 0;
 
@@ -461,7 +462,6 @@ async function getAIResponse(
 
     // === Post-commit (NO user commit here) ===
     // Persist tool outputs (assistant/system) with a sensible timestamp base
-    const toolCommits = []; // shadowing removed earlier; we use above variable
     if (toolCommits.length > 0) {
       let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
