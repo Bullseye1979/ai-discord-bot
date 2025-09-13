@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.11 (endpoint override + conditional auth)
+// aiCore.js — refactored v2.12 (single system prompt)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -10,7 +10,7 @@
 // v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
 // v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
 // v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
-//        Added options.noPendingUserInjection to avoid duplicating user content in working copy.
+// v2.12: Merge both system prompts (persona/instructions + UTC) into ONE system message.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -269,25 +269,30 @@ async function getAIResponse(
 
     const toolRegistry = context.toolRegistry;
 
-    // Compose system
+    // ---- Compose exactly ONE system message (persona/instructions + UTC) ----
     try {
       const sysParts = [];
       const priming = loadEnvPriming();
       if (priming) sysParts.push(`General rules:\n${priming}`);
-      if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
-      if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
+
+      if ((context_orig.persona || "").trim()) {
+        sysParts.push(String(context_orig.persona).trim());
+      }
+      if ((context_orig.instructions || "").trim()) {
+        sysParts.push(String(context_orig.instructions).trim());
+      }
+
+      const nowUtc = new Date().toISOString();
+      sysParts.push(
+        `Current UTC time: ${nowUtc} <- Use this time whenever asked. ` +
+        `Translate to the requested location; if none, use your current location.`
+      );
+
       const sysCombined = sysParts.join("\n\n").trim();
       if (sysCombined) {
         context.messages.unshift({ role: "system", content: sysCombined });
       }
     } catch {}
-
-    // Time hint
-    const nowUtc = new Date().toISOString();
-    context.messages.unshift({
-      role: "system",
-      content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
-    });
 
     // Pending user ONLY to working copy if requested (avoid duplicate when bot.js pre-logged)
     if (pendingUser && pendingUser.content && !noPendingInject) {
@@ -392,8 +397,8 @@ async function getAIResponse(
 
         for (const toolCall of toolCalls) {
           const fnName = toolCall?.function?.name;
-          if (client!=null) {
-           setBotPresence(client, "⌛ " + fnName, "online");
+          if (client != null) {
+            setBotPresence(client, "⌛ " + fnName, "online");
           }
           const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
 
