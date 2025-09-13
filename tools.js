@@ -4,7 +4,7 @@
 // - NEU: getToolRegistry() akzeptiert Strings oder Objekt-Items (name / function.name / id)
 
 const { getWebpage } = require("./webpage.js");
-const { getImage } = require("./image.js");
+const { getImage,getImageSD } = require("./image.js");
 const { getGoogle } = require("./google.js");
 const { getYoutube } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
