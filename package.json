@@ -28,7 +28,7 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "uuid": "^11.0.5",
-    "youtube-transcript-plus": "github:ericmmartin/youtube-transcript-plus#v1.1.1"
+    "youtube-transcript-plus": "^1.1.1"
   },
   "optionalDependencies": {
     "@discordjs/opus": "^0.10.0"
