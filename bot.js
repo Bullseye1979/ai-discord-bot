@@ -1,6 +1,7 @@
-// bot.js — refactored v3.17.1 (v3.16 + API-Endpoint + Express v3/v4 JSON-Fallback)
-// - Neuer HTTP-Endpoint: POST /api/:channelId (siehe unten)
-// - JSON-Middleware kompatibel für Express v3 (body-parser) und v4+ (express.json)
+// bot.js — refactored v3.17.2 (API: system→user-merge)
+// - HTTP-Endpoint: POST /api/:channelId
+// - JSON-Middleware via useJson() (Express v3/v4 kompatibel)
+// - API: system-Prompt wird an user-Prompt angehängt (keine extra system message)
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -11,8 +12,6 @@ const crypto = require("crypto");
 const { getAIResponse } = require("./aiCore.js");
 const { joinVoiceChannel, getVoiceConnection } = require("@discordjs/voice");
 const { hasChatConsent, setChatConsent, setVoiceConsent } = require("./consent.js");
-// Cron entfernt
-// const { initCron, reloadCronForChannel } = require("./scheduler.js");
 const Context = require("./context.js");
 const {
   getSpeech,
@@ -28,7 +27,7 @@ const {
 } = require("./discord-helper.js");
 
 const { reportError, reportInfo, reportWarn } = require("./error.js");
-const { getToolRegistry } = require("./tools.js"); // block toolset
+const { getToolRegistry } = require("./tools.js");
 
 // ---- JSON Middleware Shim (Express v3/v4 Kompatibilität) --------------------
 let bodyParser = null;
@@ -40,7 +39,6 @@ function useJson(app, limit = "2mb") {
   } else if (bodyParser && typeof bodyParser.json === "function") {
     app.use(bodyParser.json({ limit }));
   } else {
-    // Letzter Ausweg: verständliche Fehlermeldung mit Install-Hinweis
     throw new Error(
       "JSON parser middleware not available. Install body-parser (npm i body-parser) " +
       "or upgrade to Express >= 4, then restart."
@@ -231,7 +229,7 @@ function resolveEffectiveLLM(channelMeta, matchingBlock) {
   };
 }
 
-/** Voice transcript → AI reply → webhook post → optional TTS (keeps tools; strict busy gate) */
+/** Voice transcript → AI reply (keine Tooländerung hier) */
 async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {
   let ch = null;
   let chatContext = null;
@@ -302,7 +300,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       if (add) chatContext.instructions = (chatContext.instructions || "") + "\n\n" + add;
     } catch {}
 
-    // 🔴 PRE-LOG (invoked voice): immer vor dem KI-Lauf
+    // PRE-LOG
     try {
       if (pendingUserTurn && pendingUserTurn.content) {
         await chatContext.add(
@@ -325,7 +323,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       {
         pendingUser: pendingUserTurn || null,
         endpoint: effectiveEndpoint,
-        noPendingUserInjection: true, // ⬅︎ WICHTIG: nicht erneut in den Arbeitskontext injizieren
+        noPendingUserInjection: true,
       }, 
       client
     );
@@ -339,7 +337,6 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
 
     try {
       const msgShim = { channel: ch };
-      // ➜ Modell im Embed-Footer anzeigen
       await setReplyAsWebhookEmbed(msgShim, replyText, {
         botname: channelMeta.botname || "AI",
         model: effectiveModel
@@ -559,7 +556,6 @@ client.on("messageCreate", async (message) => {
             const bypassTrigger = !!voiceBlock && voiceBlock.noTrigger === true;
             const invoked = !!voiceBlock && (bypassTrigger || firstWordEqualsName(evt.text, TRIGGER));
 
-            // Nicht-invoked → nur loggen und fertig
             if (!invoked) {
               try {
                 await chatContext.add(
@@ -633,14 +629,14 @@ client.on("messageCreate", async (message) => {
     const hasConsent = await hasChatConsent(authorId, baseChannelId);
     if (!hasConsent) return;
 
-    // Pre-log immer, aber ohne Doppel-Logging
+    // Pre-log (non-trigger)
     let preLogged = false;
     if (!isTrigger) {
-      await setAddUserMessage(message, chatContext); // bewährt für non-trigger
+      await setAddUserMessage(message, chatContext);
       preLogged = true;
     }
 
-    // Block selection for typed chat — STRICTLY by user id (with wildcard)
+    // Block selection (typed chat — by user id)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const pickBlockForUser = () => {
       let exact = null, wildcard = null;
@@ -721,13 +717,12 @@ client.on("messageCreate", async (message) => {
         {
           pendingUser: pendingUserTurn,
           endpoint: effectiveEndpoint,
-          noPendingUserInjection: true // ⬅︎ nicht erneut in den Arbeitskontext injizieren
+          noPendingUserInjection: true
         },
         client
       );
 
       if (output && String(output).trim()) {
-        // ➜ Modell im Embed-Footer anzeigen
         await setReplyAsWebhookEmbed(message, output, {
           botname: channelMeta.botname,
           color: 0x00b3ff,
@@ -751,13 +746,12 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// ==== Ready handler (deprecation-safe) ====
+// ==== Ready handler ====
 function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
     setBotPresence(client, "✅ Ready", "online");
-    // Cron entfernt
   } catch (err) {
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }
@@ -776,12 +770,10 @@ client.once("clientReady", onClientReadyOnce);
 /* =============================================================================
  * HTTP-Server: Static /documents + API
  * =============================================================================
- * Wir nutzen deinen bestehenden Server auf :3000;
- * JSON-Middleware via useJson() → kompatibel mit Express v3 und v4+.
  */
 
 const expressApp = express();
-useJson(expressApp, "2mb"); // <<<<<<  zentrale Änderung statt express.json(...)
+useJson(expressApp, "2mb");
 
 // Health
 expressApp.get("/healthz", (_req, res) => res.json({ ok: true }));
@@ -800,7 +792,7 @@ expressApp.use(
   })
 );
 
-// CORS nur für /api/* (vor den Routen einfügen!)
+// CORS nur für /api/*
 expressApp.use((req, res, next) => {
   if (req.path.startsWith("/api/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -835,18 +827,22 @@ expressApp.post("/api/:channelId", async (req, res) => {
       return res.status(404).json({ error: "unknown_channel" });
     }
 
-    // _API-Block (normalisiert von discord-helper.getChannelConfig)
     const apiBlock = channelMeta.api || channelMeta._API || null;
     const enabled = !!(apiBlock && apiBlock.enabled === true);
-    const expectedKey = String(apiBlock?.key || "").trim();
-
     if (!enabled) return res.status(404).json({ error: "api_disabled" });
+
+    const expectedKey = String(apiBlock?.key || "").trim();
     if (!expectedKey || bearer !== expectedKey) return res.status(401).json({ error: "unauthorized" });
 
     const body = req.body || {};
     const systemPrompt = String(body.system || "").trim();
-    const userPrompt = String(body.user || "").trim();
-    if (!userPrompt) return res.status(400).json({ error: "bad_request", message: "Missing 'user' in body." });
+    const userPromptRaw = String(body.user || "").trim();
+    if (!userPromptRaw) return res.status(400).json({ error: "bad_request", message: "Missing 'user' in body." });
+
+    // 👇 NEU: System-Kontext in den User-Prompt einbetten (statt als extra system message)
+    const userPrompt = systemPrompt
+      ? `${userPromptRaw}\n\n[API context]\n${systemPrompt}`
+      : userPromptRaw;
 
     const chatContext = ensureChatContextForChannel(channelId, contextStorage, channelMeta);
 
@@ -860,7 +856,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    // Modell/Tokenlimit/EPM
+    // Modell/Tokenlimit/Endpoint
     const tokenlimit = (() => {
       const raw = apiBlock?.max_tokens ?? channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
       const v = Number(raw);
@@ -884,15 +880,11 @@ expressApp.post("/api/:channelId", async (req, res) => {
       process.env.OPENAI_BASE_URL ||
       "https://api.openai.com/v1";
 
-    // TEMPORÄR: systemPrompt in instructions injizieren (nicht persistieren)
-    const instrBackup = chatContext.instructions;
+    // PRE-LOG (persist): User turn als "API" mit eingebettetem Kontext
+    await chatContext.add("user", "API", userPrompt, Date.now());
+
+    incPresence();
     try {
-      if (systemPrompt) chatContext.instructions = (instrBackup || "") + "\n\n" + systemPrompt;
-
-      // PRE-LOG (persist): User turn als "API"
-      await chatContext.add("user", "API", userPrompt, Date.now());
-
-      incPresence();
       let replyText = await getAIResponse(
         chatContext,
         tokenlimit,
@@ -901,13 +893,12 @@ expressApp.post("/api/:channelId", async (req, res) => {
         effectiveApiKey,
         {
           endpoint: effectiveEndpoint,
-          noPendingUserInjection: true, // wir haben bereits pre-geloggt
+          noPendingUserInjection: true,
         },
         client
       );
       replyText = String(replyText || "").trim();
 
-      // Persistiere Assistant-Turn
       if (replyText) {
         await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
       }
@@ -917,7 +908,6 @@ expressApp.post("/api/:channelId", async (req, res) => {
       await reportError(err, null, "API_ENDPOINT", { emit: "console" });
       return res.status(500).json({ error: "ai_failure", message: String(err?.message || err) });
     } finally {
-      try { chatContext.instructions = instrBackup; } catch {}
       decPresence();
     }
   } catch (err) {
