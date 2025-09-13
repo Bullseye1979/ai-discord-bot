@@ -4,7 +4,9 @@
   "description": "Ein context-aware Discord Bot",
   "main": "bot.js",
   "private": true,
-  "engines": { "node": ">=18.17" },
+  "engines": {
+    "node": ">=18.17"
+  },
   "scripts": {
     "start": "node bot.js",
     "start:pm2": "pm2 start bot.js --name discord-bot",
@@ -27,7 +29,8 @@
     "puppeteer": "^24.2.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "uuid": "^11.0.5"
+    "uuid": "^11.0.5",
+    "youtube-transcript-plus": "^1.1.1"
   },
   "optionalDependencies": {
     "@discordjs/opus": "^0.10.0"
@@ -39,3 +42,5 @@
   "author": "Ralf",
   "license": "MIT"
 }
+
+
