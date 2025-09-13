@@ -1,5 +1,6 @@
-// discord-helper.js — refactored v3.3
+// discord-helper.js — refactored v3.4 (v3.3 + _API-Block Support)
 // Avatar aus Channel-Config-Prompt (+ Persona/Name-Addendum), Cache-Busting, strict channel-only config, safe URLs
+// Neu: getChannelConfig() normalisiert einen _API-Block → { api: { enabled, key, model?, max_tokens?, tools[], toolRegistry{}, apikey?, endpoint? } }
 
 const fs = require("fs");
 const os = require("os");
@@ -113,7 +114,7 @@ async function ensureChannelAvatar(channelId, channelMeta) {
   }
 }
 
-/** Channel-Config ausschließlich aus channel-config/<channelId>.json */
+/** Channel-Config ausschließlich aus channel-config/<channelId>.json (+ _API Normalisierung) */
 function getChannelConfig(channelId) {
   try {
     const configPath = path.join(__dirname, "channel-config", `${channelId}.json`);
@@ -125,7 +126,9 @@ function getChannelConfig(channelId) {
         instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
         max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
-        avatarPrompt: "", imagePrompt: ""
+        avatarPrompt: "", imagePrompt: "",
+        // Neuer API-Block: disabled default
+        api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "" }
       };
     }
 
@@ -171,19 +174,49 @@ function getChannelConfig(channelId) {
     const avatarPrompt = typeof cfg.avatarPrompt === "string" ? cfg.avatarPrompt : "";
     const imagePrompt = typeof cfg.imagePrompt === "string" ? cfg.imagePrompt : "";
 
+    // Channel-Tools normalisieren
     const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
 
+    // Avatar-URL berechnen
     const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
     const avatarUrl = fs.existsSync(avatarPath) ? buildPublicAvatarUrl(channelId, true) : buildPublicAvatarUrl("default", true);
 
     const summariesEnabled = !!String(summaryPrompt || "").trim();
+
+    // ===== NEU: _API-Block normalisieren =====
+    const apiRaw = (cfg._API && typeof cfg._API === "object") ? cfg._API : null;
+    let api = {
+      enabled: false,
+      key: "",
+      model: "",
+      max_tokens: null,
+      tools: [],
+      toolRegistry: {},
+      apikey: "",
+      endpoint: ""
+    };
+    if (apiRaw) {
+      api.enabled = !!apiRaw.enabled;
+      api.key = typeof apiRaw.key === "string" ? apiRaw.key : "";
+      api.model = typeof apiRaw.model === "string" ? apiRaw.model : "";
+      api.max_tokens = Number.isFinite(Number(apiRaw.max_tokens)) ? Math.floor(Number(apiRaw.max_tokens)) : null;
+      api.apikey = typeof apiRaw.apikey === "string" ? apiRaw.apikey : "";
+      api.endpoint = typeof apiRaw.endpoint === "string" ? apiRaw.endpoint : "";
+      // API-Tools separat aufbereiten
+      const apiToolsInput = Array.isArray(apiRaw.tools) ? apiRaw.tools : [];
+      const { registry: apiToolReg, tools: apiTools } = getToolRegistry(apiToolsInput);
+      api.tools = apiTools;
+      api.toolRegistry = apiToolReg;
+    }
 
     return {
       name, botname, voice, persona, avatarUrl, instructions,
       tools: ctxTools, toolRegistry, blocks, summaryPrompt,
       max_user_messages, hasConfig: true, summariesEnabled, admins,
       max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
-      avatarPrompt, imagePrompt
+      avatarPrompt, imagePrompt,
+      // neu
+      api
     };
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
@@ -192,7 +225,8 @@ function getChannelConfig(channelId) {
       instructions: "", tools: [], toolRegistry: {}, blocks: [], summaryPrompt: "",
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
-      avatarPrompt: "", imagePrompt: ""
+      avatarPrompt: "", imagePrompt: "",
+      api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "" }
     };
   }
 }
@@ -283,8 +317,6 @@ async function setBotPresence(
     reportError(err, null, "SET_BOT_PRESENCE");
   }
 }
-
-
 
 /** Add user message (attachments included) to context */
 async function setAddUserMessage(message, chatContext) {
@@ -557,10 +589,6 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
-
-
-
-
 
 /** TTS-Queueing */
 function setEnqueueTTS(guildId, task) {

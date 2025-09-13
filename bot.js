@@ -1,9 +1,14 @@
-// bot.js — refactored v3.16
-// Änderungen ggü. v3.14/v3.15:
-// - Immer VOR dem KI-Lauf loggen (auch bei Trigger/noTrigger-Bypass).
-// - Doppel-Logging verhindert (Flag preLogged).
-// - getAIResponse wird mit { pendingUser, noPendingUserInjection: true } aufgerufen.
-// - Summarize/Cron weiterhin entfernt.
+// bot.js — refactored v3.17 (v3.16 + API-Endpoint)
+// Änderungen ggü. v3.16:
+// - Neuer HTTP-Endpoint: POST /api/:channelId
+//   * Auth via Bearer-Key aus Channel-Config._API.key (oder channelMeta.api.key, falls discord-helper künftig normalisiert)
+//   * Body: { system?: string, user: string } → Antwort: { reply: string }
+//   * Keine Posts im Discord-Channel; aber Persistenz in context_log (User="API", Assistant="<botname>")
+//   * Teilt sich Persona/Instructions/Summaries/Tools-Kontext mit dem Channel
+//   * API-spezifische Tools/Model/Tokenlimit via _API-Block, sonst Channel-Defaults
+//
+// Bestehender Chat-/Voice-Flow bleibt unverändert (inkl. "immer vor KI-Lauf loggen").
+// Summarize/Cron weiterhin nicht aktiv.
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -757,8 +762,20 @@ client.once("clientReady", onClientReadyOnce);
   }
 })();
 
-// Static /documents
+/* =============================================================================
+ * HTTP-Server: Static /documents + API
+ * =============================================================================
+ * Du nutzt bereits einen Express-Server auf Port 3000 für /documents.
+ * Wir erweitern ihn um JSON-Parsing, /healthz und den neuen /api/:channelId Endpoint.
+ */
+
 const expressApp = express();
+expressApp.use(express.json({ limit: "2mb" }));
+
+// Health
+expressApp.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+// Static /documents (unverändert, nur vorgezogen, damit middleware Reihenfolge passt)
 const documentDirectory = path.join(__dirname, "documents");
 expressApp.use(
   "/documents",
@@ -771,4 +788,117 @@ expressApp.use(
     },
   })
 );
+
+/**
+ * API Endpoint: POST /api/:channelId
+ * Auth: Authorization: Bearer <channel-config._API.key>
+ * Body: { system?: string, user: string }
+ * Reply: { reply: string }
+ * - Persistiert beide Turns in der DB (user="API", assistant="<botname>")
+ * - Kein Posting in Discord
+ * - Teilt Channel-Kontext (Persona/Instructions/Summaries/Tools)
+ */
+expressApp.post("/api/:channelId", async (req, res) => {
+  const channelId = String(req.params.channelId || "").trim();
+  const auth = String(req.headers.authorization || "");
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+
+  try {
+    const channelMeta = getChannelConfig(channelId);
+    if (!channelMeta?.hasConfig) {
+      return res.status(404).json({ error: "unknown_channel" });
+    }
+
+    // _API-Block (heute evtl. noch roh aus JSON) oder künftige Normalisierung channelMeta.api
+    const apiBlock = channelMeta.api || channelMeta._API || channelMeta.Api || null;
+    const enabled = !!(apiBlock && (apiBlock.enabled === true));
+    const expectedKey = String(apiBlock?.key || "").trim();
+
+    if (!enabled) return res.status(404).json({ error: "api_disabled" });
+    if (!expectedKey || bearer !== expectedKey) return res.status(401).json({ error: "unauthorized" });
+
+    const body = req.body || {};
+    const systemPrompt = String(body.system || "").trim();
+    const userPrompt = String(body.user || "").trim();
+    if (!userPrompt) return res.status(400).json({ error: "bad_request", message: "Missing 'user' in body." });
+
+    const chatContext = ensureChatContextForChannel(channelId, contextStorage, channelMeta);
+
+    // Tools: API-spezifisch oder Channel-Default
+    if (apiBlock?.tools && Array.isArray(apiBlock.tools) && apiBlock.tools.length > 0) {
+      const { tools: apiTools, registry: apiToolReg } = getToolRegistry(apiBlock.tools);
+      chatContext.tools = apiTools;
+      chatContext.toolRegistry = apiToolReg;
+    } else {
+      chatContext.tools = channelMeta.tools;
+      chatContext.toolRegistry = channelMeta.toolRegistry;
+    }
+
+    // Modell/Tokenlimit/EPM
+    const tokenlimit = (() => {
+      const raw = apiBlock?.max_tokens ?? channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
+      const v = Number(raw);
+      const def = 4096;
+      return Number.isFinite(v) && v > 0 ? Math.max(32, Math.min(8192, Math.floor(v))) : def;
+    })();
+
+    const effectiveModel =
+      (apiBlock?.model && String(apiBlock.model)) ||
+      (channelMeta.model && String(channelMeta.model)) ||
+      "gpt-4o";
+
+    const effectiveApiKey =
+      (apiBlock?.apikey && String(apiBlock.apikey)) ||
+      (channelMeta.apikey && String(channelMeta.apikey)) ||
+      null;
+
+    const effectiveEndpoint =
+      (apiBlock?.endpoint && String(apiBlock.endpoint)) ||
+      (channelMeta.endpoint && String(channelMeta.endpoint)) ||
+      process.env.OPENAI_BASE_URL ||
+      "https://api.openai.com/v1";
+
+    // TEMPORÄR: systemPrompt in instructions injizieren (nicht persistieren)
+    const instrBackup = chatContext.instructions;
+    try {
+      if (systemPrompt) chatContext.instructions = (instrBackup || "") + "\n\n" + systemPrompt;
+
+      // PRE-LOG (persist): User turn als "API"
+      await chatContext.add("user", "API", userPrompt, Date.now());
+
+      incPresence();
+      let replyText = await getAIResponse(
+        chatContext,
+        tokenlimit,
+        /*sequenceLimit*/ 1000,
+        effectiveModel,
+        effectiveApiKey,
+        {
+          endpoint: effectiveEndpoint,
+          noPendingUserInjection: true, // wir haben bereits pre-geloggt
+        },
+        client
+      );
+      replyText = String(replyText || "").trim();
+
+      // Persistiere Assistant-Turn
+      if (replyText) {
+        await chatContext.add("assistant", channelMeta.botname || "AI", replyText, Date.now());
+      }
+
+      return res.json({ reply: replyText });
+    } catch (err) {
+      await reportError(err, null, "API_ENDPOINT", { emit: "console" });
+      return res.status(500).json({ error: "ai_failure", message: String(err?.message || err) });
+    } finally {
+      try { chatContext.instructions = instrBackup; } catch {}
+      decPresence();
+    }
+  } catch (err) {
+    await reportError(err, null, "API_ENDPOINT_FATAL", { emit: "console" });
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
+// Server starten
 expressApp.listen(3000, () => {});
