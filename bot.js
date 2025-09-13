@@ -822,6 +822,9 @@ expressApp.use((req, res, next) => {
  * - Teilt Channel-Kontext (Persona/Instructions/Tools)
  */
 expressApp.post("/api/:channelId", async (req, res) => {
+
+  console.log("[API] ch=", req.params.channelId,"authLen=", String(req.headers.authorization||"").length);
+
   const channelId = String(req.params.channelId || "").trim();
   const auth = String(req.headers.authorization || "");
   const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
