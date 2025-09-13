@@ -288,4 +288,184 @@ async function getImage(toolFunction) {
   }
 }
 
-module.exports = { getImage };
+
+// === Stable Diffusion support =================================================
+
+// Env:
+// - SD_BASE_URL              e.g. http://127.0.0.1:7860  (Automatic1111 WebUI)
+// - SD_NEGATIVE_PROMPT       optional default negative prompt
+// - SD_SAMPLER               e.g. "DPM++ 2M Karras"
+// - SD_STEPS                 integer, default 28
+// - SD_CFG                   float, default 6.5
+// - SD_SEED                  integer or -1 for random, default -1
+// - STABILITY_API_KEY        falls kein SD_BASE_URL: nutzt Stability API (Core)
+// - PUBLIC_BASE_URL          wird bereits in ensureAbsoluteUrl() verwendet
+
+function sizeToWH(size) {
+  const s = String(size || DEFAULT_SIZE);
+  if (s === "1792x1024") return { width: 1792, height: 1024 };
+  if (s === "1024x1792") return { width: 1024, height: 1792 };
+  return { width: 1024, height: 1024 };
+}
+
+async function saveBufferAsPicture(buffer, prompt, contentTypeHint = "image/png") {
+  await fs.mkdir(PICTURES_DIR, { recursive: true });
+  const ext = pickExtFromContentType(contentTypeHint);
+  const slug = safeBaseFromPrompt(prompt);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const rand = crypto.randomBytes(4).toString("hex");
+  const filename = `${slug}-${ts}-${rand}${ext}`;
+  const filePath = path.join(PICTURES_DIR, filename);
+  await fs.writeFile(filePath, buffer);
+  const publicUrl = ensureAbsoluteUrl(`/documents/pictures/${filename}`);
+  return { filename, filePath, publicUrl };
+}
+
+/** Generate image via Automatic1111 WebUI */
+async function generateWithA1111(prompt, size) {
+  const base = (process.env.SD_BASE_URL || "").replace(/\/+$/,"");
+  if (!base) return null;
+
+  const { width, height } = sizeToWH(size);
+  const payload = {
+    prompt,
+    negative_prompt: process.env.SD_NEGATIVE_PROMPT || "",
+    sampler_name: process.env.SD_SAMPLER || "DPM++ 2M Karras",
+    steps: Number(process.env.SD_STEPS || 28),
+    cfg_scale: Number(process.env.SD_CFG || 6.5),
+    seed: Number(process.env.SD_SEED || -1),
+    width,
+    height
+  };
+
+  const url = `${base}/sdapi/v1/txt2img`;
+  const res = await axios.post(url, payload, { timeout: 120000 });
+  const images = res?.data?.images;
+  if (!Array.isArray(images) || images.length === 0) {
+    throw new Error("SD_WEBUI_NO_IMAGE");
+  }
+
+  // images[0] ist Base64 (ohne Prefix)
+  const b64 = images[0];
+  const buf = Buffer.from(b64, "base64");
+  return { buffer: buf, contentType: "image/png", model: "sd-webui" };
+}
+
+/** Generate image via Stability AI (Core) */
+async function generateWithStability(prompt, size) {
+  const key = (process.env.STABILITY_API_KEY || "").trim();
+  if (!key) return null;
+
+  const { width, height } = sizeToWH(size);
+
+  // Stability Core v2beta – binary image response
+  // Ref: https://platform.stability.ai/
+  const apiUrl = "https://api.stability.ai/v2beta/stable-image/generate/core";
+  const form = new URLSearchParams();
+  form.set("prompt", prompt);
+  form.set("output_format", "png");
+  // Manche Pläne erlauben width/height; falls nicht, weglassen oder auf 1024 zwingen:
+  form.set("width", String(width));
+  form.set("height", String(height));
+
+  const res = await axios.post(apiUrl, form.toString(), {
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    responseType: "arraybuffer",
+    timeout: 120000
+  });
+
+  const buf = Buffer.from(res.data);
+  return { buffer: buf, contentType: res.headers["content-type"] || "image/png", model: "stability" };
+}
+
+/**
+ * Tool entry: getImageSD
+ * - erzeugt ein Bild via Stable Diffusion (Automatic1111 oder Stability AI)
+ * - speichert lokal (documents/pictures/…)
+ * - Rückgabe als JSON-String: { ok, url, file, prompt, size, model, error?, code? }
+ */
+async function getImageSD(toolFunction) {
+  const attemptsMeta = [];
+  try {
+    const args = coerceArgs(toolFunction);
+    if (!args.prompt) {
+      return JSON.stringify({ ok: false, error: "Missing 'prompt' after parsing", code: "IMG_INPUT" });
+    }
+
+    const requestedSize = String(args.size || "").trim();
+    const size = VALID_SIZES.has(requestedSize) ? requestedSize : DEFAULT_SIZE;
+
+    // Für SD empfehle ich keinen aggressiven Prompt-Refiner; aber leicht säubern schadet nicht
+    const basePrompt = simplifyForImage(args.prompt);
+
+    // Priorität 1: Automatic1111
+    try {
+      const a1 = await generateWithA1111(basePrompt, size);
+      if (a1) {
+        const saved = await saveBufferAsPicture(a1.buffer, basePrompt, a1.contentType);
+        return JSON.stringify({
+          ok: true,
+          url: saved.publicUrl,
+          file: `/documents/pictures/${saved.filename}`,
+          prompt: basePrompt,
+          size,
+          model: a1.model,
+          attempts: attemptsMeta
+        });
+      }
+    } catch (err) {
+      attemptsMeta.push({
+        backend: "sd-webui",
+        status: "error",
+        code: "IMG_SD_WEBUI",
+        message: err?.message || String(err)
+      });
+      // Fallback auf Stability (wenn key gesetzt)
+    }
+
+    // Priorität 2: Stability
+    try {
+      const st = await generateWithStability(basePrompt, size);
+      if (st) {
+        const saved = await saveBufferAsPicture(st.buffer, basePrompt, st.contentType);
+        return JSON.stringify({
+          ok: true,
+          url: saved.publicUrl,
+          file: `/documents/pictures/${saved.filename}`,
+          prompt: basePrompt,
+          size,
+          model: st.model,
+          attempts: attemptsMeta
+        });
+      }
+    } catch (err) {
+      attemptsMeta.push({
+        backend: "stability",
+        status: "error",
+        code: "IMG_STABILITY",
+        message: err?.message || String(err)
+      });
+    }
+
+    // wenn kein Backend verfügbar/erfolgreich:
+    return JSON.stringify({
+      ok: false,
+      error: "No Stable Diffusion backend available or generation failed",
+      code: "IMG_SD_BACKEND",
+      attempts: attemptsMeta
+    });
+  } catch (err) {
+    return JSON.stringify({
+      ok: false,
+      error: err?.message || "unexpected error",
+      code: "IMG_SD_UNEXPECTED",
+      attempts: attemptsMeta
+    });
+  }
+}
+
+
+module.exports = { getImage, getImageSD };

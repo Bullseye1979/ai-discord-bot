@@ -174,6 +174,28 @@ const tools = [
       }
     }
   },
+  {
+    type: "function",
+    function: {
+      name: "getImageSD",
+      description:
+        "Generate an image via Stable Diffusion (Automatic1111 if SD_BASE_URL is set; otherwise Stability AI if STABILITY_API_KEY exists). " +
+        "The image is stored locally and a public URL is returned.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Visual prompt." },
+          size: {
+            type: "string",
+            description: "Optional output size; omit if not needed.",
+            enum: ["1024x1024", "1792x1024", "1024x1792"]
+          },
+          user_id: { type: "string", description: "User ID or display name." }
+        },
+        required: ["prompt", "user_id"]
+      }
+    }
+  },
 
   // ==== getPDF (unverändert) ================================================
   {
@@ -224,6 +246,7 @@ const fullToolRegistry = {
   getImageDescription,
   getLocation,
   getPDF,
+  getImageSD,
   findTimeframes, // ⬅︎ neu
   getHistory      // ⬅︎ neu (timeframe summarization)
 };
