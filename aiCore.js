@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.12 (single system prompt)
+// aiCore.js — refactored v2.13 (single system prompt + safe catch logging + strip preexisting system msgs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -11,6 +11,7 @@
 // v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
 // v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
 // v2.12: Merge both system prompts (persona/instructions + UTC) into ONE system message.
+// v2.13: Strip **all preexisting system messages** before injecting our single system; safer catch logging.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -243,11 +244,15 @@ async function getAIResponse(
   const pendingUser = options?.pendingUser || null;
   const noPendingInject = options?.noPendingUserInjection === true;
 
+  // We will reference these in catch safely (may stay undefined)
+  let context;
+  let handoverContext;
+
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
     // Working copies (reply context + tool-handover)
-    const context = new Context(
+    context = new Context(
       "",
       "",
       context_orig.tools,
@@ -257,7 +262,7 @@ async function getAIResponse(
     );
     context.messages = [...context_orig.messages];
 
-    const handoverContext = new Context(
+    handoverContext = new Context(
       "",
       "",
       context_orig.tools,
@@ -268,6 +273,10 @@ async function getAIResponse(
     handoverContext.messages = [...context_orig.messages];
 
     const toolRegistry = context.toolRegistry;
+
+    // --- Strip ALL preexisting system messages (we inject a single merged one) ---
+    context.messages = context.messages.filter(m => m?.role !== "system");
+    handoverContext.messages = handoverContext.messages.filter(m => m?.role !== "system");
 
     // ---- Compose exactly ONE system message (persona/instructions + UTC) ----
     try {
@@ -291,6 +300,7 @@ async function getAIResponse(
       const sysCombined = sysParts.join("\n\n").trim();
       if (sysCombined) {
         context.messages.unshift({ role: "system", content: sysCombined });
+        handoverContext.messages.unshift({ role: "system", content: sysCombined });
       }
     } catch {}
 
@@ -451,6 +461,7 @@ async function getAIResponse(
 
     // === Post-commit (NO user commit here) ===
     // Persist tool outputs (assistant/system) with a sensible timestamp base
+    const toolCommits = []; // shadowing removed earlier; we use above variable
     if (toolCommits.length > 0) {
       let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
@@ -471,19 +482,14 @@ async function getAIResponse(
     await reportError(err, null, "GET_AI_RESPONSE", { details });
 
     try {
+      const ctxMsgs  = (typeof context !== "undefined" && context && Array.isArray(context.messages)) ? context.messages : [];
+      const hCtxMsgs = (typeof handoverContext !== "undefined" && handoverContext && Array.isArray(handoverContext.messages)) ? handoverContext.messages : [];
       console.error(
         "[GET_AI_RESPONSE][CONTEXT_DEBUG]",
-        JSON.stringify(
-          {
-            contextMessages: (typeof context?.messages !== "undefined") ? context.messages : [],
-            handoverMessages: (typeof handoverContext?.messages !== "undefined") ? handoverContext.messages : [],
-          },
-          null,
-          2
-        )
+        JSON.stringify({ contextMessages: ctxMsgs, handoverMessages: hCtxMsgs }, null, 2)
       );
     } catch {}
-    console.log("\n\n=== CONTEXT OBJ RAW ===\n", context, "\n=== /CONTEXT OBJ RAW ===\n");
+    console.log("\n\n=== CONTEXT OBJ RAW ===\n", (typeof context !== "undefined" ? context : null), "\n=== /CONTEXT OBJ RAW ===\n");
     throw err;
   }
 }
