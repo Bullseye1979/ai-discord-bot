@@ -27,8 +27,7 @@
     "puppeteer": "^24.2.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "uuid": "^11.0.5",
-    "youtube-transcript-plus": "^1.1.1"
+    "uuid": "^11.0.5"
   },
   "optionalDependencies": {
     "@discordjs/opus": "^0.10.0"
