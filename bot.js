@@ -800,6 +800,18 @@ expressApp.use(
   })
 );
 
+// CORS nur für /api/* (vor den Routen einfügen!)
+expressApp.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Max-Age", "600");
+    if (req.method === "OPTIONS") return res.status(204).end();
+  }
+  next();
+});
+
 /**
  * API Endpoint: POST /api/:channelId
  * Auth: Authorization: Bearer <channel-config._API.key>
