@@ -1,8 +1,7 @@
-// tools.js — smart history v2.0
+// tools.js — smart history v2.1 (zentral robuste Normalisierung)
 // - findTimeframes: Keywords -> list of {start,end} windows (channel-scoped), no summarization
 // - getHistory: timeframe-only summarization (no chunking, single LLM pass; full history if no start/end)
-//
-// Unveränderte Tools bleiben erhalten.
+// - NEU: getToolRegistry() akzeptiert Strings oder Objekt-Items (name / function.name / id)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage } = require("./image.js");
@@ -235,14 +234,33 @@ function normalizeToolName(name) {
   const raw = String(name).trim();
   if (!raw) return "";
 
-  // Quick aliases
+  // Aliases
   if (raw.toLowerCase() === "findtimeframes") return "findTimeframes";
   if (raw.toLowerCase() === "gethistory") return "getHistory";
 
-  // Case-insensitive match to known keys
+  // Case-insensitive match
   const keys = Object.keys(fullToolRegistry);
   const hit = keys.find((k) => k.toLowerCase() === raw.toLowerCase());
   return hit || raw;
+}
+
+/** Robust: akzeptiert Strings oder Objekte und extrahiert den gewünschten Namen. */
+function extractToolName(item) {
+  try {
+    if (typeof item === "string") return item.trim();
+    if (item && typeof item === "object") {
+      // häufige Felder: name, id, function.name
+      const n =
+        item.name ||
+        (item.function && item.function.name) ||
+        item.id ||
+        "";
+      return String(n).trim();
+    }
+    return "";
+  } catch {
+    return "";
+  }
 }
 
 /** Build a filtered tool list and callable registry for a given allowlist */
@@ -253,9 +271,14 @@ function getToolRegistry(toolNames = []) {
       return { tools: [], registry: {} };
     }
 
-    // Normalize, keep order, drop duplicates
+    // 1) Zentrale Normalisierung: Strings/Objekte → String-Namen
+    const normalizedRequested = toolNames
+      .map(extractToolName)
+      .filter(Boolean);
+
+    // 2) Canonical-Name, Reihenfolge beibehalten, Deduplizierung
     const seen = new Set();
-    const wanted = toolNames
+    const wanted = normalizedRequested
       .map((n) => normalizeToolName(n))
       .filter((n) => {
         const key = String(n || "");
@@ -265,19 +288,25 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
-    // Warn for unknown
+    // 3) Warnung für Unbekannte
     for (const name of wanted) {
       if (!fullToolRegistry[name]) {
         reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
       }
     }
 
+    // 4) Filter auf bekannte Tools
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
+
+    // 5) OpenAI-Tool-Specs nach Namen filtern
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
+
+    // 6) Callable-Registry bauen
     const registry = {};
     for (const name of availableNames) {
       registry[name] = fullToolRegistry[name];
     }
+
     return { tools: filteredTools, registry };
   } catch (err) {
     reportError(err, null, "GET_TOOL_REGISTRY", "ERROR");
