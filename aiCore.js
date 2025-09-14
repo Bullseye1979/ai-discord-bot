@@ -241,7 +241,7 @@ function buildPseudoToolsInstruction(tools) {
     "Tool result: { \"url\": \"https://…\" }",
     '{ "name": "getImageSD", "arguments": {  "prompt": "elephant",  "user_id": "" } }',
     "",
-    "WORKING EXAMPLES:",
+    "WORKING EXAMPLES (do not copy them, those are just examples):",
     '<tool_call>{ "name": "getImageSD", "arguments": {  "prompt": "elephant",  "user_id": "" } }</tool_call>',
     '<tool_call>{ "name": "getGoogle", "arguments": {  "query": "limp bizkit tour",  "user_id": "123456" } }</tool_call>',
     '<tool_call>{ "name": "getGoogle", "arguments": {  "query": "chancelor germany",  "user_id": "246789" } }</tool_call>',
