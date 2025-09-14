@@ -1,7 +1,8 @@
-// bot.js — refactored v3.17.2 (API: system→user-merge)
+// bot.js — refactored v3.18.0 (API: system→user-merge + pseudo-toolcalls)
 // - HTTP-Endpoint: POST /api/:channelId
 // - JSON-Middleware via useJson() (Express v3/v4 kompatibel)
 // - API: system-Prompt wird an user-Prompt angehängt (keine extra system message)
+// - Neu: Pseudo-Toolcalls per Block/_API-Flag → options.pseudotoolcalls an aiCore
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -226,6 +227,8 @@ function resolveEffectiveLLM(channelMeta, matchingBlock) {
       channelMeta.endpoint ||
       process.env.OPENAI_BASE_URL ||
       "https://api.openai.com/v1",
+    // NEW: pseudo-toolcalls flag can also be set per block
+    pseudotoolcalls: !!matchingBlock?.pseudotoolcalls
   };
 }
 
@@ -278,8 +281,12 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       chatContext.toolRegistry = {};
     }
 
-    const { model: effectiveModel, apikey: effectiveApiKey, endpoint: effectiveEndpoint } =
-      resolveEffectiveLLM(channelMeta, matchingBlock);
+    const {
+      model: effectiveModel,
+      apikey: effectiveApiKey,
+      endpoint: effectiveEndpoint,
+      pseudotoolcalls: blockPseudo
+    } = resolveEffectiveLLM(channelMeta, matchingBlock);
 
     const tokenlimit = (() => {
       const raw = channelMeta.max_tokens_speaker ?? channelMeta.maxTokensSpeaker;
@@ -324,6 +331,8 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
         pendingUser: pendingUserTurn || null,
         endpoint: effectiveEndpoint,
         noPendingUserInjection: true,
+        // NEW: pass pseudo-toolcalls flag from block
+        pseudotoolcalls: !!blockPseudo
       }, 
       client
     );
@@ -683,8 +692,12 @@ client.on("messageCreate", async (message) => {
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    const { model: effectiveModel, apikey: effectiveApiKey, endpoint: effectiveEndpoint } =
-      resolveEffectiveLLM(channelMeta, matchingBlock);
+    const {
+      model: effectiveModel,
+      apikey: effectiveApiKey,
+      endpoint: effectiveEndpoint,
+      pseudotoolcalls: blockPseudo
+    } = resolveEffectiveLLM(channelMeta, matchingBlock);
 
     const tokenlimit = (() => {
       const raw = channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
@@ -717,7 +730,9 @@ client.on("messageCreate", async (message) => {
         {
           pendingUser: pendingUserTurn,
           endpoint: effectiveEndpoint,
-          noPendingUserInjection: true
+          noPendingUserInjection: true,
+          // NEW: pass pseudo-toolcalls flag from block
+          pseudotoolcalls: !!blockPseudo
         },
         client
       );
@@ -839,7 +854,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
     const userPromptRaw = String(body.user || "").trim();
     if (!userPromptRaw) return res.status(400).json({ error: "bad_request", message: "Missing 'user' in body." });
 
-    // 👇 NEU: System-Kontext in den User-Prompt einbetten (statt als extra system message)
+    // 👇 System-Kontext in den User-Prompt einbetten (statt als extra system message)
     const userPrompt = systemPrompt
       ? `${userPromptRaw}\n\n[API context]\n${systemPrompt}`
       : userPromptRaw;
@@ -880,6 +895,8 @@ expressApp.post("/api/:channelId", async (req, res) => {
       process.env.OPENAI_BASE_URL ||
       "https://api.openai.com/v1";
 
+    const pseudoFromApi = !!apiBlock?.pseudotoolcalls; // NEW
+
     // PRE-LOG (persist): User turn als "API" mit eingebettetem Kontext
     await chatContext.add("user", "API", userPrompt, Date.now());
 
@@ -894,6 +911,8 @@ expressApp.post("/api/:channelId", async (req, res) => {
         {
           endpoint: effectiveEndpoint,
           noPendingUserInjection: true,
+          // NEW: pass pseudo-toolcalls from _API block
+          pseudotoolcalls: pseudoFromApi
         },
         client
       );
@@ -917,4 +936,5 @@ expressApp.post("/api/:channelId", async (req, res) => {
 });
 
 // Server starten
+express.open?.(); // no-op guard for old environments
 expressApp.listen(3000, () => {});

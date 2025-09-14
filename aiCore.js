@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.13b (single system prompt + safe catch logging + strip preexisting system msgs)
+// aiCore.js — refactored v2.12 (endpoint override + conditional auth + pseudo-toolcalls)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -10,9 +10,11 @@
 // v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
 // v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
 // v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
-// v2.12: Merge both system prompts (persona/instructions + UTC) into ONE system message.
-// v2.13b: Strip **all preexisting system messages** before injecting our single system; safer catch logging;
-//         FIX: no duplicate `toolCommits` declaration.
+//        Added options.noPendingUserInjection to avoid duplicating user content in working copy.
+// v2.12: PSEUDO-TOOLCALLS for local models (Qwen/Llama/etc.)
+//        - Schema injection into system prompt
+//        - Detect <tool_call>{...}</tool_call> & variants in assistant text
+//        - Execute via registry and commit as proper GPT tool messages
 
 require("dotenv").config();
 const axios = require("axios");
@@ -223,6 +225,75 @@ function loadEnvPriming() {
   return (process.env.STANDARDPRIMING || "").trim();
 }
 
+/* -------------------- Pseudo tool-calls helpers -------------------- */
+
+function buildPseudoToolsInstruction(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return "";
+  const names = tools
+    .map(t => t?.function?.name || t?.name)
+    .filter(Boolean);
+
+  if (names.length === 0) return "";
+  return [
+    "You can use tools via *pseudo tool-calls*.",
+    "When you need a tool, output **ONLY** one block in this exact shape, with no other text:",
+    "",
+    "<tool_call>",
+    '{ "name": "<tool_name>", "arguments": { /* JSON args */ } }',
+    "</tool_call>",
+    "",
+    "Rules:",
+    "- The block must be the only content in your message (no prose before/after).",
+    "- Use one tool per message.",
+    `- Available tools: ${names.join(", ")}`,
+  ].join("\n");
+}
+
+function extractPseudoToolCalls(text) {
+  if (!text || typeof text !== "string") return [];
+
+  const calls = [];
+
+  // 1) XML-like tag <tool_call> ... </tool_call>
+  const reTag = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+  let m;
+  while ((m = reTag.exec(text)) !== null) {
+    const raw = (m[1] || "").trim();
+    try {
+      const json = JSON.parse(raw);
+      if (json && typeof json === "object" && json.name) {
+        calls.push({ name: String(json.name), arguments: json.arguments || {} });
+      }
+    } catch {}
+  }
+
+  // 2) Code fence ```tool_call { ... } ```
+  const reFence = /```(?:tool_call|json)\s*([\s\S]*?)```/gi;
+  while ((m = reFence.exec(text)) !== null) {
+    const raw = (m[1] || "").trim();
+    try {
+      const json = JSON.parse(raw);
+      if (json && typeof json === "object" && json.name) {
+        calls.push({ name: String(json.name), arguments: json.arguments || {} });
+      }
+    } catch {}
+  }
+
+  // 3) Angle bracket single tag variant: <toolcall>{...}</toolcall>
+  const reAlt = /<toolcall>([\s\S]*?)<\/toolcall>/gi;
+  while ((m = reAlt.exec(text)) !== null) {
+    const raw = (m[1] || "").trim();
+    try {
+      const json = JSON.parse(raw);
+      if (json && typeof json === "object" && json.name) {
+        calls.push({ name: String(json.name), arguments: json.arguments || {} });
+      }
+    } catch {}
+  }
+
+  return calls;
+}
+
 /**
  * Run a chat loop with tool-calls and bounded auto-continue.
  * @param {Context} context_orig
@@ -245,63 +316,58 @@ async function getAIResponse(
   const pendingUser = options?.pendingUser || null;
   const noPendingInject = options?.noPendingUserInjection === true;
 
-  // Safe refs for catch
-  let context;
-  let handoverContext;
-
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
     // Working copies (reply context + tool-handover)
-    context = new Context(
+    const context = new Context(
       "",
       "",
       context_orig.tools,
       context_orig.toolRegistry,
       context_orig.channelId || null,
-      { skipInitialSummaries: true, persistToDB: false }
+      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!context_orig.pseudoToolcalls }
     );
     context.messages = [...context_orig.messages];
 
-    handoverContext = new Context(
+    const handoverContext = new Context(
       "",
       "",
       context_orig.tools,
       context_orig.toolRegistry,
       context_orig.channelId || null,
-      { skipInitialSummaries: true, persistToDB: false }
+      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!context_orig.pseudoToolcalls }
     );
     handoverContext.messages = [...context_orig.messages];
 
-    // --- Strip ALL preexisting system messages (we inject a single merged one) ---
-    context.messages = context.messages.filter(m => m?.role !== "system");
-    handoverContext.messages = handoverContext.messages.filter(m => m?.role !== "system");
+    const toolRegistry = context.toolRegistry;
 
-    // ---- Compose exactly ONE system message (persona/instructions + UTC) ----
+    // Compose system
     try {
       const sysParts = [];
       const priming = loadEnvPriming();
       if (priming) sysParts.push(`General rules:\n${priming}`);
+      if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
+      if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
 
-      if ((context_orig.persona || "").trim()) {
-        sysParts.push(String(context_orig.persona).trim());
+      // Pseudo-toolcalls schema (if enabled)
+      if (context_orig.pseudoToolcalls === true) {
+        const schema = buildPseudoToolsInstruction(context.tools || []);
+        if (schema) sysParts.push(schema);
       }
-      if ((context_orig.instructions || "").trim()) {
-        sysParts.push(String(context_orig.instructions).trim());
-      }
-
-      const nowUtc = new Date().toISOString();
-      sysParts.push(
-        `Current UTC time: ${nowUtc} <- Use this time whenever asked. ` +
-        `Translate to the requested location; if none, use your current location.`
-      );
 
       const sysCombined = sysParts.join("\n\n").trim();
       if (sysCombined) {
         context.messages.unshift({ role: "system", content: sysCombined });
-        handoverContext.messages.unshift({ role: "system", content: sysCombined });
       }
     } catch {}
+
+    // Time hint
+    const nowUtc = new Date().toISOString();
+    context.messages.unshift({
+      role: "system",
+      content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
+    });
 
     // Pending user ONLY to working copy if requested (avoid duplicate when bot.js pre-logged)
     if (pendingUser && pendingUser.content && !noPendingInject) {
@@ -312,9 +378,7 @@ async function getAIResponse(
       handoverContext.messages.push({ ...msg });
     }
 
-    // Collect tool results to persist
     const toolCommits = []; // { name: fnName, content: string }
-
     let continueResponse = false;
     let sequenceCounter = 0;
 
@@ -392,23 +456,52 @@ async function getAIResponse(
       const aiMessage = choice.message || {};
       const finishReason = choice.finish_reason;
 
-      const toolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
-      const hasToolCalls = toolCalls.length > 0;
+      const toolCallsFromModel = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
+      let hasToolCalls = toolCallsFromModel.length > 0;
 
-      if (hasToolCalls) {
-        context.messages.push({ role: "assistant", tool_calls: toolCalls });
+      // Append assistant text (if any) — but guard for pseudo toolcalls
+      let assistantText = typeof aiMessage.content === "string" ? aiMessage.content.trim() : "";
+
+      // PSEUDO-TOOLCALL DETECTION
+      let pseudoCalls = [];
+      if (context.pseudoToolcalls === true && assistantText) {
+        pseudoCalls = extractPseudoToolCalls(assistantText);
       }
 
-      if (typeof aiMessage.content === "string" && aiMessage.content.trim()) {
-        responseMessage += aiMessage.content.trim();
+      if (pseudoCalls.length > 0) {
+        // prevent the raw tag content from leaking into the visible assistant text
+        assistantText = "";
+      }
+
+      if (assistantText) {
+        responseMessage += assistantText;
+      }
+
+      // If the model returned native tool_calls (OpenAI style)
+      if (hasToolCalls) {
+        context.messages.push({ role: "assistant", tool_calls: toolCallsFromModel });
+      }
+
+      // If PSEUDO calls were present, convert to native tool_calls and process identically
+      if (pseudoCalls.length > 0) {
+        const fabricated = pseudoCalls.map((pc, idx) => ({
+          id: `call_${Date.now()}_${idx}`,
+          type: "function",
+          function: { name: pc.name, arguments: JSON.stringify(pc.arguments || {}) }
+        }));
+        context.messages.push({ role: "assistant", tool_calls: fabricated });
+        // Re-route through same processing path
+        hasToolCalls = true;
       }
 
       if (hasToolCalls) {
         hadToolCallsThisTurn = true;
 
-        for (const toolCall of toolCalls) {
+        const callsToHandle = context.messages[context.messages.length - 1]?.tool_calls || [];
+
+        for (const toolCall of callsToHandle) {
           const fnName = toolCall?.function?.name;
-          if (client != null) {
+          if (client != null && fnName) {
             setBotPresence(client, "⌛ " + fnName, "online");
           }
           const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
@@ -428,9 +521,18 @@ async function getAIResponse(
             continue;
           }
 
+          let parsedArgs = {};
+          try {
+            const raw = toolCall?.function?.arguments || "{}";
+            parsedArgs = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
+          } catch {
+            parsedArgs = {};
+          }
+
           try {
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-            const toolResult = await toolFunction(toolCall.function, handoverContext, getAIResponse, runtime);
+            // Hand over as if it were a real tool call
+            const toolResult = await toolFunction({ name: fnName, arguments: parsedArgs }, handoverContext, getAIResponse, runtime);
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
@@ -442,13 +544,22 @@ async function getAIResponse(
 
       sequenceCounter++;
 
+      // Continue logic:
       const dueToLength = !hasToolCalls && finishReason === "length";
       if (sequenceLimit <= 1) {
         continueResponse = false;
+      } else if (hasToolCalls) {
+        // We just added tool outputs; now ask model to continue with them.
+        if (sequenceCounter < sequenceLimit) {
+          context.messages.push({ role: "user", content: "continue" });
+          continueResponse = true;
+        } else {
+          continueResponse = false;
+        }
       } else if (dueToLength) {
         if (sequenceCounter < sequenceLimit) {
-          if (typeof aiMessage.content === "string" && aiMessage.content.trim()) {
-            context.messages.push({ role: "assistant", content: aiMessage.content.trim() });
+          if (assistantText) {
+            context.messages.push({ role: "assistant", content: assistantText });
           }
           context.messages.push({ role: "user", content: "continue" });
           continueResponse = true;
@@ -482,14 +593,19 @@ async function getAIResponse(
     await reportError(err, null, "GET_AI_RESPONSE", { details });
 
     try {
-      const ctxMsgs  = (typeof context !== "undefined" && context && Array.isArray(context.messages)) ? context.messages : [];
-      const hCtxMsgs = (typeof handoverContext !== "undefined" && handoverContext && Array.isArray(handoverContext.messages)) ? handoverContext.messages : [];
       console.error(
         "[GET_AI_RESPONSE][CONTEXT_DEBUG]",
-        JSON.stringify({ contextMessages: ctxMsgs, handoverMessages: hCtxMsgs }, null, 2)
+        JSON.stringify(
+          {
+            contextMessages: (typeof context?.messages !== "undefined") ? context.messages : [],
+            handoverMessages: (typeof handoverContext?.messages !== "undefined") ? handoverContext.messages : [],
+          },
+          null,
+          2
+        )
       );
     } catch {}
-    console.log("\n\n=== CONTEXT OBJ RAW ===\n", (typeof context !== "undefined" ? context : null), "\n=== /CONTEXT OBJ RAW ===\n");
+    console.log("\n\n=== CONTEXT OBJ RAW ===\n", context, "\n=== /CONTEXT OBJ RAW ===\n");
     throw err;
   }
 }

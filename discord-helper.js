@@ -1,6 +1,6 @@
-// discord-helper.js — refactored v3.4 (v3.3 + _API-Block Support)
+// discord-helper.js — refactored v3.5 (v3.4 + _API.pseudotoolcalls flag)
 // Avatar aus Channel-Config-Prompt (+ Persona/Name-Addendum), Cache-Busting, strict channel-only config, safe URLs
-// Neu: getChannelConfig() normalisiert einen _API-Block → { api: { enabled, key, model?, max_tokens?, tools[], toolRegistry{}, apikey?, endpoint? } }
+// NEU: getChannelConfig() normalisiert einen _API-Block → { api: { enabled, key, model?, max_tokens?, tools[], toolRegistry{}, apikey?, endpoint?, pseudotoolcalls? } }
 
 const fs = require("fs");
 const os = require("os");
@@ -128,7 +128,7 @@ function getChannelConfig(channelId) {
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
         avatarPrompt: "", imagePrompt: "",
         // Neuer API-Block: disabled default
-        api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "" }
+        api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false }
       };
     }
 
@@ -193,7 +193,8 @@ function getChannelConfig(channelId) {
       tools: [],
       toolRegistry: {},
       apikey: "",
-      endpoint: ""
+      endpoint: "",
+      pseudotoolcalls: false
     };
     if (apiRaw) {
       api.enabled = !!apiRaw.enabled;
@@ -202,6 +203,8 @@ function getChannelConfig(channelId) {
       api.max_tokens = Number.isFinite(Number(apiRaw.max_tokens)) ? Math.floor(Number(apiRaw.max_tokens)) : null;
       api.apikey = typeof apiRaw.apikey === "string" ? apiRaw.apikey : "";
       api.endpoint = typeof apiRaw.endpoint === "string" ? apiRaw.endpoint : "";
+      api.pseudotoolcalls = !!apiRaw.pseudotoolcalls; // <— NEU
+
       // API-Tools separat aufbereiten
       const apiToolsInput = Array.isArray(apiRaw.tools) ? apiRaw.tools : [];
       const { registry: apiToolReg, tools: apiTools } = getToolRegistry(apiToolsInput);
@@ -226,7 +229,7 @@ function getChannelConfig(channelId) {
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
       avatarPrompt: "", imagePrompt: "",
-      api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "" }
+      api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false }
     };
   }
 }

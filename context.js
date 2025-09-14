@@ -1,4 +1,4 @@
-// context.js — v6.5 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1)
+// context.js — v6.6 (ID-bounded Delta, NO CHUNKING, direct summaryPrompt, GPT-4.1, + pseudoToolcalls flag)
 // - Persistenter Verlauf in MySQL
 // - Inkrementelle Summaries (Fenster über last_context_id → MAX(id))
 // - KEIN Chunking: komplettes Fenster wird 1:1 in den Kontext gegeben
@@ -6,6 +6,7 @@
 // - Redo: löscht jüngste Summary und fasst exakt dasselbe Fenster erneut zusammen
 // - replaceLastSummaryWithLastLog: ersetzt nur den Summary-Text, behält last_context_id/timestamp
 // - NEU: Beim Summarize werden Meta-Summaries und Summary-Anzeige-Interaktionen (User & Assistant) ignoriert
+// - NEU: pseudoToolcalls: boolescher Schalter, damit aiCore das Pseudo-Tool-Schema injizieren/auswerten kann
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
@@ -196,6 +197,9 @@ class Context {
     this.summaryPrompt = summaryPrompt || "";
     this.persistent = typeof persistToDB === "boolean" ? persistToDB : !!this.channelId;
 
+    // NEU: Flag für Pseudo-Toolcalls (wird von aiCore ausgewertet/gesetzt)
+    this.pseudoToolcalls = !!opts?.pseudoToolcalls;
+
     this._maxUserMessages = null;
     this._prunePerTwoNonUser = true;
     this.isSummarizing = false;
@@ -359,7 +363,6 @@ Output a clear, well-structured summary (bullets/sections allowed).
       "Never rely on summaries that were not explicitly requested; always prefer underlying user/assistant/tool interactions where available."
     ].join(" ");
 
-
     try {
       const db = await getPool();
 
@@ -455,7 +458,7 @@ Output a clear, well-structured summary (bullets/sections allowed).
       );
       finalCtx.messages.push({ role: "user", name: "system", content: allJoined });
 
-      const finalSummary = (await getAI(finalCtx, MAX_FINAL_TOKENS, MODEL))?.trim() || "";
+      const finalSummary = (await getAI(finalCtx, Math.max(512, Number(process.env.SUMMARY_FINAL_TOKENS || 3500)), process.env.SUMMARY_MODEL || "gpt-4.1"))?.trim() || "";
 
       let insertedSummaryId = null;
       if (finalSummary) {
