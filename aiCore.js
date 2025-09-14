@@ -242,6 +242,10 @@ function buildPseudoToolsInstruction(tools) {
     .filter(Boolean);
 
   if (names.length === 0) return "";
+
+  // ⚠️ Dynamisches Beispiel: nutze den ersten Toolnamen statt "getImage"
+  const exampleTool = names[0];
+
   // leicht verstärktes Schema + Beispiel
   return [
     "You MUST use tools via *pseudo tool-calls* when needed.",
@@ -266,7 +270,7 @@ function buildPseudoToolsInstruction(tools) {
     "",
     "EXAMPLE:",
     "<tool_call>",
-    '{ "name": "getImage", "arguments": { "prompt": "a cute robot, cinematic light, 4k", "size": "1024x1024" } }',
+    `{ "name": "${exampleTool}", "arguments": { "prompt": "a cute robot, cinematic light, 4k", "size": "1024x1024" } }`,
     "</tool_call>",
   ].join("\n");
 }
@@ -415,6 +419,10 @@ async function getAIResponse(
 
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
+    // ➕ Auto-Korrektur Guard: begrenzte Retries, falls Prosa statt Toolcall
+    let pseudoRetryCount = 0;
+    const pseudoRetryMax = 2;
+
     // Loop until tools are resolved and optional continue chain done
     let hadToolCallsThisTurn = false;
     do {
@@ -504,6 +512,24 @@ async function getAIResponse(
         if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
       }
 
+      // 🔧 Auto-Korrektur: Prosa ohne Toolcalls → harte Korrektur (max. 2x)
+      if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0 && assistantText) {
+        if (pseudoRetryCount < pseudoRetryMax) {
+          pseudoRetryCount++;
+          dbg("Prose without tool_call detected. Sending strict correction (retry", pseudoRetryCount, ")");
+          context.messages.push({
+            role: "user",
+            content:
+              "FEHLER: Du hast Prosa gesendet. Sende JETZT ausschließlich einen einzigen <tool_call>…</tool_call>-Block ODER einen ```tool_call```-Block mit gültigem JSON {name, arguments}. KEINE ERKLÄRUNGEN."
+          });
+          continueResponse = true;
+          sequenceCounter++;
+          continue; // nächste Schleife
+        } else {
+          dbg("Max pseudo retries reached; returning prose to caller.");
+        }
+      }
+
       if (pseudoCalls.length > 0) {
         // prevent raw tag from leaking into the visible assistant text
         assistantText = "";
@@ -553,6 +579,12 @@ async function getAIResponse(
             toolCommits.push({ name: fnName || "tool", content: out });
           };
 
+          if (!toolFunction || !toolCall?.function) {
+            replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available or arguments invalid.`);
+            dbg("Tool missing or invalid:", fnName);
+            continue;
+          }
+
           // Args parsen & loggen
           let parsedArgs = {};
           try {
@@ -562,12 +594,6 @@ async function getAIResponse(
             parsedArgs = {};
           }
           dbg("Execute tool:", fnName, "args:", parsedArgs);
-
-          if (!toolFunction || !toolCall?.function) {
-            replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available or arguments invalid.`);
-            dbg("Tool missing or invalid:", fnName);
-            continue;
-          }
 
           try {
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
