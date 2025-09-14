@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.16 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
+// aiCore.js — refactored v2.17 (single-call pseudo, url-only response, stricter prose drop)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -16,6 +16,8 @@
 // v2.14: Pseudotoolcalls → do NOT send tools/tool_choice in payload (fix local 500s)
 // v2.15: Fix ReferenceError + short-circuit after tool exec in pseudo-mode + direct reply from tool result
 // v2.16: Stable retries + prompt pinning on correction + no prose accumulation in pseudo-mode
+// v2.17: In pseudo-mode execute ONLY ONE best tool-call, ignore empties, drop all prose,
+//         and return URL ONLY (no markdown) as final response.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -318,6 +320,34 @@ function extractPseudoToolCalls(text) {
   return calls;
 }
 
+/** pick the single best pseudo-call: prefer one with non-empty arguments; fallback first */
+function pickBestPseudoCall(pseudoCalls) {
+  if (!Array.isArray(pseudoCalls) || pseudoCalls.length === 0) return null;
+  const hasValue = (v) => {
+    if (v == null) return false;
+    const s = String(v).trim();
+    return s.length > 0;
+  };
+  const score = (pc) => {
+    try {
+      const args = pc?.arguments || {};
+      const vals = Object.values(args);
+      if (vals.length === 0) return 0;
+      return vals.reduce((acc, v) => acc + (hasValue(v) ? 1 : 0), 0);
+    } catch { return 0; }
+  };
+  let best = pseudoCalls[0];
+  let bestScore = score(best);
+  for (let i = 1; i < pseudoCalls.length; i++) {
+    const sc = score(pseudoCalls[i]);
+    if (sc > bestScore) {
+      best = pseudoCalls[i];
+      bestScore = sc;
+    }
+  }
+  return best;
+}
+
 function lastConcreteUserPrompt(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -510,23 +540,26 @@ async function getAIResponse(
       const toolCallsFromModel = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
       let hasToolCalls = toolCallsFromModel.length > 0;
 
-      // Assistant content
+      // Assistant content (drop prose completely in pseudo-mode)
       let assistantText = typeof aiMessage.content === "string" ? aiMessage.content.trim() : "";
       if (assistantText) dbg("Assistant text (raw):", assistantText);
+      if (pseudoFlag) {
+        // regardless of hasToolCalls: never accumulate prose in pseudo mode
+        assistantText = "";
+      }
 
       // Pseudo detection
       let pseudoCalls = [];
-      if (pseudoFlag === true && assistantText) {
-        pseudoCalls = extractPseudoToolCalls(assistantText);
-        if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
+      if (pseudoFlag === true) {
+        // we still need to parse pseudo blocks from the raw message text (already in `choice`)
+        const rawFromModel = (aiResponse?.data?.choices?.[0]?.message?.content || "").trim();
+        if (rawFromModel) {
+          pseudoCalls = extractPseudoToolCalls(rawFromModel);
+          if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
+        }
       }
 
-      // In pseudo-mode: if no toolcalls were produced, do NOT accumulate prose
-      if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0) {
-        assistantText = ""; // drop hallucinated prose
-      }
-
-      // Hard correction prompt (carry original user request)
+      // In pseudo-mode: if no toolcalls were produced, issue strict correction (max 2 tries)
       if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0) {
         if (pseudoRetryCount < pseudoRetryMax) {
           pseudoRetryCount++;
@@ -546,23 +579,31 @@ async function getAIResponse(
         }
       }
 
-      if (assistantText) {
+      // (Do not add assistantText; in pseudo mode it's always dropped)
+      if (!pseudoFlag && assistantText) {
         responseMessage += assistantText;
       }
 
-      if (hasToolCalls) {
+      // Native tool_calls passthrough (non-pseudo)
+      if (hasToolCalls && !pseudoFlag) {
         dbg("Native tool_calls:", toolCallsFromModel.map(tc => tc?.function?.name));
         context.messages.push({ role: "assistant", tool_calls: toolCallsFromModel });
       }
 
-      if (pseudoCalls.length > 0) {
-        const fabricated = pseudoCalls.map((pc, idx) => ({
-          id: `call_${Date.now()}_${idx}`,
-          type: "function",
-          function: { name: pc.name, arguments: JSON.stringify(pc.arguments || {}) }
-        }));
-        context.messages.push({ role: "assistant", tool_calls: fabricated });
-        hasToolCalls = true;
+      // Pseudo → fabricate exactly ONE best tool_call
+      if (pseudoCalls.length > 0 && pseudoFlag) {
+        const best = pickBestPseudoCall(pseudoCalls);
+        if (best) {
+          const fabricated = [{
+            id: `call_${Date.now()}_0`,
+            type: "function",
+            function: { name: best.name, arguments: JSON.stringify(best.arguments || {}) }
+          }];
+          context.messages.push({ role: "assistant", tool_calls: fabricated });
+          hasToolCalls = true;
+        } else {
+          hasToolCalls = false;
+        }
       }
 
       if (hasToolCalls) {
@@ -570,7 +611,10 @@ async function getAIResponse(
 
         const callsToHandle = context.messages[context.messages.length - 1]?.tool_calls || [];
 
-        for (const toolCall of callsToHandle) {
+        // In pseudo-mode: ensure we execute ONLY the first call
+        const loopCalls = pseudoFlag ? callsToHandle.slice(0, 1) : callsToHandle;
+
+        for (const toolCall of loopCalls) {
           const fnName = toolCall?.function?.name;
           if (client != null && fnName) {
             setBotPresence(client, "⌛ " + fnName, "online");
@@ -620,7 +664,8 @@ async function getAIResponse(
           }
         }
 
-        if (pseudoFlag === true) {
+        // In pseudo-mode: do not start assistant "continue" turns. We will break out.
+        if (pseudoFlag) {
           continueResponse = false;
           break;
         }
@@ -657,8 +702,10 @@ async function getAIResponse(
       }
     } while (hadToolCallsThisTurn || continueResponse);
 
-    // Direct reply from tool results in pseudo-mode
-    if (responseMessage.trim().length === 0 && lastToolResults.length > 0) {
+    // Direct reply from tool results
+    // - PSEUDO-MODE: return URL ONLY (first url found), no markdown, no <>.
+    // - NON-PSEUDO: keep legacy markdown+link behavior.
+    if (lastToolResults.length > 0) {
       const urls = [];
       for (const r of lastToolResults) {
         try {
@@ -666,9 +713,15 @@ async function getAIResponse(
           if (obj && typeof obj === "object" && obj.url) urls.push(String(obj.url));
         } catch {}
       }
+
       if (urls.length > 0) {
-        responseMessage = urls.map(u => `![result](${u})\n<${u}>`).join("\n");
-      } else {
+        if (pseudoFlag) {
+          responseMessage = urls[0]; // just the first URL, plain text
+        } else {
+          responseMessage = urls.map(u => `![result](${u})\n<${u}>`).join("\n");
+        }
+      } else if (responseMessage.trim().length === 0) {
+        // no URL – fall back to last tool raw content (trimmed)
         const raw = String(lastToolResults[lastToolResults.length - 1] || "").trim();
         responseMessage = raw.length > 1500 ? (raw.slice(0, 1490) + " …") : raw;
       }
