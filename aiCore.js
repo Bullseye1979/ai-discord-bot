@@ -1,12 +1,13 @@
-// aiCore.js — unified flow v2.34 (Finalisierungsturn reaktiviert)
+// aiCore.js — unified flow v2.35 (Tool-Chaining for native tools + Finalizer)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
-// - Wenn pseudotoolcalls=true: generiere Tool-Definition + Pseudo-Schema aus freigegebenen tools (context.tools)
-// - Erkannten Pseudo-Call in normalen tool_call normalisieren -> toolRegistry ausführen
+// - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
+// - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
+//   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
 // - [TOOL_RESULT:*]/[TOOL_OUTPUT:*] werden vor jedem Modell-Call aus der History gefiltert
 // - Schema VERBIETET explizit [TOOL_RESULT:*]; NEGATIVE Beispiele hinzugefügt
-// - Finalisierungsturn (postToolFinalize=true): Tool-Outputs werden ans Modell gegeben zur Aufbereitung; dort sind Tools strikt deaktiviert
+// - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
 // - Sonderfall: Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)
-// - Kein Fabricate, kein Auto-Prompt-Fill, keine Auto-Retries, kein Auto-Continue
+// - Kein Fabricate, kein Auto-Prompt-Fill
 
 require("dotenv").config();
 const axios = require("axios");
@@ -447,149 +448,212 @@ async function getAIResponse(
     const toolResults = []; // { name, raw }[]
     let lastRawAssistant = "";
 
-    /* ----- 1st Call: evtl. Tool anstoßen ----- */
+    /* ===== CHAIN LOOP (native tools) / SINGLE SHOT (pseudo) ===== */
+    let rounds = 0;
+    let continueLoop = true;
 
-    const cleanedHistory = stripPersistedWrappers(context.messages);
-    const messagesToSend = buildStrictToolPairedMessages(cleanedHistory).map(m => {
-      const out = { role: m.role, content: m.content };
-      const safeName = cleanOpenAIName(m.role, m.name);
-      if (safeName) out.name = safeName;
-      if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) out.tool_calls = m.tool_calls;
-      if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
-      return out;
-    });
+    while (continueLoop && rounds < Math.max(1, sequenceLimit)) {
+      rounds += 1;
 
-    const payload = {
-      model,
-      messages: messagesToSend,
-      max_tokens: tokenlimit
-    };
+      // 1) Persistierte Tool-Wrapper aus der History entfernen
+      const cleanedHistory = stripPersistedWrappers(context.messages);
 
-    if (!pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
-      payload.tools = context_orig.tools;
-      payload.tool_choice = "auto";
-    }
+      // 2) Payload aufbauen
+      const messagesToSend = buildStrictToolPairedMessages(cleanedHistory).map(m => {
+        const out = { role: m.role, content: m.content };
+        const safeName = cleanOpenAIName(m.role, m.name);
+        if (safeName) out.name = safeName;
+        if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) out.tool_calls = m.tool_calls;
+        if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+        return out;
+      });
 
-    const configuredRaw =
-      (options?.endpoint || "").trim() ||
-      (process.env.OPENAI_API_URL || "").trim() ||
-      (OPENAI_API_URL || "").trim();
+      const payload = {
+        model,
+        messages: messagesToSend,
+        max_tokens: tokenlimit
+      };
 
-    const endpoint = normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
-    const headers = {
-      "Content-Type": "application/json",
-      "Connection": "keep-alive",
-    };
-    const authKey = apiKey || process.env.OPENAI_API_KEY;
-    if (authKey) headers.Authorization = `Bearer ${authKey}`;
+      if (!pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
+        payload.tools = context_orig.tools;
+        payload.tool_choice = "auto";
+      }
 
-    dbg("Request →", {
-      endpoint, model, tokenlimit, pseudotoolcalls,
-      tools_in_payload: !!payload.tools,
-      tools_list: Array.isArray(context_orig.tools) ? context_orig.tools.map(t => t?.function?.name || t?.name) : []
-    });
+      const configuredRaw =
+        (options?.endpoint || "").trim() ||
+        (process.env.OPENAI_API_URL || "").trim() ||
+        (OPENAI_API_URL || "").trim();
 
-    let aiResponse;
-    try {
-      aiResponse = await postWithRetry(endpoint, payload, headers, 3);
-    } catch (err) {
-      const details = { endpoint, status: err?.response?.status, data: err?.response?.data };
-      await reportError(err, null, "OPENAI_CHAT", { details });
-      try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify({ endpoint, model, payloadPreview: { messages: messagesToSend.slice(-6), tools: payload.tools ? (payload.tools.map(t => t?.function?.name || t?.name)) : [] } }, null, 2)); } catch {}
-      console.log("\n\n=== CONTEXT RAW DUMP ===\n", context?.messages || [], "\n=== /CONTEXT RAW DUMP ===\n");
-      throw err;
-    }
+      const endpoint = normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
+      const headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+      };
+      const authKey = apiKey || process.env.OPENAI_API_KEY;
+      if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
-    const choice = aiResponse?.data?.choices?.[0] || {};
-    const aiMessage = choice.message || {};
-    const rawText = (aiMessage.content || "").trim();
-    lastRawAssistant = rawText;
-    const nativeToolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
+      dbg("Request →", {
+        endpoint, model, tokenlimit, pseudotoolcalls,
+        tools_in_payload: !!payload.tools,
+        tools_list: Array.isArray(context_orig.tools) ? context_orig.tools.map(t => t?.function?.name || t?.name) : []
+      });
 
-    dbg("Assistant text (raw):", rawText ? rawText.slice(0, 200) : "(empty)");
-    if (nativeToolCalls.length > 0) dbg("Native tool_calls:", nativeToolCalls.map(tc => tc?.function?.name));
+      // 3) Model aufrufen
+      let aiResponse;
+      try {
+        aiResponse = await postWithRetry(endpoint, payload, headers, 3);
+      } catch (err) {
+        const details = { endpoint, status: err?.response?.status, data: err?.response?.data };
+        await reportError(err, null, "OPENAI_CHAT", { details });
+        try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify({ endpoint, model, payloadPreview: { messages: messagesToSend.slice(-6), tools: payload.tools ? (payload.tools.map(t => t?.function?.name || t?.name)) : [] } }, null, 2)); } catch {}
+        console.log("\n\n=== CONTEXT RAW DUMP ===\n", context?.messages || [], "\n=== /CONTEXT RAW DUMP ===\n");
+        throw err;
+      }
 
-    // Toolcall-Normalisierung
-    let normalizedCalls = [];
-    if (nativeToolCalls.length > 0) {
-      normalizedCalls = nativeToolCalls
-        .map(tc => {
+      const choice = aiResponse?.data?.choices?.[0] || {};
+      const aiMessage = choice.message || {};
+      const finishReason = choice.finish_reason;
+      const rawText = (aiMessage.content || "").trim();
+      lastRawAssistant = rawText;
+      const nativeToolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
+
+      dbg("Assistant text (raw):", rawText ? rawText.slice(0, 200) : "(empty)");
+      if (nativeToolCalls.length > 0) dbg("Native tool_calls:", nativeToolCalls.map(tc => tc?.function?.name));
+
+      // 4) Toolcalls normalisieren
+      let normalizedCalls = [];
+
+      if (nativeToolCalls.length > 0) {
+        normalizedCalls = nativeToolCalls.map(tc => {
           try {
             const name = tc?.function?.name;
             if (!name) return null;
             let args = tc?.function?.arguments || "{}";
             args = typeof args === "string" ? JSON.parse(args || "{}") : (args || {});
-            return { id: tc.id || `call_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name, arguments: args };
+            return {
+              id: tc.id || `call_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+              name,
+              arguments: args
+            };
           } catch { return null; }
-        })
-        .filter(Boolean);
-    }
-    if (pseudotoolcalls && normalizedCalls.length === 0 && rawText) {
-      const pseudoCalls = extractPseudoToolCalls(rawText);
-      if (pseudoCalls.length > 0) {
-        const allowed = new Set((context_orig.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean));
-        const picked = pseudoCalls.find(pc => allowed.has(pc.name));
-        if (picked) {
-          normalizedCalls = [{
-            id: `call_${Date.now()}_0`,
-            name: picked.name,
-            arguments: (function sanitize(name, args) {
-              let a = Object.assign({}, args || {});
-              if (/image|getimage|sd|stable/i.test(name)) {
-                const must = v => v != null && String(v).trim().length > 0;
-                if (!must(a.size)) a.size = defaultImageSize;
-                if (typeof a.size === "string") {
-                  const s = a.size.toLowerCase().trim();
-                  if (s === "square") a.size = "1024x1024";
-                  if (/^\d{3,4}x\d{3,4}$/.test(s) === false) a.size = defaultImageSize;
-                } else a.size = defaultImageSize;
-              }
-              return a;
-            })(picked.name, picked.arguments)
-          }];
+        }).filter(Boolean);
+      }
+
+      // Pseudo: nur wenn keine native calls und Text vorhanden
+      if (pseudotoolcalls && normalizedCalls.length === 0 && rawText) {
+        const pseudoCalls = extractPseudoToolCalls(rawText);
+        if (pseudoCalls.length > 0) {
+          const allowed = new Set((context_orig.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean));
+          const picked = pseudoCalls.find(pc => allowed.has(pc.name));
+          if (picked) {
+            let a = { ...(picked.arguments || {}) };
+            if (/image|getimage|sd|stable/i.test(picked.name)) {
+              const must = v => v != null && String(v).trim().length > 0;
+              if (!must(a.size)) a.size = defaultImageSize;
+              if (typeof a.size === "string") {
+                const s = a.size.toLowerCase().trim();
+                if (s === "square") a.size = "1024x1024";
+                if (/^\d{3,4}x\d{3,4}$/.test(s) === false) a.size = defaultImageSize;
+              } else a.size = defaultImageSize;
+            }
+            normalizedCalls = [{
+              id: `call_${Date.now()}_0`,
+              name: picked.name,
+              arguments: a
+            }];
+          }
         }
       }
-    }
 
-    // Tool(s) ausführen
-    if (normalizedCalls.length > 0) {
-      const call = normalizedCalls[0];
-      const fnName = call.name;
-      const args = call.arguments || {};
+      const hadToolCallsThisTurn = normalizedCalls.length > 0;
 
-      if (client && fnName) setBotPresence(client, "⌛ " + fnName, "online");
-      const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
+      // 5) assistant.tool_calls in den Verlauf SCHREIBEN (wichtig fürs Pairing!)
+      if (hadToolCallsThisTurn) {
+        const assistantToolMsg = {
+          role: "assistant",
+          tool_calls: normalizedCalls.map(c => ({
+            id: c.id,
+            type: "function",
+            function: { name: c.name, arguments: JSON.stringify(c.arguments || {}) }
+          }))
+        };
+        context.messages.push(assistantToolMsg);
+      }
 
-      const replyTool = (content) => {
-        const out = (typeof content === "string" || content == null)
-          ? (content || "")
-          : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
-        context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
-        const wrapped = formatToolResultForPersistence(fnName || "tool", out);
-        const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
-        try { context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, Date.now()); } catch {}
-        toolResults.push({ name: fnName || "tool", raw: out });
-        toolCommits.push({ name: fnName || "tool", content: out });
-      };
+      // 6) Tool(s) ausführen
+      if (hadToolCallsThisTurn) {
+        // non-pseudo: alle Calls ausführen; pseudo: nur den ersten (wir haben ohnehin nur 1 erzeugt)
+        const callsToRun = pseudotoolcalls ? normalizedCalls.slice(0, 1) : normalizedCalls;
 
-      if (!toolFunction) {
-        replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available.`);
+        for (const call of callsToRun) {
+          const fnName = call.name;
+          const args = call.arguments || {};
+
+          if (client && fnName) setBotPresence(client, "⌛ " + fnName, "online");
+          const toolFunction = context.toolRegistry ? context.toolRegistry[fnName] : undefined;
+
+          const replyTool = (content) => {
+            const out = (typeof content === "string" || content == null)
+              ? (content || "")
+              : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
+
+            // tool-Message für Pairing
+            context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
+
+            // Persist (TOOL_RESULT)
+            const wrapped = formatToolResultForPersistence(fnName || "tool", out);
+            const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
+            try { context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, Date.now()); } catch {}
+
+            // Für finale Ausgabe sammeln
+            toolResults.push({ name: fnName || "tool", raw: out });
+
+            // Logging
+            toolCommits.push({ name: fnName || "tool", content: out });
+          };
+
+          if (!toolFunction) {
+            replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available.`);
+            continue;
+          }
+
+          try {
+            dbg("Execute tool:", fnName, "args:", args);
+            const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
+            const toolResult = await toolFunction({ name: fnName, arguments: args }, handoverContext, getAIResponse, runtime);
+            const preview = typeof toolResult === "string" ? toolResult.slice(0, 300) : (() => { try { return JSON.stringify(toolResult).slice(0, 300); } catch { return String(toolResult).slice(0, 300); } })();
+            dbg("Tool result preview:", preview);
+            replyTool(toolResult || "");
+          } catch (toolErr) {
+            const emsg = toolErr?.message || String(toolErr);
+            await reportError(toolErr, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
+            dbg("Tool error:", fnName, emsg);
+            replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
+          }
+        }
+      }
+
+      // 7) Schleifensteuerung:
+      // - Pseudo: IMMER nach 1 Runde raus (max 1 Call)
+      // - Native: weiter, solange Tool-Calls; sonst ggf. Continue bei finish_reason === "length"
+      if (pseudotoolcalls) {
+        continueLoop = false; // genau ein Durchlauf
       } else {
-        try {
-          dbg("Execute tool:", fnName, "args:", args);
-          const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
-          const toolResult = await toolFunction({ name: fnName, arguments: args }, handoverContext, getAIResponse, runtime);
-          const preview = typeof toolResult === "string" ? toolResult.slice(0, 300) : (() => { try { return JSON.stringify(toolResult).slice(0, 300); } catch { return String(toolResult).slice(0, 300); } })();
-          dbg("Tool result preview:", preview);
-          replyTool(toolResult || "");
-        } catch (toolErr) {
-          const emsg = toolErr?.message || String(toolErr);
-          await reportError(toolErr, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
-          dbg("Tool error:", fnName, emsg);
-          replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
+        if (hadToolCallsThisTurn) {
+          continueLoop = true; // noch mal Modell fragen, jetzt mit tool-Antworten in der History
+        } else if (finishReason === "length" && rounds < sequenceLimit) {
+          // Continue-Logik: falls Text durchgelaufen ist
+          if (rawText) {
+            // optional: den Text in den Verlauf legen (damit er nicht verloren geht)
+            context.messages.push({ role: "assistant", content: rawText });
+          }
+          context.messages.push({ role: "user", content: "continue" });
+          continueLoop = true;
+        } else {
+          continueLoop = false;
         }
       }
-    }
+    } // END while chain
 
     /* ----- Antwortaufbereitung / Rendering ----- */
 
@@ -616,7 +680,7 @@ async function getAIResponse(
       else responseMessage = "";
     }
 
-    /* ----- 2nd Call: Finalisierungsturn (nur wenn sinnvoll) ----- */
+    /* ----- Finalisierungsturn (nur wenn sinnvoll) ----- */
 
     const looksLikeSingleUrl =
       rendered.length === 1 && /^https?:\/\//i.test(rendered[0]);
@@ -624,11 +688,21 @@ async function getAIResponse(
     const shouldSkipFinalizeForUrlOnly = pseudotoolcalls && looksLikeSingleUrl;
 
     if (postToolFinalize && toolResults.length > 0 && !shouldSkipFinalizeForUrlOnly) {
-      // Finalizer-Prompt bauen (ohne Tools, ohne Pseudo-Schema)
-      const finalizerSystem = buildFinalizerSystemPrompt();
-      const lastUserText = getLastUserText(cleanedHistory);
+      const configuredRaw =
+        (options?.endpoint || "").trim() ||
+        (process.env.OPENAI_API_URL || "").trim() ||
+        (OPENAI_API_URL || "").trim();
+      const endpoint = normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
+      const headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+      };
+      const authKey = apiKey || process.env.OPENAI_API_KEY;
+      if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
-      // Kompakt-Input aus Tool-Ergebnissen
+      const finalizerSystem = buildFinalizerSystemPrompt();
+      const lastUserText = getLastUserText(stripPersistedWrappers(context.messages));
+
       const MAX_ITEM_CHARS = 2000;
       const toolSummaries = toolResults.map(tr => {
         let s = tr.raw;
@@ -647,7 +721,6 @@ async function getAIResponse(
         model,
         messages: finalizeMessages,
         max_tokens: tokenlimit
-        // WICHTIG: KEINE tools/tool_choice hier!
       };
 
       dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, tools_in_payload: false });
@@ -658,16 +731,12 @@ async function getAIResponse(
         const finalText = (finalChoice?.message?.content || "").trim();
         if (finalText) responseMessage = finalText;
       } catch (finalErr) {
-        // Bei Fehler: Fallback auf bereits gerenderten responseMessage
         await reportError(finalErr, null, "OPENAI_FINALIZE", null);
         dbg("Finalize error:", finalErr?.message || String(finalErr));
       }
     }
 
-    // Persist tool outputs (Sicherheitsnetz)
-    // (bereits oben pro Tool getan; hier nur falls nötig)
-    // – intentionally left as-is
-
+    // Persist tool outputs (Schon pro Tool gemacht; hier kein Extra notwendig)
     return responseMessage;
   } catch (err) {
     const details = { status: err?.response?.status, data: err?.response?.data };
