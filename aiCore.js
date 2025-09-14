@@ -1,23 +1,10 @@
-// aiCore.js — refactored v2.17 (single-call pseudo, url-only response, stricter prose drop)
-// Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// v2.0: pendingUser working-copy + post-commit with original timestamp.
-// v2.3: prune orphan historical `tool` msgs when building payload.
-// v2.4: PERSIST tool results as `assistant` (or `system`) messages with a clear wrapper.
-// v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
-// v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
-// v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
-// v2.8: Hardened tool_call flow (no empty tool_calls; strict ordering intent in loop).
-// v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
-// v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
-// v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
-//        Added options.noPendingUserInjection to avoid duplicating user content in working copy.
-// v2.12: PSEUDO-TOOLCALLS for local models (Qwen/Llama/etc.)
-// v2.13: Extra debug (schema/tools, payload, assistant text, parsed pseudo-calls, tool exec)
-// v2.14: Pseudotoolcalls → do NOT send tools/tool_choice in payload (fix local 500s)
-// v2.15: Fix ReferenceError + short-circuit after tool exec in pseudo-mode + direct reply from tool result
-// v2.16: Stable retries + prompt pinning on correction + no prose accumulation in pseudo-mode
-// v2.17: In pseudo-mode execute ONLY ONE best tool-call, ignore empties, drop all prose,
-//         and return URL ONLY (no markdown) as final response.
+// aiCore.js — refactored v2.19
+// - NO fabricating tool-calls from last user prompt (as requested)
+// - NO auto-filling empty prompt from last user text
+// - Robust pseudo-call parsing (bare JSON, name+JSON, fenced code, xml-ish)
+// - Pseudo-mode: single best call, no prose, URL-only reply
+// - Argument sanitizer (keine Fremd-Befüllung von prompt), default size support
+// - noToolcallPolicy: "silent" | "error" | "echo"  (default: "silent")
 
 require("dotenv").config();
 const axios = require("axios");
@@ -275,77 +262,75 @@ function buildPseudoToolsInstruction(tools) {
   ].join("\n");
 }
 
+/** very tolerant pseudo-call extraction */
 function extractPseudoToolCalls(text) {
   if (!text || typeof text !== "string") return [];
-
   const calls = [];
 
-  // 1) XML-like tag <tool_call> ... </tool_call>
-  const reTag = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
-  let m;
-  while ((m = reTag.exec(text)) !== null) {
-    const raw = (m[1] || "").trim();
+  const pushIfValid = (obj) => {
     try {
-      const json = JSON.parse(raw);
-      if (json && typeof json === "object" && json.name) {
-        calls.push({ name: String(json.name), arguments: json.arguments || {} });
-      }
+      if (!obj || typeof obj !== "object") return;
+      // accept {name, arguments} or { tool: { name, arguments } } or { function: { name, arguments } }
+      const name =
+        obj.name ||
+        obj?.tool?.name ||
+        obj?.function?.name;
+      const args =
+        obj.arguments ||
+        obj?.tool?.arguments ||
+        obj?.function?.arguments ||
+        {};
+      if (!name) return;
+      calls.push({ name: String(name), arguments: args || {} });
     } catch {}
-  }
+  };
 
-  // 2) Code fence ```tool_call { ... } ``` and ```json { ... } ```
-  const reFence = /```(?:tool_call|json)\s*([\s\S]*?)```/gi;
-  while ((m = reFence.exec(text)) !== null) {
-    const raw = (m[1] || "").trim();
-    try {
-      const json = JSON.parse(raw);
-      if (json && typeof json === "object" && json.name) {
-        calls.push({ name: String(json.name), arguments: json.arguments || {} });
-      }
-    } catch {}
-  }
+  // 0) Try to parse whole text as JSON directly (bare JSON case)
+  try { pushIfValid(JSON.parse(text)); } catch {}
+
+  // 1) XML-like tag <tool_call> ... </tool_call>
+  (function(){
+    const re = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const raw = (m[1] || "").trim();
+      try { pushIfValid(JSON.parse(raw)); } catch {}
+    }
+  })();
+
+  // 2) Fenced code ```tool_call ...``` or ```json ...``` or ```javascript ...```
+  (function(){
+    const re = /```(?:tool_call|json|javascript|js)\s*([\s\S]*?)```/gi;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const raw = (m[1] || "").trim();
+      try { pushIfValid(JSON.parse(raw)); } catch {}
+    }
+  })();
 
   // 3) Variant: <toolcall>{...}</toolcall>
-  const reAlt = /<toolcall>([\s\S]*?)<\/toolcall>/gi;
-  while ((m = reAlt.exec(text)) !== null) {
-    const raw = (m[1] || "").trim();
-    try {
-      const json = JSON.parse(raw);
-      if (json && typeof json === "object" && json.name) {
-        calls.push({ name: String(json.name), arguments: json.arguments || {} });
-      }
-    } catch {}
-  }
+  (function(){
+    const re = /<toolcall>([\s\S]*?)<\/toolcall>/gi;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const raw = (m[1] || "").trim();
+      try { pushIfValid(JSON.parse(raw)); } catch {}
+    }
+  })();
+
+  // 4) Pattern: a line with a tool name, followed by a JSON block
+  //   e.g.  getImageSD\n{ "prompt": "...", "size": "..." }
+  (function(){
+    const re = /(^|\n)\s*([A-Za-z0-9_\-\.]+)\s*\n\s*(\{[\s\S]*\})/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const name = (m[2] || "").trim();
+      const json = (m[3] || "").trim();
+      try { pushIfValid({ name, arguments: JSON.parse(json) || {} }); } catch {}
+    }
+  })();
 
   return calls;
-}
-
-/** pick the single best pseudo-call: prefer one with non-empty arguments; fallback first */
-function pickBestPseudoCall(pseudoCalls) {
-  if (!Array.isArray(pseudoCalls) || pseudoCalls.length === 0) return null;
-  const hasValue = (v) => {
-    if (v == null) return false;
-    const s = String(v).trim();
-    return s.length > 0;
-  };
-  const score = (pc) => {
-    try {
-      const args = pc?.arguments || {};
-      const vals = Object.values(args);
-      if (vals.length === 0) return 0;
-      return vals.reduce((acc, v) => acc + (hasValue(v) ? 1 : 0), 0);
-    } catch { return 0; }
-  };
-  let best = pseudoCalls[0];
-  let bestScore = score(best);
-  for (let i = 1; i < pseudoCalls.length; i++) {
-    const sc = score(pseudoCalls[i]);
-    if (sc > bestScore) {
-      best = pseudoCalls[i];
-      bestScore = sc;
-    }
-  }
-  return best;
 }
 
 function lastConcreteUserPrompt(messages) {
@@ -359,6 +344,28 @@ function lastConcreteUserPrompt(messages) {
     return c;
   }
   return "";
+}
+
+/** sanitize/complete args for image-like tools (ohne Auto-Prompt-Fill) */
+function sanitizeArgsForImageTool(args, options = {}) {
+  const out = Object.assign({}, args || {});
+  const defSize = options.defaultImageSize || "1024x1024";
+  const must = (v) => v != null && String(v).trim().length > 0;
+
+  // Keine Fremd-Übernahme von prompt aus text/query/description? -> wir erlauben lediglich Synonyme innerhalb des gleichen Call-Objekts.
+  if (!must(out.prompt) && must(out.text)) { out.prompt = String(out.text).trim(); delete out.text; }
+  if (!must(out.prompt) && must(out.query)) { out.prompt = String(out.query).trim(); delete out.query; }
+  if (!must(out.prompt) && must(out.description)) { out.prompt = String(out.description).trim(); delete out.description; }
+
+  if (!must(out.size)) out.size = defSize;
+  if (typeof out.size === "string") {
+    const s = out.size.toLowerCase().trim();
+    if (s === "square") out.size = "1024x1024";
+    if (/^\d{3,4}x\d{3,4}$/.test(s) === false) out.size = defSize;
+  } else {
+    out.size = defSize;
+  }
+  return out;
 }
 
 /**
@@ -376,6 +383,8 @@ async function getAIResponse(
   let responseMessage = "";
   const pendingUser = options?.pendingUser || null;
   const noPendingInject = options?.noPendingUserInjection === true;
+
+  const noToolcallPolicy = options?.noToolcallPolicy || "silent"; // "silent" | "error" | "echo"
 
   let context = null;
   let handoverContext = null;
@@ -405,8 +414,6 @@ async function getAIResponse(
       { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudoFlag }
     );
     handoverContext.messages = [...context_orig.messages];
-
-    const toolRegistry = context.toolRegistry;
 
     // Compose system
     try {
@@ -460,6 +467,7 @@ async function getAIResponse(
 
     let hadToolCallsThisTurn = false;
     let lastToolResults = [];
+    let lastRawAssistant = ""; // für noToolcallPolicy="echo"
 
     do {
       hadToolCallsThisTurn = false;
@@ -540,26 +548,20 @@ async function getAIResponse(
       const toolCallsFromModel = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
       let hasToolCalls = toolCallsFromModel.length > 0;
 
-      // Assistant content (drop prose completely in pseudo-mode)
-      let assistantText = typeof aiMessage.content === "string" ? aiMessage.content.trim() : "";
-      if (assistantText) dbg("Assistant text (raw):", assistantText);
-      if (pseudoFlag) {
-        // regardless of hasToolCalls: never accumulate prose in pseudo mode
-        assistantText = "";
-      }
+      // Assistant content
+      const rawFromModel = (aiMessage.content || "").trim();
+      if (rawFromModel) dbg("Assistant text (raw):", rawFromModel);
+      lastRawAssistant = rawFromModel;
+      let assistantText = pseudoFlag ? "" : rawFromModel; // Pseudo: nie Prosa akkumulieren
 
-      // Pseudo detection
+      // Pseudo detection (from raw text)
       let pseudoCalls = [];
-      if (pseudoFlag === true) {
-        // we still need to parse pseudo blocks from the raw message text (already in `choice`)
-        const rawFromModel = (aiResponse?.data?.choices?.[0]?.message?.content || "").trim();
-        if (rawFromModel) {
-          pseudoCalls = extractPseudoToolCalls(rawFromModel);
-          if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
-        }
+      if (pseudoFlag && rawFromModel) {
+        pseudoCalls = extractPseudoToolCalls(rawFromModel);
+        if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
       }
 
-      // In pseudo-mode: if no toolcalls were produced, issue strict correction (max 2 tries)
+      // In pseudo-mode: wenn kein Toolcall -> bis zu 2 Korrekturen senden, danach NICHT fabrizieren
       if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0) {
         if (pseudoRetryCount < pseudoRetryMax) {
           pseudoRetryCount++;
@@ -575,11 +577,12 @@ async function getAIResponse(
           sequenceCounter++;
           continue;
         } else {
-          dbg("Max pseudo retries reached; giving up without prose.");
+          dbg("Max pseudo retries reached — no toolcall fabricated (per policy).");
+          // wir brechen die Schleife ohne Tool-Ausführung
+          break;
         }
       }
 
-      // (Do not add assistantText; in pseudo mode it's always dropped)
       if (!pseudoFlag && assistantText) {
         responseMessage += assistantText;
       }
@@ -590,10 +593,35 @@ async function getAIResponse(
         context.messages.push({ role: "assistant", tool_calls: toolCallsFromModel });
       }
 
-      // Pseudo → fabricate exactly ONE best tool_call
+      // Pseudo → genau EIN bester Toolcall aus Parsed Calls
       if (pseudoCalls.length > 0 && pseudoFlag) {
-        const best = pickBestPseudoCall(pseudoCalls);
+        const best = (function pickBest(pseudoCalls) {
+          if (!Array.isArray(pseudoCalls) || pseudoCalls.length === 0) return null;
+          const hasValue = (v) => v != null && String(v).trim().length > 0;
+          const score = (pc) => {
+            try {
+              const args = pc?.arguments || {};
+              const vals = Object.values(args);
+              if (vals.length === 0) return 0;
+              return vals.reduce((acc, v) => acc + (hasValue(v) ? 1 : 0), 0);
+            } catch { return 0; }
+          };
+          let best = pseudoCalls[0];
+          let bestScore = score(best);
+          for (let i = 1; i < pseudoCalls.length; i++) {
+            const sc = score(pseudoCalls[i]);
+            if (sc > bestScore) { best = pseudoCalls[i]; bestScore = sc; }
+          }
+          return best;
+        })(pseudoCalls);
+
         if (best) {
+          // Falls es ein Image-Tool ist, nur technische Defaults (size) ergänzen – prompt bleibt, wie geliefert
+          if (/image|getimage|sd|stable/i.test(best.name)) {
+            best.arguments = sanitizeArgsForImageTool(best.arguments, {
+              defaultImageSize: options.defaultImageSize || "1024x1024",
+            });
+          }
           const fabricated = [{
             id: `call_${Date.now()}_0`,
             type: "function",
@@ -611,7 +639,7 @@ async function getAIResponse(
 
         const callsToHandle = context.messages[context.messages.length - 1]?.tool_calls || [];
 
-        // In pseudo-mode: ensure we execute ONLY the first call
+        // In pseudo-mode: ONLY first call ausführen
         const loopCalls = pseudoFlag ? callsToHandle.slice(0, 1) : callsToHandle;
 
         for (const toolCall of loopCalls) {
@@ -644,6 +672,14 @@ async function getAIResponse(
             const raw = toolCall?.function?.arguments || "{}";
             parsedArgs = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
           } catch { parsedArgs = {}; }
+
+          // Nur Defaults ergänzen (z. B. size), niemals prompt aus Usertext befüllen
+          if (/image|getimage|sd|stable/i.test(fnName)) {
+            parsedArgs = sanitizeArgsForImageTool(parsedArgs, {
+              defaultImageSize: options.defaultImageSize || "1024x1024",
+            });
+          }
+
           dbg("Execute tool:", fnName, "args:", parsedArgs);
 
           try {
@@ -664,7 +700,7 @@ async function getAIResponse(
           }
         }
 
-        // In pseudo-mode: do not start assistant "continue" turns. We will break out.
+        // In pseudo-mode: keine "continue"-Turns
         if (pseudoFlag) {
           continueResponse = false;
           break;
@@ -715,15 +751,31 @@ async function getAIResponse(
       }
 
       if (urls.length > 0) {
-        if (pseudoFlag) {
-          responseMessage = urls[0]; // just the first URL, plain text
+        if (options.urlList === true) {
+          responseMessage = urls.join("\n"); // explicit list
+        } else if (options.pseudotoolcalls === true || context_orig?.pseudoToolcalls === true) {
+          responseMessage = urls[0]; // plain URL
         } else {
           responseMessage = urls.map(u => `![result](${u})\n<${u}>`).join("\n");
         }
       } else if (responseMessage.trim().length === 0) {
-        // no URL – fall back to last tool raw content (trimmed)
-        const raw = String(lastToolResults[lastToolResults.length - 1] || "").trim();
-        responseMessage = raw.length > 1500 ? (raw.slice(0, 1490) + " …") : raw;
+        // kein URL-Ergebnis – Fallback je Policy
+        if (noToolcallPolicy === "error") {
+          responseMessage = "TOOLCALL_MISSING";
+        } else if (noToolcallPolicy === "echo") {
+          responseMessage = String(lastRawAssistant || "");
+        } else {
+          responseMessage = ""; // silent
+        }
+      }
+    } else if (responseMessage.trim().length === 0) {
+      // gar kein Tool ausgeführt und nichts akkumuliert
+      if (noToolcallPolicy === "error") {
+        responseMessage = "TOOLCALL_MISSING";
+      } else if (noToolcallPolicy === "echo") {
+        responseMessage = String(lastRawAssistant || "");
+      } else {
+        responseMessage = ""; // silent
       }
     }
 
