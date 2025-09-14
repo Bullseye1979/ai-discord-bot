@@ -1,11 +1,11 @@
-// aiCore.js — unified flow v2.30
-// - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
-// - Wenn pseudotoolcalls=true: generiere Tool-Definition + Pseudo-Schema aus freigegebenen tools (context.tools)
-// - Erkanntes Pseudo-Call-Block -> in normalen tool_call normalisieren -> toolRegistry ausführen
-// - Kein Fabricate, kein Auto-Prompt-Fill, keine Auto-Retries, kein Auto-Continue
-// - Tool-Response wird zusätzlich als [TOOL_RESULT:<name>] persistiert (kompatibel für Modelle ohne Tools)
-// - Benutzerantwort: URL/Liste/JSON (einfach anpassbar)
-// - Transport-Hardening + Retry beibehalten
+// aiCore.js — unified flow v2.32
+// - EIN Flow für native & Pseudo-Tools (Flag: pseudotoolcalls)
+// - Pseudo: injiziere Tool-Definition + Regeln (nur tool_call, NIEMALS TOOL_RESULT)
+// - Historie vor dem Senden bereinigen: entferne persistierte [TOOL_RESULT:*] / [TOOL_OUTPUT:*]
+// - Parser akzeptiert: <tool_call>…</tool_call>, ```tool_call```, reines JSON, NAME\n{…}
+//   => [TOOL_RESULT:*] wird ignoriert (triggert KEIN Tool)
+// - Kein Fabricate, kein Auto-Fill, kein Auto-Continue
+// - Tool-Result wird weiterhin als [TOOL_RESULT:<name>] persistiert (nur für Logging/Anzeige)
 
 require("dotenv").config();
 const axios = require("axios");
@@ -21,19 +21,8 @@ const DEBUG = String(process.env.PSEUDO_TOOLS_DEBUG || "1") === "1";
 const dbg = (...args) => { if (DEBUG) { try { console.log("[AI]", ...args); } catch {} } };
 
 /* -------------------- Transport -------------------- */
-
-const keepAliveHttpAgent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 16,
-  maxFreeSockets: 16,
-  timeout: 30_000,
-});
-const keepAliveHttpsAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 16,
-  maxFreeSockets: 16,
-  timeout: 30_000,
-});
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 16, timeout: 30_000 });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 16, timeout: 30_000 });
 
 const axiosAI = axios.create({
   httpAgent: keepAliveHttpAgent,
@@ -57,9 +46,7 @@ async function postWithRetry(url, payload, headers, tries = 3) {
       if (res.status >= 200 && res.status < 300) return res;
 
       console.error("[AI POST][NON-2XX]", {
-        try: i + 1,
-        status: res.status,
-        statusText: res.statusText,
+        try: i + 1, status: res.status, statusText: res.statusText,
         dataPreview: typeof res.data === "string" ? res.data.slice(0, 1200) : res.data,
       });
       if (res.status >= 400 && res.status < 500) {
@@ -72,9 +59,7 @@ async function postWithRetry(url, payload, headers, tries = 3) {
       const transient = ["ECONNRESET","EPIPE","ETIMEDOUT"].includes(err?.code) ||
                         /socket hang up|ERR_STREAM_PREMATURE_CLOSE/.test(String(err?.message||""));
       console.error("[AI POST][ERROR]", {
-        try: i + 1,
-        code: err?.code,
-        message: err?.message,
+        try: i + 1, code: err?.code, message: err?.message,
         status: err?.response?.status || null,
         dataPreview: typeof err?.response?.data === "string" ? err.response.data.slice(0, 1200) : err?.response?.data || null,
       });
@@ -86,7 +71,6 @@ async function postWithRetry(url, payload, headers, tries = 3) {
 }
 
 /* -------------------- Helpers -------------------- */
-
 function normalizeEndpoint(raw) {
   const fallback = "https://api.openai.com/v1/chat/completions";
   let url = (raw || "").trim();
@@ -103,12 +87,25 @@ function cleanOpenAIName(role, name) {
   let s = String(name).trim()
     .replace(/[\s<|\\/>\u0000-\u001F]/g, "_")
     .replace(/[^A-Za-z0-9._-]/g, "_")
-    .replace(/_{2,}/g, "_")
-    .replace(/^_+|_+$/g, "");
+    .replace(/_{2,}/g, "_").replace(/^_+|_+$/g, "");
   s = s.slice(0, 64);
   const reserved = new Set(["assistant", "user", "system", "tool"]);
   if (!s || reserved.has(s.toLowerCase())) return undefined;
   return s;
+}
+
+/** Entfernt persistierte Wrapper ([TOOL_RESULT:*], [TOOL_OUTPUT:*]) aus der Historie */
+function stripPersistedWrappers(msgs) {
+  const reWrap = /^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:[^\]]+\]/i;
+  return (msgs || []).filter(m => {
+    if (!m || typeof m.content !== "string") return true;
+    const c = m.content.trim();
+    // wir strippen nur assistant/system – user msgs bleiben immer
+    if (m.role === "assistant" || m.role === "system") {
+      if (reWrap.test(c)) return false; // -> nicht ans Modell schicken
+    }
+    return true;
+  });
 }
 
 function buildStrictToolPairedMessages(msgs) {
@@ -137,7 +134,6 @@ function buildStrictToolPairedMessages(msgs) {
 }
 
 /* ---- Persist Tool Results ---- */
-
 const TOOL_PERSIST_ROLE =
   (process.env.TOOL_PERSIST_ROLE || "assistant").toLowerCase() === "system" ? "system" : "assistant";
 
@@ -158,7 +154,6 @@ function formatToolResultForPersistence(toolName, content) {
 }
 
 /* ---- Pseudo-Tools: Definition + Parser ---- */
-
 function buildPseudoToolsInstruction(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return "";
   const MAX_TOTAL = Math.max(2000, Number(process.env.PSEUDO_SCHEMA_MAX || 6000));
@@ -228,6 +223,7 @@ function buildPseudoToolsInstruction(tools) {
     "- The block must be the ONLY content (no prose).",
     "- Use exactly ONE tool per message.",
     "- JSON must be valid.",
+    "- NEVER output [TOOL_RESULT:…] or similar markers. Only send a tool_call block.",
     "",
     "AVAILABLE TOOLS:"
   ];
@@ -247,7 +243,7 @@ function buildPseudoToolsInstruction(tools) {
   return text;
 }
 
-/** toleranter Pseudo-Call-Extractor (KEIN Fabricate) */
+/** Pseudo-Toolcall-Extractor (ignoriert TOOL_RESULT) */
 function extractPseudoToolCalls(text) {
   if (!text || typeof text !== "string") return [];
   const calls = [];
@@ -261,28 +257,37 @@ function extractPseudoToolCalls(text) {
     } catch {}
   };
 
-  try { pushIfValid(JSON.parse(text)); } catch {}
+  // 0) reines JSON (nicht mit [TOOL_RESULT] beginnen lassen)
+  try {
+    const trimmed = text.trim();
+    if (!/^\[TOOL_RESULT\s*:/.test(trimmed)) pushIfValid(JSON.parse(trimmed));
+  } catch {}
+
+  // 1) XML <tool_call>…</tool_call>
   (function(){
     const re = /<tool_call>([\s\S]*?)<\/tool_call>/gi; let m;
     while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
   })();
+
+  // 2) Fenced ```tool_call
   (function(){
     const re = /```(?:tool_call|json|javascript|js)\s*([\s\S]*?)```/gi; let m;
     while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
   })();
-  (function(){
-    const re = /<toolcall>([\s\S]*?)<\/toolcall>/gi; let m;
-    while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
-  })();
+
+  // 3) NAME\n{…}
   (function(){
     const re = /(^|\n)\s*([A-Za-z0-9_\-\.]+)\s*\n\s*(\{[\s\S]*\})/g; let m;
     while ((m = re.exec(text)) !== null) { const name=(m[2]||"").trim(); const json=(m[3]||"").trim(); try { pushIfValid({ name, arguments: JSON.parse(json)||{} }); } catch {} }
   })();
+
+  // 4) EXPLIZIT IGNORIEREN: [TOOL_RESULT:*]… (kein Tool-Trigger)
+  // (kein Code nötig – wir parsen es einfach nicht)
+
   return calls;
 }
 
 /* ---- Rendering für User-Antwort ---- */
-
 function prettyClipJSON(any, max = 1800) {
   let s;
   try { s = typeof any === "string" ? any : JSON.stringify(any, null, 2); }
@@ -292,14 +297,11 @@ function prettyClipJSON(any, max = 1800) {
 }
 
 function renderToolOutputGeneric(name, raw) {
-  // 1) string?
   if (typeof raw === "string" && raw.trim()) {
     const s = raw.trim();
-    if (/^https?:\/\//i.test(s)) return s; // Plain URL
+    if (/^https?:\/\//i.test(s)) return s;
     try { return renderToolOutputGeneric(name, JSON.parse(s)); } catch { return prettyClipJSON(s); }
   }
-
-  // 2) object?
   if (raw && typeof raw === "object") {
     const obj = raw;
     const url = obj.url || obj.link || obj.href;
@@ -334,16 +336,14 @@ function renderToolOutputGeneric(name, raw) {
 
     return prettyClipJSON(obj);
   }
-
   return "";
 }
 
 /* -------------------- Main -------------------- */
-
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
-  sequenceLimit = 1000, // (unbenutzt – kein auto-continue)
+  sequenceLimit = 1000, // (nicht genutzt – kein auto-continue)
   model = "gpt-4o",
   apiKey = null,
   options = {},
@@ -361,25 +361,12 @@ async function getAIResponse(
   let handoverContext = null;
 
   try {
-    // Working copies
-    context = new Context(
-      "",
-      "",
-      context_orig.tools,
-      context_orig.toolRegistry,
-      context_orig.channelId || null,
-      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudotoolcalls }
-    );
+    context = new Context("", "", context_orig.tools, context_orig.toolRegistry, context_orig.channelId || null,
+      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudotoolcalls });
     context.messages = [...context_orig.messages];
 
-    handoverContext = new Context(
-      "",
-      "",
-      context_orig.tools,
-      context_orig.toolRegistry,
-      context_orig.channelId || null,
-      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudotoolcalls }
-    );
+    handoverContext = new Context("", "", context_orig.tools, context_orig.toolRegistry, context_orig.channelId || null,
+      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudotoolcalls });
     handoverContext.messages = [...context_orig.messages];
 
     // System priming
@@ -390,7 +377,6 @@ async function getAIResponse(
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
       if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
 
-      // WICHTIG: Pseudo-Definition nur dann injizieren, wenn pseudotoolcalls = true
       if (pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
         const schema = buildPseudoToolsInstruction(context_orig.tools);
         if (schema) sysParts.push(schema);
@@ -407,7 +393,7 @@ async function getAIResponse(
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
-    // Pending user → nur working copy (falls gewünscht)
+    // Pending user
     if (pendingUser && pendingUser.content && !noPendingInject) {
       const safeName = cleanOpenAIName("user", pendingUser.name || "user");
       const msg = { role: "user", content: pendingUser.content };
@@ -417,12 +403,15 @@ async function getAIResponse(
     }
 
     const toolCommits = [];
-    const toolResults = []; // { name, raw }[]
+    const toolResults = [];
     let lastRawAssistant = "";
 
-    // ---- EIN Zyklus: Anfrage -> (optional) Tool -> Antwort ----
+    // --- 1. History bereinigen ---
+    const cleanedHistory = stripPersistedWrappers(context.messages);
 
-    const messagesToSend = buildStrictToolPairedMessages(context.messages).map(m => {
+    // --- 2. Senden ---
+    const safeMsgs = buildStrictToolPairedMessages(cleanedHistory);
+    const messagesToSend = safeMsgs.map(m => {
       const out = { role: m.role, content: m.content };
       const safeName = cleanOpenAIName(m.role, m.name);
       if (safeName) out.name = safeName;
@@ -431,112 +420,71 @@ async function getAIResponse(
       return out;
     });
 
-    const payload = {
-      model,
-      messages: messagesToSend,
-      max_tokens: tokenlimit
-    };
-
-    // EIN Flow:
-    // - Wenn pseudotoolcalls=false -> native tools erlauben
-    // - Wenn pseudotoolcalls=true -> KEINE native tools im Payload; das Modell soll Pseudo-Blöcke schicken
+    const payload = { model, messages: messagesToSend, max_tokens: tokenlimit };
     if (!pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
       payload.tools = context_orig.tools;
       payload.tool_choice = "auto";
     }
 
-    const configuredRaw =
-      (options?.endpoint || "").trim() ||
-      (process.env.OPENAI_API_URL || "").trim() ||
-      (OPENAI_API_URL || "").trim();
-
+    const configuredRaw = (options?.endpoint || "").trim() || (process.env.OPENAI_API_URL || "").trim() || (OPENAI_API_URL || "").trim();
     const endpoint = normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
-    const headers = {
-      "Content-Type": "application/json",
-      "Connection": "keep-alive",
-    };
+    const headers = { "Content-Type": "application/json", "Connection": "keep-alive" };
     const authKey = apiKey || process.env.OPENAI_API_KEY;
     if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
     dbg("Request →", {
-      endpoint,
-      model,
-      tokenlimit,
-      pseudotoolcalls,
+      endpoint, model, tokenlimit, pseudotoolcalls,
       tools_in_payload: !!payload.tools,
       tools_list: Array.isArray(context_orig.tools) ? context_orig.tools.map(t => t?.function?.name || t?.name) : []
     });
 
-    let aiResponse;
-    try {
-      aiResponse = await postWithRetry(endpoint, payload, headers, 3);
-    } catch (err) {
-      const details = { endpoint, status: err?.response?.status, data: err?.response?.data };
-      await reportError(err, null, "OPENAI_CHAT", { details });
-      try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify({ endpoint, model, payloadPreview: { messages: messagesToSend.slice(-6), tools: payload.tools ? (payload.tools.map(t => t?.function?.name || t?.name)) : [] } }, null, 2)); } catch {}
-      console.log("\n\n=== CONTEXT RAW DUMP ===\n", context?.messages || [], "\n=== /CONTEXT RAW DUMP ===\n");
-      throw err;
-    }
-
+    const aiResponse = await postWithRetry(endpoint, payload, headers, 3);
     const choice = aiResponse?.data?.choices?.[0] || {};
     const aiMessage = choice.message || {};
     const rawText = (aiMessage.content || "").trim();
     lastRawAssistant = rawText;
     const nativeToolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
-
     dbg("Assistant text (raw):", rawText ? rawText.slice(0, 200) : "(empty)");
     if (nativeToolCalls.length > 0) dbg("Native tool_calls:", nativeToolCalls.map(tc => tc?.function?.name));
 
-    // --- Toolcall-Normalisierung ---
-    // 1) Native tool_calls (wenn vorhanden)
+    // --- 3. Toolcall normalisieren ---
     let normalizedCalls = [];
-    if (nativeToolCalls.length > 0) {
-      normalizedCalls = nativeToolCalls
-        .map(tc => {
-          try {
-            const name = tc?.function?.name;
-            if (!name) return null;
-            let args = tc?.function?.arguments || "{}";
-            args = typeof args === "string" ? JSON.parse(args || "{}") : (args || {});
-            return { id: tc.id || `call_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name, arguments: args };
-          } catch { return null; }
-        })
-        .filter(Boolean);
-    }
 
-    // 2) Falls pseudotoolcalls=true und KEINE native calls → Pseudo-Block parsen
-    if (pseudotoolcalls && normalizedCalls.length === 0 && rawText) {
+    if (nativeToolCalls.length > 0) {
+      normalizedCalls = nativeToolCalls.map(tc => {
+        try {
+          const name = tc?.function?.name;
+          if (!name) return null;
+          let args = tc?.function?.arguments || "{}";
+          args = typeof args === "string" ? JSON.parse(args || "{}") : (args || {});
+          return { id: tc.id || `call_${Date.now()}_${Math.random().toString(36).slice(2,7)}`, name, arguments: args };
+        } catch { return null; }
+      }).filter(Boolean);
+    } else if (pseudotoolcalls && rawText) {
       const pseudoCalls = extractPseudoToolCalls(rawText);
       if (pseudoCalls.length > 0) {
-        // nur Tools, die freigegeben sind
         const allowed = new Set((context_orig.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean));
         const picked = pseudoCalls.find(pc => allowed.has(pc.name));
         if (picked) {
-          normalizedCalls = [{
-            id: `call_${Date.now()}_0`,
-            name: picked.name,
-            arguments: (function sanitize(name, args) {
-              // KEIN Autofill. Nur techn. Defaults (z. B. size) für Image-Tools
-              let a = Object.assign({}, args || {});
-              if (/image|getimage|sd|stable/i.test(name)) {
-                const must = v => v != null && String(v).trim().length > 0;
-                if (!must(a.size)) a.size = defaultImageSize;
-                if (typeof a.size === "string") {
-                  const s = a.size.toLowerCase().trim();
-                  if (s === "square") a.size = "1024x1024";
-                  if (/^\d{3,4}x\d{3,4}$/.test(s) === false) a.size = defaultImageSize;
-                } else a.size = defaultImageSize;
-              }
-              return a;
-            })(picked.name, picked.arguments)
-          }];
+          // Nur Image-Defaults (size). Kein Autofill von prompt.
+          const args = Object.assign({}, picked.arguments || {});
+          if (/image|getimage|sd|stable/i.test(picked.name)) {
+            const must = v => v != null && String(v).trim().length > 0;
+            if (!must(args.size)) args.size = defaultImageSize;
+            if (typeof args.size === "string") {
+              const s = args.size.toLowerCase().trim();
+              if (s === "square") args.size = "1024x1024";
+              if (/^\d{3,4}x\d{3,4}$/.test(s) === false) args.size = defaultImageSize;
+            } else args.size = defaultImageSize;
+          }
+          normalizedCalls = [{ id: `call_${Date.now()}_0`, name: picked.name, arguments: args }];
         }
       }
+      // WICHTIG: [TOOL_RESULT:*] wird bewusst nicht als Call akzeptiert
     }
 
-    // --- Tool(s) ausführen (einheitlich) ---
+    // --- 4. Tool ausführen (nur den ersten) ---
     if (normalizedCalls.length > 0) {
-      // Nur den ersten ausführen (klarer, deterministisch)
       const call = normalizedCalls[0];
       const fnName = call.name;
       const args = call.arguments || {};
@@ -548,15 +496,17 @@ async function getAIResponse(
         const out = (typeof content === "string" || content == null)
           ? (content || "")
           : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
-        // 1) Tool-Message für pairing (falls später nützlich)
+
+        // Pairing-Tool-Message (nur lokal)
         context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
-        // 2) Persist-kompatibel (für Modelle ohne Tools)
+
+        // Persistiert als Wrapper (wird künftig gefiltert und NICHT mehr ans Modell geschickt)
         const wrapped = formatToolResultForPersistence(fnName || "tool", out);
         const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
         try { context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, Date.now()); } catch {}
-        // 3) Für User-Antwort halten
+
+        // Für Benutzerantwort & Logs
         toolResults.push({ name: fnName || "tool", raw: out });
-        // 4) Für Logging-Queue
         toolCommits.push({ name: fnName || "tool", content: out });
       };
 
@@ -579,13 +529,12 @@ async function getAIResponse(
       }
     }
 
-    // --- Benutzer-Antwort zusammenbauen ---
+    // --- 5. Benutzer-Antwort ---
     if (toolResults.length > 0) {
       const rendered = [];
       for (const item of toolResults) {
         const { name, raw } = item;
-        let obj = null;
-        try { obj = JSON.parse(raw); } catch {}
+        let obj = null; try { obj = JSON.parse(raw); } catch {}
         rendered.push(renderToolOutputGeneric(name, obj ?? raw));
       }
       const joined = rendered.filter(Boolean).join("\n\n");
@@ -596,7 +545,6 @@ async function getAIResponse(
         else responseMessage = "";
       }
     } else {
-      // Kein Tool – liefere einfach das Model-Text-Ergebnis zurück
       responseMessage = String(lastRawAssistant || "");
       if (!responseMessage) {
         if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
@@ -604,7 +552,7 @@ async function getAIResponse(
       }
     }
 
-    // Persist tool outputs (der Vollständigkeit halber, falls oben mal fehlschlug)
+    // Persist (Sicherheitshalber)
     if (toolCommits.length > 0) {
       let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
