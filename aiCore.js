@@ -1,10 +1,8 @@
-// aiCore.js — refactored v2.19
-// - NO fabricating tool-calls from last user prompt (as requested)
-// - NO auto-filling empty prompt from last user text
-// - Robust pseudo-call parsing (bare JSON, name+JSON, fenced code, xml-ish)
-// - Pseudo-mode: single best call, no prose, URL-only reply
-// - Argument sanitizer (keine Fremd-Befüllung von prompt), default size support
-// - noToolcallPolicy: "silent" | "error" | "echo"  (default: "silent")
+// aiCore.js — refactored v2.21
+// - Neutraler Pseudo-Tools-Guide wird dynamisch aus tools.js (OpenAI JSON-Schema) erzeugt
+// - Entfernt image-lastiges Beispiel (kein globales "prompt/size")
+// - Beibehaltung v2.19-Features: kein Fabricate, kein Auto-Prompt-Fill, robuster Parser,
+//   Pseudo-Mode: ein Toolcall, keine Prosa, Antwort = nur URL; noToolcallPolicy: "silent" | "error" | "echo"
 
 require("dotenv").config();
 const axios = require("axios");
@@ -224,17 +222,74 @@ function loadEnvPriming() {
 
 /* -------------------- Pseudo tool-calls helpers -------------------- */
 
-function buildPseudoToolsInstruction(tools) {
+/**
+ * buildPseudoToolsInstruction — neutraler Schema-Text aus realen tools.js-Definitionen
+ * Unterstützt OpenAI-Style:
+ * tools = [{ type: "function", function: { name, description, parameters: JSONSchema } }, ...]
+ * Wird im Pseudo-Mode als Systemprompt-Instruktion eingefügt.
+ */
+function buildPseudoToolsInstruction(tools, opts = {}) {
   if (!Array.isArray(tools) || tools.length === 0) return "";
-  const names = tools
-    .map(t => t?.function?.name || t?.name)
-    .filter(Boolean);
 
-  if (names.length === 0) return "";
+  const MAX_TOTAL_CHARS = Math.max(2000, Number(process.env.PSEUDO_SCHEMA_MAX || 6000));
+  const MAX_TOOLS = Math.max(1, Number(process.env.PSEUDO_SCHEMA_MAX_TOOLS || 16));
+  const MAX_KEYS_PER_TOOL = Math.max(1, Number(process.env.PSEUDO_SCHEMA_MAX_KEYS || 14));
+  const DESC_LIMIT = Math.max(80, Number(process.env.PSEUDO_SCHEMA_DESC_LIMIT || 200));
 
-  const exampleTool = names[0];
+  const pick = (arr, n) => Array.isArray(arr) ? arr.slice(0, n) : [];
+  const clampStr = (s, n) => (String(s || "").length > n ? (String(s).slice(0, n - 1) + "…") : String(s || ""));
+  const typeOfProp = (prop) => {
+    if (!prop) return "any";
+    if (Array.isArray(prop.type)) return prop.type.join("|");
+    if (prop.type) return String(prop.type);
+    if (prop.enum) return `enum(${prop.enum.length})`;
+    if (prop.anyOf) return "anyOf";
+    if (prop.oneOf) return "oneOf";
+    if (prop.allOf) return "allOf";
+    return "any";
+  };
 
-  return [
+  // Extrahiere je Tool: name, required[], properties (Top-Level), Beispiel
+  const entries = [];
+  for (const t of tools) {
+    const f = t && (t.function || t.fn || t); // robust gegen leicht andere Strukturen
+    const name = f?.name ? String(f.name) : null;
+    if (!name) continue;
+
+    const params = f?.parameters && typeof f.parameters === "object" ? f.parameters : null;
+    const props = params?.properties && typeof params.properties === "object" ? params.properties : {};
+    const required = Array.isArray(params?.required) ? params.required : [];
+
+    // Liste der Keys + Typen begrenzen
+    const keys = Object.keys(props);
+    const shownKeys = pick(keys, MAX_KEYS_PER_TOOL).map(k => {
+      const typ = typeOfProp(props[k]);
+      return `- ${k} (${typ})`;
+    });
+    if (keys.length > shownKeys.length) {
+      shownKeys.push(`- …(+${keys.length - shownKeys.length} weitere)`);
+    }
+
+    // Minimal-Beispiel: nur required keys mit Dummy-Werten
+    const sampleArgs = {};
+    for (const rk of required) {
+      const p = props[rk] || {};
+      const typ = typeOfProp(p);
+      if (typ.includes("number") || typ === "integer") sampleArgs[rk] = 0;
+      else if (typ.includes("boolean")) sampleArgs[rk] = false;
+      else if (p?.enum && Array.isArray(p.enum) && p.enum.length > 0) sampleArgs[rk] = p.enum[0];
+      else sampleArgs[rk] = ""; // string/any
+    }
+
+    const desc = f?.description ? clampStr(f.description, DESC_LIMIT) : "";
+    entries.push({ name, required, shownKeys, sampleArgs, desc });
+    if (entries.length >= MAX_TOOLS) break;
+  }
+
+  if (entries.length === 0) return "";
+
+  // Baue die neutrale Instruktion
+  let out = [
     "You MUST use tools via *pseudo tool-calls* when needed.",
     "Output **ONLY** one block, no other text.",
     "",
@@ -252,17 +307,33 @@ function buildPseudoToolsInstruction(tools) {
     "RULES:",
     "- The block must be the ONLY content in your message (no prose before/after).",
     "- Use exactly ONE tool per message.",
-    "- JSON must be valid.",
-    `- Available tools: ${names.join(", ")}`,
-    "",
-    "EXAMPLE:",
-    "<tool_call>",
-    `{ "name": "${exampleTool}", "arguments": { "prompt": "a cute robot, cinematic light, 4k", "size": "1024x1024" } }`,
-    "</tool_call>",
-  ].join("\n");
+    "- JSON must be valid."
+  ];
+
+  out.push(`- Available tools: ${entries.map(e => e.name).join(", ")}`, "", "TOOLS:");
+  for (const e of entries) {
+    out.push(`- ${e.name}${e.desc ? ` — ${e.desc}` : ""}`);
+    if (e.required.length > 0) out.push(`  required: ${e.required.join(", ")}`);
+    else out.push(`  required: (none)`);
+    out.push("  keys:");
+    for (const line of e.shownKeys) out.push(`  ${line}`);
+    // Minimalbeispiel
+    const sample = JSON.stringify({ name: e.name, arguments: e.sampleArgs }, null, 2);
+    out.push("  example:");
+    out.push("  ```tool_call");
+    out.push(sample.split("\n").map(l => "  " + l).join("\n"));
+    out.push("  ```");
+  }
+
+  let text = out.join("\n");
+  const MAX_TOTAL = MAX_TOTAL_CHARS;
+  if (text.length > MAX_TOTAL) {
+    text = text.slice(0, MAX_TOTAL - 20) + "\n…";
+  }
+  return text;
 }
 
-/** very tolerant pseudo-call extraction */
+/** sehr toleranter pseudo-call extractor */
 function extractPseudoToolCalls(text) {
   if (!text || typeof text !== "string") return [];
   const calls = [];
@@ -285,10 +356,10 @@ function extractPseudoToolCalls(text) {
     } catch {}
   };
 
-  // 0) Try to parse whole text as JSON directly (bare JSON case)
+  // 0) Whole text as JSON (bare JSON)
   try { pushIfValid(JSON.parse(text)); } catch {}
 
-  // 1) XML-like tag <tool_call> ... </tool_call>
+  // 1) <tool_call> ... </tool_call>
   (function(){
     const re = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
     let m;
@@ -298,7 +369,7 @@ function extractPseudoToolCalls(text) {
     }
   })();
 
-  // 2) Fenced code ```tool_call ...``` or ```json ...``` or ```javascript ...```
+  // 2) ```tool_call|json|javascript|js ...```
   (function(){
     const re = /```(?:tool_call|json|javascript|js)\s*([\s\S]*?)```/gi;
     let m;
@@ -308,7 +379,7 @@ function extractPseudoToolCalls(text) {
     }
   })();
 
-  // 3) Variant: <toolcall>{...}</toolcall>
+  // 3) <toolcall>{...}</toolcall>
   (function(){
     const re = /<toolcall>([\s\S]*?)<\/toolcall>/gi;
     let m;
@@ -318,8 +389,7 @@ function extractPseudoToolCalls(text) {
     }
   })();
 
-  // 4) Pattern: a line with a tool name, followed by a JSON block
-  //   e.g.  getImageSD\n{ "prompt": "...", "size": "..." }
+  // 4) Pattern: <name>\n{ json }
   (function(){
     const re = /(^|\n)\s*([A-Za-z0-9_\-\.]+)\s*\n\s*(\{[\s\S]*\})/g;
     let m;
@@ -352,7 +422,7 @@ function sanitizeArgsForImageTool(args, options = {}) {
   const defSize = options.defaultImageSize || "1024x1024";
   const must = (v) => v != null && String(v).trim().length > 0;
 
-  // Keine Fremd-Übernahme von prompt aus text/query/description? -> wir erlauben lediglich Synonyme innerhalb des gleichen Call-Objekts.
+  // nur Synonyme innerhalb desselben Call-Objekts mappen
   if (!must(out.prompt) && must(out.text)) { out.prompt = String(out.text).trim(); delete out.text; }
   if (!must(out.prompt) && must(out.query)) { out.prompt = String(out.query).trim(); delete out.query; }
   if (!must(out.prompt) && must(out.description)) { out.prompt = String(out.description).trim(); delete out.description; }
