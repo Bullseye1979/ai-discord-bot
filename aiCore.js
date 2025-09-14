@@ -238,6 +238,7 @@ function buildPseudoToolsInstruction(tools) {
     "- Use exactly ONE tool per message.",
     "- JSON must be valid.",
     "- NEVER output [TOOL_RESULT:…], [TOOL_OUTPUT:…], \"Tool result:\", or similar markers.",
+    "- Ignore previous attempts or toolcalls."
     "- If you cannot call a tool, return NOTHING.",
     "",
     "INVALID examples (do NOT do this):",
