@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.12 (endpoint override + conditional auth + pseudo-toolcalls)
+// aiCore.js — refactored v2.13 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -15,6 +15,7 @@
 //        - Schema injection into system prompt
 //        - Detect <tool_call>{...}</tool_call> & variants in assistant text
 //        - Execute via registry and commit as proper GPT tool messages
+// v2.13: DEBUG: console dumps for schema/tools, payload preview, assistant text, parsed pseudo-calls, tool exec
 
 require("dotenv").config();
 const axios = require("axios");
@@ -24,6 +25,13 @@ const { OPENAI_API_URL } = require("./config.js");
 const Context = require("./context.js");
 const { reportError } = require("./error.js");
 const { setBotPresence } = require("./discord-helper.js");
+
+/* -------------------- Debug helper -------------------- */
+const DEBUG_PSEUDO = String(process.env.PSEUDO_TOOLS_DEBUG || "1") === "1";
+function dbg(...args) {
+  if (!DEBUG_PSEUDO) return;
+  try { console.log("[PSEUDO]", ...args); } catch {}
+}
 
 /** Sanitize 'name' per OpenAI schema; omit for system/tool roles */
 function cleanOpenAIName(role, name) {
@@ -234,18 +242,32 @@ function buildPseudoToolsInstruction(tools) {
     .filter(Boolean);
 
   if (names.length === 0) return "";
+  // leicht verstärktes Schema + Beispiel
   return [
-    "You can use tools via *pseudo tool-calls*.",
-    "When you need a tool, output **ONLY** one block in this exact shape, with no other text:",
+    "You MUST use tools via *pseudo tool-calls* when needed.",
+    "Output **ONLY** one block, no other text.",
     "",
+    "FORMAT (choose exactly one):",
+    "1) XML:",
     "<tool_call>",
-    '{ "name": "<tool_name>", "arguments": { /* JSON args */ } }',
+    '{ "name": "<tool_name>", "arguments": { /* valid JSON args */ } }',
     "</tool_call>",
     "",
-    "Rules:",
-    "- The block must be the only content in your message (no prose before/after).",
-    "- Use one tool per message.",
+    "2) Fenced code:",
+    "```tool_call",
+    '{ "name": "<tool_name>", "arguments": { /* valid JSON args */ } }',
+    "```",
+    "",
+    "RULES:",
+    "- The block must be the ONLY content in your message (no prose before/after).",
+    "- Use exactly ONE tool per message.",
+    "- JSON must be valid.",
     `- Available tools: ${names.join(", ")}`,
+    "",
+    "EXAMPLE:",
+    "<tool_call>",
+    '{ "name": "getImage", "arguments": { "prompt": "a cute robot, cinematic light, 4k", "size": "1024x1024" } }',
+    "</tool_call>",
   ].join("\n");
 }
 
@@ -356,7 +378,13 @@ async function getAIResponse(
       // Pseudo-toolcalls schema (only if enabled)
       if (pseudoFlag === true) {
         const schema = buildPseudoToolsInstruction(context.tools || []);
-        if (schema) sysParts.push(schema);
+        if (schema) {
+          sysParts.push(schema);
+          // DEBUG: emit schema + tool list
+          const toolNames = (context.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean);
+          dbg("Injected pseudo-tools schema. Tools:", toolNames);
+          dbg("Schema:\n" + schema);
+        }
       }
 
       const sysCombined = sysParts.join("\n\n").trim();
@@ -421,20 +449,16 @@ async function getAIResponse(
       const endpoint =
         normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
 
-      const __REQUEST_DEBUG_SNAPSHOT = {
+      // DEBUG: request snapshot (compact)
+      dbg("Request →", {
         endpoint,
         model,
         tokenlimit,
         sequenceCounter,
-        payloadPreview: {
-          messages: messagesToSend,
-          tools: Array.isArray(context.tools)
-            ? context.tools.map(t => (t?.function?.name || t?.name || "unknown"))
-            : [],
-        },
-        contextMessages: context.messages,
-        handoverMessages: handoverContext.messages,
-      };
+        tools: Array.isArray(context.tools)
+          ? context.tools.map(t => t?.function?.name || t?.name || "unknown")
+          : [],
+      });
 
       // Headers
       const headers = {
@@ -450,7 +474,14 @@ async function getAIResponse(
       } catch (err) {
         const details = { endpoint, status: err?.response?.status, data: err?.response?.data };
         await reportError(err, null, "OPENAI_CHAT", { details });
-        try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify(__REQUEST_DEBUG_SNAPSHOT, null, 2)); } catch {}
+        try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify({
+          endpoint,
+          model,
+          payloadPreview: {
+            messages: messagesToSend.slice(-6),
+            tools: Array.isArray(context.tools) ? context.tools.map(t => t?.function?.name || t?.name) : [],
+          }
+        }, null, 2)); } catch {}
         console.log("\n\n=== CONTEXT RAW DUMP ===\n", context.messages, "\n=== /CONTEXT RAW DUMP ===\n");
         throw err;
       }
@@ -464,15 +495,17 @@ async function getAIResponse(
 
       // Append assistant text (if any) — but guard for pseudo toolcalls
       let assistantText = typeof aiMessage.content === "string" ? aiMessage.content.trim() : "";
+      if (assistantText) dbg("Assistant text (raw):", assistantText);
 
       // PSEUDO-TOOLCALL DETECTION
       let pseudoCalls = [];
       if (pseudoFlag === true && assistantText) {
         pseudoCalls = extractPseudoToolCalls(assistantText);
+        if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
       }
 
       if (pseudoCalls.length > 0) {
-        // prevent raw tag from leaking into assistant text
+        // prevent raw tag from leaking into the visible assistant text
         assistantText = "";
       }
 
@@ -482,6 +515,7 @@ async function getAIResponse(
 
       // If the model returned native tool_calls (OpenAI style)
       if (hasToolCalls) {
+        dbg("Native tool_calls:", toolCallsFromModel.map(tc => tc?.function?.name));
         context.messages.push({ role: "assistant", tool_calls: toolCallsFromModel });
       }
 
@@ -519,11 +553,7 @@ async function getAIResponse(
             toolCommits.push({ name: fnName || "tool", content: out });
           };
 
-          if (!toolFunction || !toolCall?.function) {
-            replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available or arguments invalid.`);
-            continue;
-          }
-
+          // Args parsen & loggen
           let parsedArgs = {};
           try {
             const raw = toolCall?.function?.arguments || "{}";
@@ -531,15 +561,30 @@ async function getAIResponse(
           } catch {
             parsedArgs = {};
           }
+          dbg("Execute tool:", fnName, "args:", parsedArgs);
+
+          if (!toolFunction || !toolCall?.function) {
+            replyTool(`[ERROR]: Tool '${fnName || "unknown"}' not available or arguments invalid.`);
+            dbg("Tool missing or invalid:", fnName);
+            continue;
+          }
 
           try {
             const runtime = { channel_id: context_orig.channelId || handoverContext.channelId || null };
             // Hand over as if it were a real tool call
             const toolResult = await toolFunction({ name: fnName, arguments: parsedArgs }, handoverContext, getAIResponse, runtime);
+
+            // DEBUG: Ergebnis-Preview
+            const preview =
+              typeof toolResult === "string" ? toolResult.slice(0, 300) :
+              (() => { try { return JSON.stringify(toolResult).slice(0, 300); } catch { return String(toolResult).slice(0, 300); } })();
+            dbg("Tool result preview:", preview);
+
             replyTool(toolResult || "");
           } catch (toolError) {
             const emsg = toolError?.message || String(toolError);
             await reportError(toolError, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
+            dbg("Tool error:", fnName, emsg);
             replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
           }
         }
