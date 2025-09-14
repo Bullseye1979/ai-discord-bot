@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.14 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
+// aiCore.js — refactored v2.15 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -17,6 +17,7 @@
 //        - Execute via registry and commit as proper GPT tool messages
 // v2.13: DEBUG: console dumps for schema/tools, payload preview, assistant text, parsed pseudo-calls, tool exec
 // v2.14: ❗When pseudotoolcalls=true → do NOT send tools/tool_choice in payload (fix 500s on local endpoints)
+// v2.15: Fix ReferenceError in catch; short-circuit after tool exec in pseudo-mode + build direct reply from tool result
 
 require("dotenv").config();
 const axios = require("axios");
@@ -341,6 +342,10 @@ async function getAIResponse(
   const pendingUser = options?.pendingUser || null;
   const noPendingInject = options?.noPendingUserInjection === true;
 
+  // make these visible in catch
+  let context = null;
+  let handoverContext = null;
+
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
@@ -348,7 +353,7 @@ async function getAIResponse(
     const pseudoFlag = options?.pseudotoolcalls === true || context_orig?.pseudoToolcalls === true;
 
     // Working copies (reply context + tool-handover)
-    const context = new Context(
+    context = new Context(
       "",
       "",
       context_orig.tools,
@@ -358,7 +363,7 @@ async function getAIResponse(
     );
     context.messages = [...context_orig.messages];
 
-    const handoverContext = new Context(
+    handoverContext = new Context(
       "",
       "",
       context_orig.tools,
@@ -424,6 +429,8 @@ async function getAIResponse(
 
     // Loop until tools are resolved and optional continue chain done
     let hadToolCallsThisTurn = false;
+    let lastToolResults = []; // for pseudo direct reply
+
     do {
       hadToolCallsThisTurn = false;
 
@@ -581,6 +588,8 @@ async function getAIResponse(
 
             context.messages.push({ role: "tool", tool_call_id: toolCall.id, content: out });
             toolCommits.push({ name: fnName || "tool", content: out });
+            // for pseudo direct reply
+            lastToolResults.push(out);
           };
 
           if (!toolFunction || !toolCall?.function) {
@@ -618,6 +627,12 @@ async function getAIResponse(
             replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
           }
         }
+
+        // ❗Pseudo-Toolcall-Mode: nicht erneut ans Modell senden
+        if (pseudoFlag === true) {
+          continueResponse = false;
+          break;
+        }
       }
 
       sequenceCounter++;
@@ -627,10 +642,14 @@ async function getAIResponse(
       if (sequenceLimit <= 1) {
         continueResponse = false;
       } else if (hasToolCalls) {
-        // We just added tool outputs; now ask model to continue with them.
-        if (sequenceCounter < sequenceLimit) {
-          context.messages.push({ role: "user", content: "continue" });
-          continueResponse = true;
+        // Standard-Flow (kein Pseudo): Modell darf mit Tool-Outputs fortsetzen
+        if (!pseudoFlag) {
+          if (sequenceCounter < sequenceLimit) {
+            context.messages.push({ role: "user", content: "continue" });
+            continueResponse = true;
+          } else {
+            continueResponse = false;
+          }
         } else {
           continueResponse = false;
         }
@@ -648,6 +667,23 @@ async function getAIResponse(
         continueResponse = false;
       }
     } while (hadToolCallsThisTurn || continueResponse);
+
+    // ⏮️ Falls Pseudo-Modus: sichtbare Antwort direkt aus Tool-Result(en) bauen, wenn nichts vom Modell kam
+    if (responseMessage.trim().length === 0 && lastToolResults.length > 0) {
+      const urls = [];
+      for (const r of lastToolResults) {
+        try {
+          const obj = JSON.parse(r);
+          if (obj && typeof obj === "object" && obj.url) urls.push(String(obj.url));
+        } catch {}
+      }
+      if (urls.length > 0) {
+        responseMessage = urls.map(u => `![result](${u})\n<${u}>`).join("\n");
+      } else {
+        const raw = String(lastToolResults[lastToolResults.length - 1] || "").trim();
+        responseMessage = raw.length > 1500 ? (raw.slice(0, 1490) + " …") : raw;
+      }
+    }
 
     // === Post-commit (NO user commit here) ===
     // Persist tool outputs (assistant/system) with a sensible timestamp base
@@ -675,8 +711,8 @@ async function getAIResponse(
         "[GET_AI_RESPONSE][CONTEXT_DEBUG]",
         JSON.stringify(
           {
-            contextMessages: (typeof context?.messages !== "undefined") ? context.messages : [],
-            handoverMessages: (typeof handoverContext?.messages !== "undefined") ? handoverContext.messages : [],
+            contextMessages: Array.isArray(context?.messages) ? context.messages : [],
+            handoverMessages: Array.isArray(handoverContext?.messages) ? handoverContext.messages : [],
           },
           null,
           2
