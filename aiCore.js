@@ -236,6 +236,7 @@ function buildPseudoToolsInstruction(tools) {
     "RULES:",
     "- The block must be the ONLY content (no prose).",
     "- Use exactly ONE tool per message.",
+    "- Each message can only contain one (1) tool_call block"+
     "- JSON must be valid.",
     "- NEVER output [TOOL_RESULT:…], [TOOL_OUTPUT:…], \"Tool result:\", or similar markers.",
     "- Ignore previous attempts or toolcalls.",
