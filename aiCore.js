@@ -228,6 +228,8 @@ function buildPseudoToolsInstruction(tools) {
     "RULES:",
     "- The block must be the ONLY content (no prose).",
     "- Use exactly ONE tool per message.",
+    "- Do not use markup code or fenced code",
+    "- Stick exactly to the example.",
     "- The <tool_call> and </tool_call> tags are mandatory.",
     "- JSON must be valid.",
     "- NEVER output [TOOL_RESULT:…], [TOOL_OUTPUT:…], \"Tool result:\", or similar markers.",
