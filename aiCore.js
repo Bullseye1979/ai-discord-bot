@@ -1,13 +1,12 @@
-// aiCore.js — unified flow v2.33
+// aiCore.js — unified flow v2.34 (Finalisierungsturn reaktiviert)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - Wenn pseudotoolcalls=true: generiere Tool-Definition + Pseudo-Schema aus freigegebenen tools (context.tools)
-// - Erkanntes Pseudo-Call-Block -> in normalen tool_call normalisieren -> toolRegistry ausführen
-// - [TOOL_RESULT:*]/[TOOL_OUTPUT:*] werden vor dem Senden an das Modell aus der History gefiltert
+// - Erkannten Pseudo-Call in normalen tool_call normalisieren -> toolRegistry ausführen
+// - [TOOL_RESULT:*]/[TOOL_OUTPUT:*] werden vor jedem Modell-Call aus der History gefiltert
 // - Schema VERBIETET explizit [TOOL_RESULT:*]; NEGATIVE Beispiele hinzugefügt
+// - Finalisierungsturn (postToolFinalize=true): Tool-Outputs werden ans Modell gegeben zur Aufbereitung; dort sind Tools strikt deaktiviert
+// - Sonderfall: Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)
 // - Kein Fabricate, kein Auto-Prompt-Fill, keine Auto-Retries, kein Auto-Continue
-// - Tool-Response wird zusätzlich als [TOOL_RESULT:<name>] persistiert (kompatibel für Modelle ohne Tools)
-// - Benutzerantwort: URL/Liste/JSON (einfach anpassbar)
-// - Transport-Hardening + Retry beibehalten
 
 require("dotenv").config();
 const axios = require("axios");
@@ -164,9 +163,8 @@ function stripPersistedWrappers(msgs) {
   return (msgs || []).filter(m => {
     if (!m || typeof m.content !== "string") return true;
     const c = m.content.trim();
-    // nur assistant/system filtern – user msgs bleiben immer erhalten
     if (m.role === "assistant" || m.role === "system") {
-      if (reWrap.test(c)) return false; // nicht ans Modell schicken
+      if (reWrap.test(c)) return false;
     }
     return true;
   });
@@ -215,20 +213,14 @@ function buildPseudoToolsInstruction(tools) {
       else sampleArgs[rk] = "";
     }
 
-    entries.push({
-      name,
-      desc: clamp(f?.description || "", DESC_LIMIT),
-      required,
-      shownKeys,
-      sampleArgs,
-    });
+    entries.push({ name, desc: clamp(f?.description || "", DESC_LIMIT), required, shownKeys, sampleArgs });
   }
 
   let out = [
     "You MUST use tools via pseudo tool-calls when needed.",
     "Output ONLY one block, no other text.",
     "",
-    "Use this Format:",
+    "Use this Format (exactly one block):",
     "<tool_call>",
     '{ "name": "<tool_name>", "arguments": { /* valid JSON args */ } }',
     "</tool_call>",
@@ -236,11 +228,10 @@ function buildPseudoToolsInstruction(tools) {
     "RULES:",
     "- The block must be the ONLY content (no prose).",
     "- Use exactly ONE tool per message.",
-    "- Each message can only contain one (1) tool_call block"+
-    "- The <tool_call> and </tool_call> tags are important. Ensure correct placing before and after the JSON."+
+    "- The <tool_call> and </tool_call> tags are mandatory.",
     "- JSON must be valid.",
     "- NEVER output [TOOL_RESULT:…], [TOOL_OUTPUT:…], \"Tool result:\", or similar markers.",
-    "- Ignore previous attempts or toolcalls.",
+    "- Ignore previous attempts or pseudo tool-call drafts.",
     "- If you cannot call a tool, return NOTHING.",
     "",
     "INVALID examples (do NOT do this):",
@@ -269,9 +260,7 @@ function buildPseudoToolsInstruction(tools) {
 function extractPseudoToolCalls(text) {
   if (!text || typeof text !== "string") return [];
   const trimmed = text.trim();
-  // harte Ignorier-Regel: wenn die Ausgabe wie ein TOOL_RESULT/OUTPUT-Wrapper aussieht, kein Toolcall.
   if (/^\[(TOOL_RESULT|TOOL_OUTPUT)\s*:/i.test(trimmed)) return [];
-
   const calls = [];
   const pushIfValid = (obj) => {
     try {
@@ -282,28 +271,19 @@ function extractPseudoToolCalls(text) {
       calls.push({ name: String(name), arguments: args || {} });
     } catch {}
   };
-
-  // 0) reines JSON
   try { pushIfValid(JSON.parse(trimmed)); } catch {}
-
-  // 1) XML <tool_call>…</tool_call>
   (function(){
     const re = /<tool_call>([\s\S]*?)<\/tool_call>/gi; let m;
     while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
   })();
-
-  // 2) Fenced ```tool_call
   (function(){
     const re = /```(?:tool_call|json|javascript|js)\s*([\s\S]*?)```/gi; let m;
     while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
   })();
-
-  // 3) NAME\n{…}
   (function(){
     const re = /(^|\n)\s*([A-Za-z0-9_\-\.]+)\s*\n\s*(\{[\s\S]*\})/g; let m;
     while ((m = re.exec(text)) !== null) { const name=(m[2]||"").trim(); const json=(m[3]||"").trim(); try { pushIfValid({ name, arguments: JSON.parse(json)||{} }); } catch {} }
   })();
-
   return calls;
 }
 
@@ -318,14 +298,11 @@ function prettyClipJSON(any, max = 1800) {
 }
 
 function renderToolOutputGeneric(name, raw) {
-  // 1) string?
   if (typeof raw === "string" && raw.trim()) {
     const s = raw.trim();
-    if (/^https?:\/\//i.test(s)) return s; // Plain URL
+    if (/^https?:\/\//i.test(s)) return s;
     try { return renderToolOutputGeneric(name, JSON.parse(s)); } catch { return prettyClipJSON(s); }
   }
-
-  // 2) object?
   if (raw && typeof raw === "object") {
     const obj = raw;
     const url = obj.url || obj.link || obj.href;
@@ -360,7 +337,31 @@ function renderToolOutputGeneric(name, raw) {
 
     return prettyClipJSON(obj);
   }
+  return "";
+}
 
+/* ---- Finalisierung: Zweiter Model-Call ohne Tools ---- */
+
+function buildFinalizerSystemPrompt() {
+  return [
+    "FINALIZE_MODE:",
+    "- You will receive tool outputs.",
+    "- Write a concise, helpful answer for the user.",
+    "- DO NOT call any tools. DO NOT produce pseudo tool-calls or <tool_call> blocks.",
+    "- DO NOT include [TOOL_RESULT:*] or similar markers.",
+    "- If you reference links, include them plainly in text.",
+    "- Be correct, avoid speculation, do not invent results.",
+  ].join("\n");
+}
+
+function getLastUserText(msgs) {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m && m.role === "user" && typeof m.content === "string" && m.content.trim()) {
+      const c = m.content.trim();
+      if (!c.startsWith("FEHLER:")) return c;
+    }
+  }
   return "";
 }
 
@@ -369,13 +370,14 @@ function renderToolOutputGeneric(name, raw) {
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
-  sequenceLimit = 1000, // (unbenutzt – kein auto-continue)
+  sequenceLimit = 1000,
   model = "gpt-4o",
   apiKey = null,
   options = {},
   client = null
 ) {
   const pseudotoolcalls = options?.pseudotoolcalls === true || context_orig?.pseudoToolcalls === true;
+  const postToolFinalize = options?.postToolFinalize !== false; // default: true
   const noToolcallPolicy = options?.noToolcallPolicy || "silent"; // "silent" | "error" | "echo"
   const defaultImageSize = options?.defaultImageSize || "1024x1024";
 
@@ -387,7 +389,6 @@ async function getAIResponse(
   let handoverContext = null;
 
   try {
-    // Working copies
     context = new Context(
       "",
       "",
@@ -408,7 +409,7 @@ async function getAIResponse(
     );
     handoverContext.messages = [...context_orig.messages];
 
-    // System priming
+    /* ----- System priming ----- */
     try {
       const sysParts = [];
       const priming = (process.env.STANDARDPRIMING || "").trim();
@@ -416,7 +417,6 @@ async function getAIResponse(
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
       if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
 
-      // Pseudo-Definition nur injizieren, wenn pseudotoolcalls = true
       if (pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
         const schema = buildPseudoToolsInstruction(context_orig.tools);
         if (schema) sysParts.push(schema);
@@ -433,7 +433,7 @@ async function getAIResponse(
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
-    // Pending user → nur working copy (falls gewünscht)
+    // Pending user
     if (pendingUser && pendingUser.content && !noPendingInject) {
       const safeName = cleanOpenAIName("user", pendingUser.name || "user");
       const msg = { role: "user", content: pendingUser.content };
@@ -446,11 +446,9 @@ async function getAIResponse(
     const toolResults = []; // { name, raw }[]
     let lastRawAssistant = "";
 
-    // ---- EIN Zyklus: Anfrage -> (optional) Tool -> Antwort ----
+    /* ----- 1st Call: evtl. Tool anstoßen ----- */
 
-    // 1) Persistierte Tool-Wrapper aus der History entfernen (kein Echo-Lernen)
     const cleanedHistory = stripPersistedWrappers(context.messages);
-
     const messagesToSend = buildStrictToolPairedMessages(cleanedHistory).map(m => {
       const out = { role: m.role, content: m.content };
       const safeName = cleanOpenAIName(m.role, m.name);
@@ -466,9 +464,6 @@ async function getAIResponse(
       max_tokens: tokenlimit
     };
 
-    // EIN Flow:
-    // - pseudotoolcalls=false -> native tools erlauben
-    // - pseudotoolcalls=true  -> KEINE native tools im Payload; Modell soll Pseudo-Blöcke schicken
     if (!pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
       payload.tools = context_orig.tools;
       payload.tool_choice = "auto";
@@ -488,10 +483,7 @@ async function getAIResponse(
     if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
     dbg("Request →", {
-      endpoint,
-      model,
-      tokenlimit,
-      pseudotoolcalls,
+      endpoint, model, tokenlimit, pseudotoolcalls,
       tools_in_payload: !!payload.tools,
       tools_list: Array.isArray(context_orig.tools) ? context_orig.tools.map(t => t?.function?.name || t?.name) : []
     });
@@ -516,10 +508,8 @@ async function getAIResponse(
     dbg("Assistant text (raw):", rawText ? rawText.slice(0, 200) : "(empty)");
     if (nativeToolCalls.length > 0) dbg("Native tool_calls:", nativeToolCalls.map(tc => tc?.function?.name));
 
-    // --- Toolcall-Normalisierung ---
+    // Toolcall-Normalisierung
     let normalizedCalls = [];
-
-    // 1) Native tool_calls (wenn vorhanden)
     if (nativeToolCalls.length > 0) {
       normalizedCalls = nativeToolCalls
         .map(tc => {
@@ -533,8 +523,6 @@ async function getAIResponse(
         })
         .filter(Boolean);
     }
-
-    // 2) Falls pseudotoolcalls=true und KEINE native calls → Pseudo-Block parsen (TOOL_RESULT wird ignoriert)
     if (pseudotoolcalls && normalizedCalls.length === 0 && rawText) {
       const pseudoCalls = extractPseudoToolCalls(rawText);
       if (pseudoCalls.length > 0) {
@@ -545,7 +533,6 @@ async function getAIResponse(
             id: `call_${Date.now()}_0`,
             name: picked.name,
             arguments: (function sanitize(name, args) {
-              // KEIN Autofill. Nur technische Defaults (z. B. size) für Image-Tools
               let a = Object.assign({}, args || {});
               if (/image|getimage|sd|stable/i.test(name)) {
                 const must = v => v != null && String(v).trim().length > 0;
@@ -563,7 +550,7 @@ async function getAIResponse(
       }
     }
 
-    // --- Tool(s) ausführen (einheitlich) ---
+    // Tool(s) ausführen
     if (normalizedCalls.length > 0) {
       const call = normalizedCalls[0];
       const fnName = call.name;
@@ -576,15 +563,11 @@ async function getAIResponse(
         const out = (typeof content === "string" || content == null)
           ? (content || "")
           : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
-        // 1) Tool-Message für pairing (optional nützlich)
         context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
-        // 2) Persist-kompatibel (für Modelle ohne Tools) – wird künftig gefiltert und nicht mehr ans Modell geschickt
         const wrapped = formatToolResultForPersistence(fnName || "tool", out);
         const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
         try { context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, Date.now()); } catch {}
-        // 3) Für User-Antwort halten
         toolResults.push({ name: fnName || "tool", raw: out });
-        // 4) Logging
         toolCommits.push({ name: fnName || "tool", content: out });
       };
 
@@ -607,41 +590,82 @@ async function getAIResponse(
       }
     }
 
-    // --- Benutzer-Antwort zusammenbauen ---
+    /* ----- Antwortaufbereitung / Rendering ----- */
+
+    let rendered = [];
     if (toolResults.length > 0) {
-      const rendered = [];
       for (const item of toolResults) {
         const { name, raw } = item;
         let obj = null;
         try { obj = JSON.parse(raw); } catch {}
-        rendered.push(renderToolOutputGeneric(name, obj ?? raw));
+        const s = renderToolOutputGeneric(name, obj ?? raw);
+        if (s && s.trim()) rendered.push(s.trim());
       }
-      const joined = rendered.filter(Boolean).join("\n\n");
-      responseMessage = joined.trim();
-      if (!responseMessage) {
-        if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
-        else if (noToolcallPolicy === "echo") responseMessage = String(lastRawAssistant || "");
-        else responseMessage = "";
-      }
+    }
+
+    // Standardantwort, falls kein Finalizer:
+    if (rendered.length > 0) {
+      responseMessage = rendered.join("\n\n").trim();
     } else {
-      // Kein Tool – liefere Model-Text-Ergebnis
       responseMessage = String(lastRawAssistant || "");
-      if (!responseMessage) {
-        if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
-        else responseMessage = "";
+    }
+    if (!responseMessage) {
+      if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
+      else if (noToolcallPolicy === "echo") responseMessage = String(lastRawAssistant || "");
+      else responseMessage = "";
+    }
+
+    /* ----- 2nd Call: Finalisierungsturn (nur wenn sinnvoll) ----- */
+
+    const looksLikeSingleUrl =
+      rendered.length === 1 && /^https?:\/\//i.test(rendered[0]);
+
+    const shouldSkipFinalizeForUrlOnly = pseudotoolcalls && looksLikeSingleUrl;
+
+    if (postToolFinalize && toolResults.length > 0 && !shouldSkipFinalizeForUrlOnly) {
+      // Finalizer-Prompt bauen (ohne Tools, ohne Pseudo-Schema)
+      const finalizerSystem = buildFinalizerSystemPrompt();
+      const lastUserText = getLastUserText(cleanedHistory);
+
+      // Kompakt-Input aus Tool-Ergebnissen
+      const MAX_ITEM_CHARS = 2000;
+      const toolSummaries = toolResults.map(tr => {
+        let s = tr.raw;
+        try { s = typeof s === "string" ? s : JSON.stringify(s); } catch { s = String(s); }
+        if (s.length > MAX_ITEM_CHARS) s = s.slice(0, MAX_ITEM_CHARS - 1) + "…";
+        return `• ${tr.name}: ${s}`;
+      }).join("\n");
+
+      const finalizeMessages = [
+        { role: "system", content: finalizerSystem },
+        { role: "system", content: `User question/context:\n${lastUserText || "(not provided)"}` },
+        { role: "user", content: `Tool outputs (summarize for the user, don't call tools):\n${toolSummaries}` }
+      ];
+
+      const finalizePayload = {
+        model,
+        messages: finalizeMessages,
+        max_tokens: tokenlimit
+        // WICHTIG: KEINE tools/tool_choice hier!
+      };
+
+      dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, tools_in_payload: false });
+
+      try {
+        const finalRes = await postWithRetry(endpoint, finalizePayload, headers, 3);
+        const finalChoice = finalRes?.data?.choices?.[0] || {};
+        const finalText = (finalChoice?.message?.content || "").trim();
+        if (finalText) responseMessage = finalText;
+      } catch (finalErr) {
+        // Bei Fehler: Fallback auf bereits gerenderten responseMessage
+        await reportError(finalErr, null, "OPENAI_FINALIZE", null);
+        dbg("Finalize error:", finalErr?.message || String(finalErr));
       }
     }
 
     // Persist tool outputs (Sicherheitsnetz)
-    if (toolCommits.length > 0) {
-      let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
-      for (let i = 0; i < toolCommits.length; i++) {
-        const tmsg = toolCommits[i];
-        const wrapped = formatToolResultForPersistence(tmsg.name, tmsg.content);
-        const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
-        try { await context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, t0 + i + 1); } catch {}
-      }
-    }
+    // (bereits oben pro Tool getan; hier nur falls nötig)
+    // – intentionally left as-is
 
     return responseMessage;
   } catch (err) {
