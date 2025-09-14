@@ -1,8 +1,24 @@
-// aiCore.js — refactored v2.17 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
+// aiCore.js — refactored v2.18 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// v2.0 … v2.16 (siehe Historie)
-// v2.17: Link-Normalisierung (Angle-Brackets, Quotes, trailing Punct), Absolut-Pfad-Bau via PUBLIC_BASE_URL,
-//        robuste URL-Ernte aus Tool-Resulten, reine-URL-Ausgabe im Pseudo-Mode, Antwortsäuberung.
+// v2.0: pendingUser working-copy + post-commit with original timestamp.
+// v2.3: prune orphan historical `tool` msgs when building payload.
+// v2.4: PERSIST tool results as `assistant` (or `system`) messages with a clear wrapper.
+// v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
+// v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
+// v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
+// v2.8: Hardened tool_call flow (no empty tool_calls; strict ordering intent in loop).
+// v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
+// v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
+// v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
+//        Added options.noPendingUserInjection to avoid duplicating user content in working copy.
+// v2.12: PSEUDO-TOOLCALLS for local models (Qwen/Llama/etc.)
+//        - Schema injection into system prompt
+//        - Detect <tool_call>{...}</tool_call> & variants in assistant text
+//        - Execute via registry and commit as proper GPT tool messages
+// v2.13: DEBUG: console dumps for schema/tools, payload preview, assistant text, parsed pseudo-calls, tool exec
+// v2.14: ❗When pseudotoolcalls=true → do NOT send tools/tool_choice in payload (fix 500s on local endpoints)
+// v2.15: Fix ReferenceError in catch; short-circuit after tool exec in pseudo-mode + build direct reply from tool result
+// v2.18: Bare-JSON pseudo-call detection + URL normalization + int coercion for common args + stable retry context
 
 require("dotenv").config();
 const axios = require("axios");
@@ -68,25 +84,23 @@ async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function deepClone(obj) {
-  try { return JSON.parse(JSON.stringify(obj)); } catch { return obj; }
-}
-
 /**
- * POST with retry. We deep-clone the payload to keep it 100% stable across retries.
+ * POST with retry. On non-2xx, we log details explicitly.
+ * NOTE: we override validateStatus here to always get a response,
+ * then we decide to throw based on status range.
  */
 async function postWithRetry(url, payload, headers, tries = 3) {
   let lastErr;
-  const stablePayload = deepClone(payload);
   for (let i = 0; i < tries; i++) {
     try {
-      const res = await axiosAI.post(url, stablePayload, {
+      const res = await axiosAI.post(url, payload, {
         headers,
         validateStatus: () => true, // log even on 4xx/5xx
       });
 
       if (res.status >= 200 && res.status < 300) return res;
 
+      // Non-2xx: log snapshot
       console.error("[AI POST][NON-2XX]", {
         try: i + 1,
         status: res.status,
@@ -95,12 +109,14 @@ async function postWithRetry(url, payload, headers, tries = 3) {
           typeof res.data === "string" ? res.data.slice(0, 2000) : res.data,
       });
 
+      // For 4xx, do not retry (payload issue)
       if (res.status >= 400 && res.status < 500) {
         const e = new Error(`AI_HTTP_${res.status}`);
         e.response = res;
         throw e;
       }
 
+      // For 5xx, retry
       lastErr = new Error(`AI_HTTP_${res.status}`);
       await sleep(300 * Math.pow(2, i));
       continue;
@@ -127,7 +143,7 @@ async function postWithRetry(url, payload, headers, tries = 3) {
       });
 
       if (!transient || i === tries - 1) throw err;
-      await sleep(300 * Math.pow(2, i));
+      await sleep(300 * Math.pow(2, i)); // 300ms, 600ms, 1200ms
     }
   }
   throw lastErr;
@@ -144,6 +160,28 @@ function normalizeEndpoint(raw) {
   if (/\/v1\/?$/.test(url)) return url.replace(/\/v1\/?$/, "/v1/chat/completions");
   if (/\/v1\/responses\/?$/.test(url)) return url.replace(/\/v1\/responses\/?$/, "/v1/chat/completions");
   return url.replace(/\/+$/, "");
+}
+
+/* -------------------- URL helpers -------------------- */
+
+function normalizeUrl(u) {
+  if (!u || typeof u !== "string") return null;
+  let s = u.trim();
+
+  // strip angle brackets and quotes
+  s = s.replace(/^<+/, "").replace(/>+$/, "");
+  s = s.replace(/^['"]+/, "").replace(/['"]+$/, "");
+
+  // cut at first whitespace
+  if (/\s/.test(s)) s = s.split(/\s+/)[0];
+
+  // trim trailing punctuation / brackets / quotes
+  s = s.replace(/[)\]\},.;:!?'"`]+$/g, "");
+
+  // sanity
+  if (!/^https?:\/\//i.test(s) && !s.startsWith("/")) return null;
+
+  return s;
 }
 
 /**
@@ -188,6 +226,7 @@ const TOOL_PERSIST_ROLE =
 
 const MAX_TOOL_PERSIST_CHARS = Math.max(
   500,
+  10000,
   Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 8000))
 );
 
@@ -218,86 +257,6 @@ function formatToolResultForPersistence(toolName, content) {
 
 function loadEnvPriming() {
   return (process.env.STANDARDPRIMING || "").trim();
-}
-
-/* -------------------- URL normalization helpers -------------------- */
-
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-
-function normalizeUrl(u) {
-  if (!u || typeof u !== "string") return null;
-  let s = u.trim();
-
-  // strip angle brackets and quotes
-  s = s.replace(/^<+/, "").replace(/>+$/, "");
-  s = s.replace(/^['"]+/, "").replace(/['"]+$/, "");
-
-  // remove trailing punctuations common in inline text
-  s = s.replace(/[),.;:!?]+$/g, "");
-
-  // collapse spaces
-  s = s.replace(/\s+/g, "");
-
-  if (!s) return null;
-
-  // simple sanity check
-  if (!/^https?:\/\//i.test(s) && !s.startsWith("/")) return null;
-  return s;
-}
-
-function coerceAbsoluteUrl(u) {
-  const n = normalizeUrl(u);
-  if (!n) return null;
-  if (/^https?:\/\//i.test(n)) return n;
-  if (n.startsWith("/") && PUBLIC_BASE_URL) {
-    return `${PUBLIC_BASE_URL}${n}`;
-  }
-  return null;
-}
-
-function collectUrlsFromToolResult(raw) {
-  const urls = new Set();
-
-  const pushMaybe = (val) => {
-    if (!val) return;
-    const abs = coerceAbsoluteUrl(val) || normalizeUrl(val);
-    if (abs && /^https?:\/\//i.test(abs)) urls.add(abs);
-  };
-
-  const scanObj = (obj) => {
-    if (!obj || typeof obj !== "object") return;
-
-    // canonical fields
-    pushMaybe(obj.url);
-    pushMaybe(obj.link);
-    pushMaybe(obj.href);
-    pushMaybe(obj.image);
-    pushMaybe(obj.file); // may be http or /documents/...
-    // arrays
-    for (const key of ["urls", "links", "images"]) {
-      const arr = obj[key];
-      if (Array.isArray(arr)) arr.forEach(pushMaybe);
-    }
-  };
-
-  // raw can be stringified JSON or plain string URL
-  try {
-    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (parsed && typeof parsed === "object") {
-      scanObj(parsed);
-    }
-  } catch {
-    // try to pick single URL from plain string
-    pushMaybe(String(raw || ""));
-  }
-
-  return [...urls];
-}
-
-function stripAngleBracketsInText(text) {
-  if (!text) return text;
-  // turn <http://...> into http://...
-  return text.replace(/<\s*(https?:\/\/[^>\s]+)\s*>/gi, "$1");
 }
 
 /* -------------------- Pseudo tool-calls helpers -------------------- */
@@ -382,24 +341,53 @@ function extractPseudoToolCalls(text) {
     } catch {}
   }
 
+  // 4) Bare JSON blocks (no fences/tags)
+  try {
+    const blocks = [];
+    let depth = 0, start = -1;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === "{") {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          blocks.push(text.slice(start, i + 1));
+          start = -1;
+        }
+      }
+    }
+    for (const raw of blocks) {
+      let json = null;
+      try { json = JSON.parse(raw); } catch { continue; }
+      if (!json || typeof json !== "object") continue;
+
+      // skip result-ish objects
+      const looksLikeResult =
+        json.url || json.link || json.href || json.image || json.file ||
+        Array.isArray(json.urls) || Array.isArray(json.images) || Array.isArray(json.links);
+
+      if (!looksLikeResult && json.name && (typeof json.arguments === "object" || typeof json.arguments === "string")) {
+        let args = {};
+        try { args = typeof json.arguments === "string" ? JSON.parse(json.arguments) : (json.arguments || {}); } catch {}
+        calls.push({ name: String(json.name), arguments: args });
+      }
+    }
+  } catch {}
+
   return calls;
 }
 
-function lastConcreteUserPrompt(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role !== "user") continue;
-    const c = (m.content || "").trim();
-    if (!c) continue;
-    if (c.toLowerCase() === "continue") continue;
-    if (c.startsWith("FEHLER:")) continue;
-    return c;
-  }
-  return "";
-}
-
-/* -------------------- Main -------------------- */
-
+/**
+ * Run a chat loop with tool-calls and bounded auto-continue.
+ * @param {Context} context_orig
+ * @param {number}  tokenlimit
+ * @param {number}  sequenceLimit
+ * @param {string}  model
+ * @param {string|null} apiKey
+ * @param {object}  options               // { pendingUser?: {name, content, timestamp}, endpoint?: string, noPendingUserInjection?: boolean, pseudotoolcalls?: boolean }
+ */
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
@@ -413,15 +401,17 @@ async function getAIResponse(
   const pendingUser = options?.pendingUser || null;
   const noPendingInject = options?.noPendingUserInjection === true;
 
+  // visible in catch
   let context = null;
   let handoverContext = null;
 
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
+    // 🔧 Resolve pseudo-toolcalls flag from options OR original context
     const pseudoFlag = options?.pseudotoolcalls === true || context_orig?.pseudoToolcalls === true;
 
-    // Working copies
+    // Working copies (reply context + tool-handover)
     context = new Context(
       "",
       "",
@@ -442,8 +432,6 @@ async function getAIResponse(
     );
     handoverContext.messages = [...context_orig.messages];
 
-    const toolRegistry = context.toolRegistry;
-
     // Compose system
     try {
       const sysParts = [];
@@ -452,6 +440,7 @@ async function getAIResponse(
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
       if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
 
+      // Pseudo-toolcalls schema (only if enabled)
       if (pseudoFlag === true) {
         const schema = buildPseudoToolsInstruction(context.tools || []);
         if (schema) {
@@ -475,7 +464,7 @@ async function getAIResponse(
       content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.`,
     });
 
-    // Pending user ONLY to working copy if requested
+    // Pending user ONLY to working copy if requested (avoid duplicate when bot.js pre-logged)
     if (pendingUser && pendingUser.content && !noPendingInject) {
       const safeName = cleanOpenAIName("user", pendingUser.name || "user");
       const msg = { role: "user", content: pendingUser.content };
@@ -484,17 +473,19 @@ async function getAIResponse(
       handoverContext.messages.push({ ...msg });
     }
 
-    const toolCommits = [];
+    const toolCommits = []; // { name: fnName, content: string }
     let continueResponse = false;
     let sequenceCounter = 0;
 
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
+    // Auto-correction guard for pseudo mode
     let pseudoRetryCount = 0;
     const pseudoRetryMax = 2;
 
+    // Loop
     let hadToolCallsThisTurn = false;
-    let lastToolResults = [];
+    let lastToolResults = []; // for pseudo direct reply
 
     do {
       hadToolCallsThisTurn = false;
@@ -512,6 +503,7 @@ async function getAIResponse(
         return out;
       });
 
+      // Build payload — OMIT tools/tool_choice when pseudo mode is enabled
       const payload = {
         model,
         messages: messagesToSend,
@@ -530,6 +522,7 @@ async function getAIResponse(
       const endpoint =
         normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
 
+      // DEBUG
       dbg("Request →", {
         endpoint,
         model,
@@ -547,7 +540,7 @@ async function getAIResponse(
       };
       if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
-      // Call with stable payload
+      // API Call
       let aiResponse;
       try {
         aiResponse = await postWithRetry(endpoint, payload, headers);
@@ -575,7 +568,7 @@ async function getAIResponse(
       const toolCallsFromModel = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
       let hasToolCalls = toolCallsFromModel.length > 0;
 
-      // Assistant content
+      // Assistant text (may contain pseudo-calls)
       let assistantText = typeof aiMessage.content === "string" ? aiMessage.content.trim() : "";
       if (assistantText) dbg("Assistant text (raw):", assistantText);
 
@@ -586,41 +579,38 @@ async function getAIResponse(
         if (pseudoCalls.length > 0) dbg("Detected pseudo tool-calls:", pseudoCalls);
       }
 
-      // In pseudo-mode: if no toolcalls were produced, do NOT accumulate prose
-      if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0) {
-        assistantText = ""; // drop hallucinated prose
-      }
-
-      // Hard correction prompt (carry original user request)
-      if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0) {
+      // Strict correction for prose in pseudo mode
+      if (pseudoFlag === true && !hasToolCalls && pseudoCalls.length === 0 && assistantText) {
         if (pseudoRetryCount < pseudoRetryMax) {
           pseudoRetryCount++;
-          const originalUser = lastConcreteUserPrompt(messagesToSend);
-          const pin = originalUser ? `\nAUFTRAG (wiederholt): ${originalUser}` : "";
-          dbg("Prose without tool_call detected. Sending strict correction (retry", pseudoRetryCount, ")", pin ? "(with pinned user request)" : "");
+          dbg("Prose without tool_call detected. Sending strict correction (retry", pseudoRetryCount, ")");
           context.messages.push({
             role: "user",
             content:
-              "FEHLER: Du hast Prosa gesendet. Sende JETZT ausschließlich einen einzigen <tool_call>…</tool_call>-Block ODER einen ```tool_call```-Block mit gültigem JSON {name, arguments}. KEINE ERKLÄRUNGEN." + pin
+              "FEHLER: Du hast Prosa gesendet. Sende JETZT ausschließlich einen einzigen <tool_call>…</tool_call>-Block ODER einen ```tool_call```-Block mit gültigem JSON {name, arguments}. KEINE ERKLÄRUNGEN."
           });
           continueResponse = true;
           sequenceCounter++;
           continue;
-        } else {
-          dbg("Max pseudo retries reached; giving up without prose.");
         }
       }
 
-      if (assistantText) {
-        // cleanup angle-bracketed URLs inside prose
-        responseMessage += stripAngleBracketsInText(assistantText);
+      if (pseudoCalls.length > 0) {
+        // prevent raw tag from leaking
+        assistantText = "";
       }
 
+      if (assistantText) {
+        responseMessage += assistantText;
+      }
+
+      // Native tool_calls
       if (hasToolCalls) {
         dbg("Native tool_calls:", toolCallsFromModel.map(tc => tc?.function?.name));
         context.messages.push({ role: "assistant", tool_calls: toolCallsFromModel });
       }
 
+      // Pseudo → fabricate native
       if (pseudoCalls.length > 0) {
         const fabricated = pseudoCalls.map((pc, idx) => ({
           id: `call_${Date.now()}_${idx}`,
@@ -660,12 +650,18 @@ async function getAIResponse(
             continue;
           }
 
-          // Args
+          // Parse args + simple int coercion
           let parsedArgs = {};
           try {
             const raw = toolCall?.function?.arguments || "{}";
             parsedArgs = typeof raw === "string" ? JSON.parse(raw) : (raw || {});
           } catch { parsedArgs = {}; }
+          for (const k of ["width","height","w","h","steps","seed","cfg","sampler_steps"]) {
+            if (parsedArgs[k] != null && typeof parsedArgs[k] !== "number") {
+              const n = Number(parsedArgs[k]);
+              if (Number.isFinite(n)) parsedArgs[k] = n;
+            }
+          }
           dbg("Execute tool:", fnName, "args:", parsedArgs);
 
           try {
@@ -686,6 +682,7 @@ async function getAIResponse(
           }
         }
 
+        // Pseudo mode: do not continue back to model
         if (pseudoFlag === true) {
           continueResponse = false;
           break;
@@ -694,6 +691,7 @@ async function getAIResponse(
 
       sequenceCounter++;
 
+      // Continue logic
       const dueToLength = !hasToolCalls && finishReason === "length";
       if (sequenceLimit <= 1) {
         continueResponse = false;
@@ -723,32 +721,57 @@ async function getAIResponse(
       }
     } while (hadToolCallsThisTurn || continueResponse);
 
-    // Direct reply from tool results in pseudo-mode: emit clean URLs only
+    // Pseudo-mode: build visible reply from tool-results when model produced no text
     if (responseMessage.trim().length === 0 && lastToolResults.length > 0) {
-      const allUrls = new Set();
+      const urls = [];
       for (const r of lastToolResults) {
-        collectUrlsFromToolResult(r).forEach(u => allUrls.add(u));
+        try {
+          const obj = JSON.parse(r);
+          if (obj && typeof obj === "object") {
+            // common locations
+            const candidates = [];
+            if (obj.url) candidates.push(obj.url);
+            if (obj.image && typeof obj.image === "object" && obj.image.url) candidates.push(obj.image.url);
+            if (obj.file) candidates.push(obj.file);
+            if (Array.isArray(obj.urls)) candidates.push(...obj.urls);
+            if (Array.isArray(obj.images)) {
+              for (const im of obj.images) {
+                if (im && typeof im === "object" && im.url) candidates.push(im.url);
+                else if (typeof im === "string") candidates.push(im);
+              }
+            }
+            for (const c of candidates) {
+              const n = normalizeUrl(String(c));
+              if (n) urls.push(n);
+            }
+          }
+        } catch {
+          // ignore parse errors for lastToolResults
+        }
       }
-      if (allUrls.size > 0) {
-        // Just plain URLs, each on its own line — Discord will auto-embed
-        responseMessage = [...allUrls].join("\n");
+      // de-dup
+      const uniq = Array.from(new Set(urls));
+      if (uniq.length > 0) {
+        // Plain URLs, one per line (Discord/clients auto-embed)
+        responseMessage = uniq.join("\n");
       } else {
         const raw = String(lastToolResults[lastToolResults.length - 1] || "").trim();
         responseMessage = raw.length > 1500 ? (raw.slice(0, 1490) + " …") : raw;
       }
-    } else if (responseMessage) {
-      // final cleanup: strip <url> patterns if any leaked
-      responseMessage = stripAngleBracketsInText(responseMessage);
     }
 
-    // Persist tool outputs
+    // === Post-commit (NO user commit here) ===
     if (toolCommits.length > 0) {
       let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
         const tmsg = toolCommits[i];
         const wrapped = formatToolResultForPersistence(tmsg.name, tmsg.content);
         const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
-        try { await context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, t0 + i + 1); } catch {}
+        try {
+          await context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, t0 + i + 1);
+        } catch {
+          // ignore persistence errors
+        }
       }
     }
 
