@@ -1,21 +1,8 @@
-// aiCore.js — refactored v2.16 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
+// aiCore.js — refactored v2.17 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
-// v2.0: pendingUser working-copy + post-commit with original timestamp.
-// v2.3: prune orphan historical `tool` msgs when building payload.
-// v2.4: PERSIST tool results as `assistant` (or `system`) messages with a clear wrapper.
-// v2.5: CAP persisted tool-result wrapper to 3000 chars (config via TOOL_PERSIST_MAX).
-// v2.6: Transport hardening (keep-alive + retry) + endpoint normalization.
-// v2.7: SIMPLE GLOBAL PRIMING from env -> "General rules:\n{STANDARDPRIMING}" prepended to persona+instructions.
-// v2.8: Hardened tool_call flow (no empty tool_calls; strict ordering intent in loop).
-// v2.9: Strict payload pairing (buildStrictToolPairedMessages) + request/context debug snapshots.
-// v2.10: Endpoint precedence (options.endpoint > ENV > config > default) + conditional Authorization.
-// v2.11: ❗No user-message persistence here; bot.js logs user turns pre-call.
-//        Added options.noPendingUserInjection to avoid duplicating user content in working copy.
-// v2.12: PSEUDO-TOOLCALLS for local models (Qwen/Llama/etc.)
-// v2.13: Extra debug (schema/tools, payload, assistant text, parsed pseudo-calls, tool exec)
-// v2.14: Pseudotoolcalls → do NOT send tools/tool_choice in payload (fix local 500s)
-// v2.15: Fix ReferenceError + short-circuit after tool exec in pseudo-mode + direct reply from tool result
-// v2.16: Stable retries + prompt pinning on correction + no prose accumulation in pseudo-mode
+// v2.0 … v2.16 (siehe Historie)
+// v2.17: Link-Normalisierung (Angle-Brackets, Quotes, trailing Punct), Absolut-Pfad-Bau via PUBLIC_BASE_URL,
+//        robuste URL-Ernte aus Tool-Resulten, reine-URL-Ausgabe im Pseudo-Mode, Antwortsäuberung.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -233,6 +220,86 @@ function loadEnvPriming() {
   return (process.env.STANDARDPRIMING || "").trim();
 }
 
+/* -------------------- URL normalization helpers -------------------- */
+
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+
+function normalizeUrl(u) {
+  if (!u || typeof u !== "string") return null;
+  let s = u.trim();
+
+  // strip angle brackets and quotes
+  s = s.replace(/^<+/, "").replace(/>+$/, "");
+  s = s.replace(/^['"]+/, "").replace(/['"]+$/, "");
+
+  // remove trailing punctuations common in inline text
+  s = s.replace(/[),.;:!?]+$/g, "");
+
+  // collapse spaces
+  s = s.replace(/\s+/g, "");
+
+  if (!s) return null;
+
+  // simple sanity check
+  if (!/^https?:\/\//i.test(s) && !s.startsWith("/")) return null;
+  return s;
+}
+
+function coerceAbsoluteUrl(u) {
+  const n = normalizeUrl(u);
+  if (!n) return null;
+  if (/^https?:\/\//i.test(n)) return n;
+  if (n.startsWith("/") && PUBLIC_BASE_URL) {
+    return `${PUBLIC_BASE_URL}${n}`;
+  }
+  return null;
+}
+
+function collectUrlsFromToolResult(raw) {
+  const urls = new Set();
+
+  const pushMaybe = (val) => {
+    if (!val) return;
+    const abs = coerceAbsoluteUrl(val) || normalizeUrl(val);
+    if (abs && /^https?:\/\//i.test(abs)) urls.add(abs);
+  };
+
+  const scanObj = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+
+    // canonical fields
+    pushMaybe(obj.url);
+    pushMaybe(obj.link);
+    pushMaybe(obj.href);
+    pushMaybe(obj.image);
+    pushMaybe(obj.file); // may be http or /documents/...
+    // arrays
+    for (const key of ["urls", "links", "images"]) {
+      const arr = obj[key];
+      if (Array.isArray(arr)) arr.forEach(pushMaybe);
+    }
+  };
+
+  // raw can be stringified JSON or plain string URL
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (parsed && typeof parsed === "object") {
+      scanObj(parsed);
+    }
+  } catch {
+    // try to pick single URL from plain string
+    pushMaybe(String(raw || ""));
+  }
+
+  return [...urls];
+}
+
+function stripAngleBracketsInText(text) {
+  if (!text) return text;
+  // turn <http://...> into http://...
+  return text.replace(/<\s*(https?:\/\/[^>\s]+)\s*>/gi, "$1");
+}
+
 /* -------------------- Pseudo tool-calls helpers -------------------- */
 
 function buildPseudoToolsInstruction(tools) {
@@ -331,9 +398,8 @@ function lastConcreteUserPrompt(messages) {
   return "";
 }
 
-/**
- * Run a chat loop with tool-calls and bounded auto-continue.
- */
+/* -------------------- Main -------------------- */
+
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
@@ -424,7 +490,6 @@ async function getAIResponse(
 
     const authKey = apiKey || process.env.OPENAI_API_KEY;
 
-    // Pseudo correction limit
     let pseudoRetryCount = 0;
     const pseudoRetryMax = 2;
 
@@ -547,7 +612,8 @@ async function getAIResponse(
       }
 
       if (assistantText) {
-        responseMessage += assistantText;
+        // cleanup angle-bracketed URLs inside prose
+        responseMessage += stripAngleBracketsInText(assistantText);
       }
 
       if (hasToolCalls) {
@@ -657,21 +723,22 @@ async function getAIResponse(
       }
     } while (hadToolCallsThisTurn || continueResponse);
 
-    // Direct reply from tool results in pseudo-mode
+    // Direct reply from tool results in pseudo-mode: emit clean URLs only
     if (responseMessage.trim().length === 0 && lastToolResults.length > 0) {
-      const urls = [];
+      const allUrls = new Set();
       for (const r of lastToolResults) {
-        try {
-          const obj = JSON.parse(r);
-          if (obj && typeof obj === "object" && obj.url) urls.push(String(obj.url));
-        } catch {}
+        collectUrlsFromToolResult(r).forEach(u => allUrls.add(u));
       }
-      if (urls.length > 0) {
-        responseMessage = urls.map(u => `![result](${u})\n<${u}>`).join("\n");
+      if (allUrls.size > 0) {
+        // Just plain URLs, each on its own line — Discord will auto-embed
+        responseMessage = [...allUrls].join("\n");
       } else {
         const raw = String(lastToolResults[lastToolResults.length - 1] || "").trim();
         responseMessage = raw.length > 1500 ? (raw.slice(0, 1490) + " …") : raw;
       }
+    } else if (responseMessage) {
+      // final cleanup: strip <url> patterns if any leaked
+      responseMessage = stripAngleBracketsInText(responseMessage);
     }
 
     // Persist tool outputs
