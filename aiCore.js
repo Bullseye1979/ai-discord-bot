@@ -225,6 +225,7 @@ function buildPseudoToolsInstruction(tools) {
     "",
     "RULES:",
     "- The block must be the ONLY content (no prose).",
+    "- Do not comment the toolcall",
     "- Use exactly ONE tool per message.",
     "- Do not use markup code or fenced code",
     "- Stick exactly to the example.",
