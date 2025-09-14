@@ -895,7 +895,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
       process.env.OPENAI_BASE_URL ||
       "https://api.openai.com/v1";
 
-    const pseudoFromApi = !!apiBlock?.pseudotoolcalls; // NEW
+    const pseudoFromApi = !!apiBlock?.pseudotoolcalls // NEW
 
     // PRE-LOG (persist): User turn als "API" mit eingebettetem Kontext
     await chatContext.add("user", "API", userPrompt, Date.now());
