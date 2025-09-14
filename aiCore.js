@@ -1,7 +1,9 @@
-// aiCore.js — unified flow v2.30
+// aiCore.js — unified flow v2.33
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - Wenn pseudotoolcalls=true: generiere Tool-Definition + Pseudo-Schema aus freigegebenen tools (context.tools)
 // - Erkanntes Pseudo-Call-Block -> in normalen tool_call normalisieren -> toolRegistry ausführen
+// - [TOOL_RESULT:*]/[TOOL_OUTPUT:*] werden vor dem Senden an das Modell aus der History gefiltert
+// - Schema VERBIETET explizit [TOOL_RESULT:*]; NEGATIVE Beispiele hinzugefügt
 // - Kein Fabricate, kein Auto-Prompt-Fill, keine Auto-Retries, kein Auto-Continue
 // - Tool-Response wird zusätzlich als [TOOL_RESULT:<name>] persistiert (kompatibel für Modelle ohne Tools)
 // - Benutzerantwort: URL/Liste/JSON (einfach anpassbar)
@@ -136,8 +138,7 @@ function buildStrictToolPairedMessages(msgs) {
   return out;
 }
 
-/* ---- Persist Tool Results ---- */
-
+/** Persist Tool Results */
 const TOOL_PERSIST_ROLE =
   (process.env.TOOL_PERSIST_ROLE || "assistant").toLowerCase() === "system" ? "system" : "assistant";
 
@@ -155,6 +156,20 @@ function formatToolResultForPersistence(toolName, content) {
     body = body.slice(0, MAX_TOOL_PERSIST_CHARS - tail.length) + tail;
   }
   return body;
+}
+
+/** Entfernt persistierte Wrapper ([TOOL_RESULT:*], [TOOL_OUTPUT:*]) aus der Historie */
+function stripPersistedWrappers(msgs) {
+  const reWrap = /^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:[^\]]+\]/i;
+  return (msgs || []).filter(m => {
+    if (!m || typeof m.content !== "string") return true;
+    const c = m.content.trim();
+    // nur assistant/system filtern – user msgs bleiben immer erhalten
+    if (m.role === "assistant" || m.role === "system") {
+      if (reWrap.test(c)) return false; // nicht ans Modell schicken
+    }
+    return true;
+  });
 }
 
 /* ---- Pseudo-Tools: Definition + Parser ---- */
@@ -228,6 +243,12 @@ function buildPseudoToolsInstruction(tools) {
     "- The block must be the ONLY content (no prose).",
     "- Use exactly ONE tool per message.",
     "- JSON must be valid.",
+    "- NEVER output [TOOL_RESULT:…], [TOOL_OUTPUT:…], \"Tool result:\", or similar markers.",
+    "- If you cannot call a tool, return NOTHING.",
+    "",
+    "INVALID examples (do NOT do this):",
+    "[TOOL_RESULT:getGoogle]\\n{ \"query\": \"example\" }",
+    "Tool result: { \"url\": \"https://…\" }",
     "",
     "AVAILABLE TOOLS:"
   ];
@@ -247,9 +268,13 @@ function buildPseudoToolsInstruction(tools) {
   return text;
 }
 
-/** toleranter Pseudo-Call-Extractor (KEIN Fabricate) */
+/** toleranter Pseudo-Call-Extractor (ignoriert TOOL_RESULT/OUTPUT) */
 function extractPseudoToolCalls(text) {
   if (!text || typeof text !== "string") return [];
+  const trimmed = text.trim();
+  // harte Ignorier-Regel: wenn die Ausgabe wie ein TOOL_RESULT/OUTPUT-Wrapper aussieht, kein Toolcall.
+  if (/^\[(TOOL_RESULT|TOOL_OUTPUT)\s*:/i.test(trimmed)) return [];
+
   const calls = [];
   const pushIfValid = (obj) => {
     try {
@@ -261,23 +286,27 @@ function extractPseudoToolCalls(text) {
     } catch {}
   };
 
-  try { pushIfValid(JSON.parse(text)); } catch {}
+  // 0) reines JSON
+  try { pushIfValid(JSON.parse(trimmed)); } catch {}
+
+  // 1) XML <tool_call>…</tool_call>
   (function(){
     const re = /<tool_call>([\s\S]*?)<\/tool_call>/gi; let m;
     while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
   })();
+
+  // 2) Fenced ```tool_call
   (function(){
     const re = /```(?:tool_call|json|javascript|js)\s*([\s\S]*?)```/gi; let m;
     while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
   })();
-  (function(){
-    const re = /<toolcall>([\s\S]*?)<\/toolcall>/gi; let m;
-    while ((m = re.exec(text)) !== null) { const raw = (m[1]||"").trim(); try { pushIfValid(JSON.parse(raw)); } catch {} }
-  })();
+
+  // 3) NAME\n{…}
   (function(){
     const re = /(^|\n)\s*([A-Za-z0-9_\-\.]+)\s*\n\s*(\{[\s\S]*\})/g; let m;
     while ((m = re.exec(text)) !== null) { const name=(m[2]||"").trim(); const json=(m[3]||"").trim(); try { pushIfValid({ name, arguments: JSON.parse(json)||{} }); } catch {} }
   })();
+
   return calls;
 }
 
@@ -390,7 +419,7 @@ async function getAIResponse(
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
       if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
 
-      // WICHTIG: Pseudo-Definition nur dann injizieren, wenn pseudotoolcalls = true
+      // Pseudo-Definition nur injizieren, wenn pseudotoolcalls = true
       if (pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
         const schema = buildPseudoToolsInstruction(context_orig.tools);
         if (schema) sysParts.push(schema);
@@ -422,7 +451,10 @@ async function getAIResponse(
 
     // ---- EIN Zyklus: Anfrage -> (optional) Tool -> Antwort ----
 
-    const messagesToSend = buildStrictToolPairedMessages(context.messages).map(m => {
+    // 1) Persistierte Tool-Wrapper aus der History entfernen (kein Echo-Lernen)
+    const cleanedHistory = stripPersistedWrappers(context.messages);
+
+    const messagesToSend = buildStrictToolPairedMessages(cleanedHistory).map(m => {
       const out = { role: m.role, content: m.content };
       const safeName = cleanOpenAIName(m.role, m.name);
       if (safeName) out.name = safeName;
@@ -438,8 +470,8 @@ async function getAIResponse(
     };
 
     // EIN Flow:
-    // - Wenn pseudotoolcalls=false -> native tools erlauben
-    // - Wenn pseudotoolcalls=true -> KEINE native tools im Payload; das Modell soll Pseudo-Blöcke schicken
+    // - pseudotoolcalls=false -> native tools erlauben
+    // - pseudotoolcalls=true  -> KEINE native tools im Payload; Modell soll Pseudo-Blöcke schicken
     if (!pseudotoolcalls && Array.isArray(context_orig.tools) && context_orig.tools.length > 0) {
       payload.tools = context_orig.tools;
       payload.tool_choice = "auto";
@@ -488,8 +520,9 @@ async function getAIResponse(
     if (nativeToolCalls.length > 0) dbg("Native tool_calls:", nativeToolCalls.map(tc => tc?.function?.name));
 
     // --- Toolcall-Normalisierung ---
-    // 1) Native tool_calls (wenn vorhanden)
     let normalizedCalls = [];
+
+    // 1) Native tool_calls (wenn vorhanden)
     if (nativeToolCalls.length > 0) {
       normalizedCalls = nativeToolCalls
         .map(tc => {
@@ -504,11 +537,10 @@ async function getAIResponse(
         .filter(Boolean);
     }
 
-    // 2) Falls pseudotoolcalls=true und KEINE native calls → Pseudo-Block parsen
+    // 2) Falls pseudotoolcalls=true und KEINE native calls → Pseudo-Block parsen (TOOL_RESULT wird ignoriert)
     if (pseudotoolcalls && normalizedCalls.length === 0 && rawText) {
       const pseudoCalls = extractPseudoToolCalls(rawText);
       if (pseudoCalls.length > 0) {
-        // nur Tools, die freigegeben sind
         const allowed = new Set((context_orig.tools || []).map(t => t?.function?.name || t?.name).filter(Boolean));
         const picked = pseudoCalls.find(pc => allowed.has(pc.name));
         if (picked) {
@@ -516,7 +548,7 @@ async function getAIResponse(
             id: `call_${Date.now()}_0`,
             name: picked.name,
             arguments: (function sanitize(name, args) {
-              // KEIN Autofill. Nur techn. Defaults (z. B. size) für Image-Tools
+              // KEIN Autofill. Nur technische Defaults (z. B. size) für Image-Tools
               let a = Object.assign({}, args || {});
               if (/image|getimage|sd|stable/i.test(name)) {
                 const must = v => v != null && String(v).trim().length > 0;
@@ -536,7 +568,6 @@ async function getAIResponse(
 
     // --- Tool(s) ausführen (einheitlich) ---
     if (normalizedCalls.length > 0) {
-      // Nur den ersten ausführen (klarer, deterministisch)
       const call = normalizedCalls[0];
       const fnName = call.name;
       const args = call.arguments || {};
@@ -548,15 +579,15 @@ async function getAIResponse(
         const out = (typeof content === "string" || content == null)
           ? (content || "")
           : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
-        // 1) Tool-Message für pairing (falls später nützlich)
+        // 1) Tool-Message für pairing (optional nützlich)
         context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
-        // 2) Persist-kompatibel (für Modelle ohne Tools)
+        // 2) Persist-kompatibel (für Modelle ohne Tools) – wird künftig gefiltert und nicht mehr ans Modell geschickt
         const wrapped = formatToolResultForPersistence(fnName || "tool", out);
         const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
         try { context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, Date.now()); } catch {}
         // 3) Für User-Antwort halten
         toolResults.push({ name: fnName || "tool", raw: out });
-        // 4) Für Logging-Queue
+        // 4) Logging
         toolCommits.push({ name: fnName || "tool", content: out });
       };
 
@@ -596,7 +627,7 @@ async function getAIResponse(
         else responseMessage = "";
       }
     } else {
-      // Kein Tool – liefere einfach das Model-Text-Ergebnis zurück
+      // Kein Tool – liefere Model-Text-Ergebnis
       responseMessage = String(lastRawAssistant || "");
       if (!responseMessage) {
         if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
@@ -604,7 +635,7 @@ async function getAIResponse(
       }
     }
 
-    // Persist tool outputs (der Vollständigkeit halber, falls oben mal fehlschlug)
+    // Persist tool outputs (Sicherheitsnetz)
     if (toolCommits.length > 0) {
       let t0 = (pendingUser && pendingUser.timestamp) ? pendingUser.timestamp : Date.now();
       for (let i = 0; i < toolCommits.length; i++) {
