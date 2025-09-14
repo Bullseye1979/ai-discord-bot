@@ -147,12 +147,31 @@ async function getProcessAIRequest(message, chatContext, client, state, model, a
       chatContext.instructions = (chatContext.instructions || "") + "\n\n" + modeAppend.trim();
     }
 
+    // NEW: endpoint & pseudo-toolcalls sauber auflösen (Block > _API > ENV/Default)
+    const effectiveEndpoint =
+      (matchingBlock?.endpoint && String(matchingBlock.endpoint).trim()) ||
+      (channelMeta?.api?.endpoint && String(channelMeta.api.endpoint).trim()) ||
+      (process.env.OPENAI_BASE_URL && String(process.env.OPENAI_BASE_URL).trim()) ||
+      ""; // aiCore normalisiert selbst auf /v1/chat/completions, falls leer
+
+    const pseudoFlag =
+      (matchingBlock?.pseudotoolcalls === true) ||
+      (channelMeta?.api?.pseudotoolcalls === true) ||
+      false;
+
     const output = await getAIResponse(
       chatContext,
       tokenlimit,
       sequenceLimit,
       effectiveModel,
-      effectiveApiKey
+      effectiveApiKey,
+      {
+        // NEW: kritisch für Pseudo-Toolcalls + Endpunkt!
+        endpoint: effectiveEndpoint,
+        pseudotoolcalls: !!pseudoFlag,
+        // Optional: falls du die User-Message schon VOR dem Call persistiert hast:
+        // noPendingUserInjection: true
+      }
     );
 
     if (output && String(output).trim()) {

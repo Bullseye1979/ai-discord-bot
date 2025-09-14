@@ -217,20 +217,39 @@ async function deleteAllMessages(channel) {
   }
 }
 
-/** LLM-Endpunkt/Key/Modell pro Turn auflösen (Block > Global > ENV/Default) */
+/** LLM-Endpunkt/Key/Modell pro Turn auflösen (Block > Channel > _API > ENV/Default) */
 function resolveEffectiveLLM(channelMeta, matchingBlock) {
-  return {
-    model: matchingBlock?.model || channelMeta.model || "gpt-4o",
-    apikey: matchingBlock?.apikey || channelMeta.apikey || null,
-    endpoint:
-      matchingBlock?.endpoint ||
-      channelMeta.endpoint ||
-      process.env.OPENAI_BASE_URL ||
-      "https://api.openai.com/v1",
-    // NEW: pseudo-toolcalls flag can also be set per block
-    pseudotoolcalls: !!matchingBlock?.pseudotoolcalls
-  };
+  const api = channelMeta?.api || channelMeta?._API || {};
+
+  const model =
+    (matchingBlock && matchingBlock.model) ||
+    channelMeta.model ||
+    api.model ||
+    "gpt-4o";
+
+  const apikey =
+    (matchingBlock && matchingBlock.apikey) ||
+    channelMeta.apikey ||
+    api.apikey ||
+    null;
+
+  const endpoint =
+    (matchingBlock && matchingBlock.endpoint) ||
+    channelMeta.endpoint ||
+    api.endpoint ||
+    process.env.OPENAI_BASE_URL ||
+    "https://api.openai.com/v1";
+
+  // 🔧 Pseudo-Toolcalls: Block > Channel > _API (Fallback)
+  const pseudo =
+    (matchingBlock && matchingBlock.pseudotoolcalls === true) ||
+    (channelMeta && channelMeta.pseudotoolcalls === true) ||
+    (api && api.pseudotoolcalls === true) ||
+    false;
+
+  return { model, apikey, endpoint, pseudotoolcalls: pseudo };
 }
+
 
 /** Voice transcript → AI reply (keine Tooländerung hier) */
 async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {

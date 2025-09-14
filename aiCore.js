@@ -267,7 +267,7 @@ function extractPseudoToolCalls(text) {
     } catch {}
   }
 
-  // 2) Code fence ```tool_call { ... } ```
+  // 2) Code fence ```tool_call { ... } ``` and ```json { ... } ```
   const reFence = /```(?:tool_call|json)\s*([\s\S]*?)```/gi;
   while ((m = reFence.exec(text)) !== null) {
     const raw = (m[1] || "").trim();
@@ -279,7 +279,7 @@ function extractPseudoToolCalls(text) {
     } catch {}
   }
 
-  // 3) Angle bracket single tag variant: <toolcall>{...}</toolcall>
+  // 3) Variant: <toolcall>{...}</toolcall>
   const reAlt = /<toolcall>([\s\S]*?)<\/toolcall>/gi;
   while ((m = reAlt.exec(text)) !== null) {
     const raw = (m[1] || "").trim();
@@ -301,7 +301,7 @@ function extractPseudoToolCalls(text) {
  * @param {number}  sequenceLimit
  * @param {string}  model
  * @param {string|null} apiKey
- * @param {object}  options               // { pendingUser?: {name, content, timestamp}, endpoint?: string, noPendingUserInjection?: boolean }
+ * @param {object}  options               // { pendingUser?: {name, content, timestamp}, endpoint?: string, noPendingUserInjection?: boolean, pseudotoolcalls?: boolean }
  */
 async function getAIResponse(
   context_orig,
@@ -319,6 +319,9 @@ async function getAIResponse(
   try {
     if (tokenlimit == null) tokenlimit = 4096;
 
+    // 🔧 Resolve pseudo-toolcalls flag from options OR original context
+    const pseudoFlag = options?.pseudotoolcalls === true || context_orig?.pseudoToolcalls === true;
+
     // Working copies (reply context + tool-handover)
     const context = new Context(
       "",
@@ -326,7 +329,7 @@ async function getAIResponse(
       context_orig.tools,
       context_orig.toolRegistry,
       context_orig.channelId || null,
-      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!context_orig.pseudoToolcalls }
+      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudoFlag }
     );
     context.messages = [...context_orig.messages];
 
@@ -336,7 +339,7 @@ async function getAIResponse(
       context_orig.tools,
       context_orig.toolRegistry,
       context_orig.channelId || null,
-      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!context_orig.pseudoToolcalls }
+      { skipInitialSummaries: true, persistToDB: false, pseudoToolcalls: !!pseudoFlag }
     );
     handoverContext.messages = [...context_orig.messages];
 
@@ -350,8 +353,8 @@ async function getAIResponse(
       if ((context_orig.persona || "").trim()) sysParts.push(String(context_orig.persona).trim());
       if ((context_orig.instructions || "").trim()) sysParts.push(String(context_orig.instructions).trim());
 
-      // Pseudo-toolcalls schema (if enabled)
-      if (context_orig.pseudoToolcalls === true) {
+      // Pseudo-toolcalls schema (only if enabled)
+      if (pseudoFlag === true) {
         const schema = buildPseudoToolsInstruction(context.tools || []);
         if (schema) sysParts.push(schema);
       }
@@ -464,12 +467,12 @@ async function getAIResponse(
 
       // PSEUDO-TOOLCALL DETECTION
       let pseudoCalls = [];
-      if (context.pseudoToolcalls === true && assistantText) {
+      if (pseudoFlag === true && assistantText) {
         pseudoCalls = extractPseudoToolCalls(assistantText);
       }
 
       if (pseudoCalls.length > 0) {
-        // prevent the raw tag content from leaking into the visible assistant text
+        // prevent raw tag from leaking into assistant text
         assistantText = "";
       }
 
