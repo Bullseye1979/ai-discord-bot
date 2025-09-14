@@ -1,4 +1,4 @@
-// aiCore.js — unified flow v2.35 (Tool-Chaining for native tools + Finalizer)
+// aiCore.js — unified flow v2.36 (Tool-Chaining + Finalizer, no link parsing)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
@@ -6,8 +6,12 @@
 // - [TOOL_RESULT:*]/[TOOL_OUTPUT:*] werden vor jedem Modell-Call aus der History gefiltert
 // - Schema VERBIETET explizit [TOOL_RESULT:*]; NEGATIVE Beispiele hinzugefügt
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
-// - Sonderfall: Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)
+// - Sonderfall (früher): Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)  => ***ENTFERNT***
 // - Kein Fabricate, kein Auto-Prompt-Fill
+//
+// v2.36 changes:
+// - Link-Parser entfernt: Tool-Outputs werden nicht mehr auf URLs/Listen/links reduziert.
+// - Finalizer wird nie wegen „single URL“ übersprungen.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -306,47 +310,15 @@ function prettyClipJSON(any, max = 1800) {
   return s;
 }
 
-function renderToolOutputGeneric(name, raw) {
-  if (typeof raw === "string" && raw.trim()) {
-    const s = raw.trim();
-    if (/^https?:\/\//i.test(s)) return s;
-    try { return renderToolOutputGeneric(name, JSON.parse(s)); } catch { return prettyClipJSON(s); }
-  }
-  if (raw && typeof raw === "object") {
-    const obj = raw;
-    const url = obj.url || obj.link || obj.href;
-    if (typeof url === "string" && url.trim()) return url.trim();
-
-    if (Array.isArray(obj.results)) {
-      const lines = [];
-      for (const it of obj.results) {
-        const title = (it?.title || it?.name || "").toString().trim();
-        const link  = (it?.url || it?.link || it?.href || "").toString().trim();
-        if (title && link) lines.push(`${title} — ${link}`);
-        else if (link)     lines.push(link);
-        if (lines.length >= 5) break;
-      }
-      if (lines.length > 0) return lines.join("\n");
-    }
-
-    if (Array.isArray(obj)) {
-      const lines = [];
-      for (const it of obj) {
-        const title = (it?.title || it?.name || "").toString().trim();
-        const link  = (it?.url || it?.link || it?.href || "").toString().trim();
-        if (title && link) lines.push(`${title} — ${link}`);
-        else if (link)     lines.push(link);
-        if (lines.length >= 5) break;
-      }
-      if (lines.length > 0) return lines.join("\n");
-    }
-
-    if (typeof obj.text === "string" && obj.text.trim()) return obj.text.trim();
-    if (typeof obj.content === "string" && obj.content.trim()) return obj.content.trim();
-
-    return prettyClipJSON(obj);
-  }
-  return "";
+/**
+ * NEU (v2.36): Keine Link-/URL-Erkennung, keine Ergebnislistenbildung.
+ * - Strings: 1:1 zurück (getrimmt).
+ * - Objekte/Arrays: JSON-pretty (geclippt).
+ */
+function renderToolOutputGeneric(_name, raw) {
+  if (raw == null) return "";
+  if (typeof raw === "string") return raw.trim();
+  try { return prettyClipJSON(raw); } catch { return String(raw); }
 }
 
 /* ---- Finalisierung: Zweiter Model-Call ohne Tools ---- */
@@ -687,12 +659,10 @@ async function getAIResponse(
       else responseMessage = "";
     }
 
-    /* ----- Finalisierungsturn (nur wenn sinnvoll) ----- */
+    /* ----- Finalisierungsturn ----- */
 
-    const looksLikeSingleUrl =
-      rendered.length === 1 && /^https?:\/\//i.test(rendered[0]);
-
-    const shouldSkipFinalizeForUrlOnly = pseudotoolcalls && looksLikeSingleUrl;
+    // v2.36: kein Skip-Finalize mehr für single URL
+    const shouldSkipFinalizeForUrlOnly = false;
 
     if (postToolFinalize && toolResults.length > 0 && !shouldSkipFinalizeForUrlOnly) {
       const configuredRaw =
