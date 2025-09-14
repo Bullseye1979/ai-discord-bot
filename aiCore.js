@@ -1,4 +1,4 @@
-// aiCore.js — refactored v2.13 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
+// aiCore.js — refactored v2.14 (endpoint override + conditional auth + pseudo-toolcalls + debug logs)
 // Chat loop with tool-calls, safe logging, strict auto-continue guard.
 // v2.0: pendingUser working-copy + post-commit with original timestamp.
 // v2.3: prune orphan historical `tool` msgs when building payload.
@@ -16,6 +16,7 @@
 //        - Detect <tool_call>{...}</tool_call> & variants in assistant text
 //        - Execute via registry and commit as proper GPT tool messages
 // v2.13: DEBUG: console dumps for schema/tools, payload preview, assistant text, parsed pseudo-calls, tool exec
+// v2.14: ❗When pseudotoolcalls=true → do NOT send tools/tool_choice in payload (fix 500s on local endpoints)
 
 require("dotenv").config();
 const axios = require("axios");
@@ -243,10 +244,8 @@ function buildPseudoToolsInstruction(tools) {
 
   if (names.length === 0) return "";
 
-  // ⚠️ Dynamisches Beispiel: nutze den ersten Toolnamen statt "getImage"
   const exampleTool = names[0];
 
-  // leicht verstärktes Schema + Beispiel
   return [
     "You MUST use tools via *pseudo tool-calls* when needed.",
     "Output **ONLY** one block, no other text.",
@@ -441,13 +440,16 @@ async function getAIResponse(
         return out;
       });
 
+      // 🔑 Build payload — OMIT tools/tool_choice when pseudotoolcalls is enabled
       const payload = {
         model,
         messages: messagesToSend,
-        max_tokens: tokenlimit,
-        tool_choice: "auto",
-        tools: context.tools,
+        max_tokens: tokenlimit
       };
+      if (!pseudoFlag && Array.isArray(context.tools) && context.tools.length > 0) {
+        payload.tools = context.tools;
+        payload.tool_choice = "auto";
+      }
 
       const configuredRaw =
         (options?.endpoint || "").trim() ||
@@ -463,9 +465,9 @@ async function getAIResponse(
         model,
         tokenlimit,
         sequenceCounter,
-        tools: Array.isArray(context.tools)
+        tools: (!pseudoFlag && Array.isArray(context.tools))
           ? context.tools.map(t => t?.function?.name || t?.name || "unknown")
-          : [],
+          : []
       });
 
       // Headers
@@ -487,10 +489,12 @@ async function getAIResponse(
           model,
           payloadPreview: {
             messages: messagesToSend.slice(-6),
-            tools: Array.isArray(context.tools) ? context.tools.map(t => t?.function?.name || t?.name) : [],
+            tools: (!pseudoFlag && Array.isArray(context.tools))
+              ? context.tools.map(t => t?.function?.name || t?.name)
+              : [],
           }
         }, null, 2)); } catch {}
-        console.log("\n\n=== CONTEXT RAW DUMP ===\n", context.messages, "\n=== /CONTEXT RAW DUMP ===\n");
+        console.log("\n\n=== CONTEXT RAW DUMP ===\n", context?.messages || [], "\n=== /CONTEXT RAW DUMP ===\n");
         throw err;
       }
 
@@ -679,7 +683,7 @@ async function getAIResponse(
         )
       );
     } catch {}
-    console.log("\n\n=== CONTEXT OBJ RAW ===\n", context, "\n=== /CONTEXT OBJ RAW ===\n");
+    console.log("\n\n=== CONTEXT OBJ RAW ===\n", context || {}, "\n=== /CONTEXT OBJ RAW ===\n");
     throw err;
   }
 }
