@@ -239,6 +239,13 @@ function buildPseudoToolsInstruction(tools) {
     "INVALID examples (do NOT do this):",
     "[TOOL_RESULT:getGoogle]\\n{ \"query\": \"example\" }",
     "Tool result: { \"url\": \"https://…\" }",
+    '{ "name": "getImageSD", "arguments": {  "prompt": "elephant",  "user_id": "" } }',
+    "",
+    "WORKING EXAMPLES:",
+    '<tool_call>{ "name": "getImageSD", "arguments": {  "prompt": "elephant",  "user_id": "" } }</tool_call>',
+    '<tool_call>{ "name": "getGoogle", "arguments": {  "query": "limp bizkit tour",  "user_id": "123456" } }</tool_call>',
+    '<tool_call>{ "name": "getGoogle", "arguments": {  "query": "chancelor germany",  "user_id": "246789" } }</tool_call>',
+    '<tool_call>{ "name": "getImageSD", "arguments": {  "prompt": "man with a hat",  "user_id": "246789" } }</tool_call>',
     "",
     "AVAILABLE TOOLS:"
   ];
