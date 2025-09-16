@@ -1,12 +1,59 @@
-// location.js — v2.6 (GOOGLE_API_KEY; Static Street View image only)
+// location.js — v2.7 (GOOGLE_API_KEY; server-side download of Static Street View image)
 // Build Google Maps (route/search) links via api=1, optional Street View (pano link),
 // plus human-readable driving directions via Directions API.
-// NOTE: No Static Map image — only Static Street View image is returned alongside links.
-// ENV: GOOGLE_API_KEY
+// NEW: Static Street View image wird SERVERSEITIG heruntergeladen, lokal gespeichert
+//      und als dauerhafte URL wie in getImage zurückgegeben.
+// NOTE: Keine Static Map (Routenbild).
+// ENV: GOOGLE_API_KEY, PUBLIC_BASE_URL (optional), BASE_URL (Fallback)
 
 const axios = require("axios");
+const path = require("path");
+const fs = require("fs/promises");
+const crypto = require("crypto");
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+
+// ——— Ablageort & URL-Format exakt wie in getImage ———
+const PICTURES_DIR = path.join(__dirname, "documents", "pictures");
+
+function ensureAbsoluteUrl(urlPath) {
+  const base = (process.env.PUBLIC_BASE_URL || process.env.BASE_URL || "").replace(/\/$/, "");
+  if (/^https?:\/\//i.test(urlPath)) return urlPath;
+  if (base) return `${base}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`;
+  return urlPath; // relativ als Fallback
+}
+
+function pickExtFromContentType(ct) {
+  const s = String(ct || "").toLowerCase();
+  if (s.includes("image/png")) return ".png";
+  if (s.includes("image/jpeg") || s.includes("image/jpg")) return ".jpg";
+  if (s.includes("image/webp")) return ".webp";
+  if (s.includes("image/gif")) return ".gif";
+  return ".png"; // default
+}
+
+function safeBaseFromHint(hint) {
+  const s = String(hint || "streetview")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+  return s || "streetview";
+}
+
+async function saveBufferAsPicture(buffer, nameHint, contentTypeHint = "image/png") {
+  await fs.mkdir(PICTURES_DIR, { recursive: true });
+  const ext = pickExtFromContentType(contentTypeHint);
+  const slug = safeBaseFromHint(nameHint);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const rand = crypto.randomBytes(4).toString("hex");
+  const filename = `${slug}-${ts}-${rand}${ext}`;
+  const filePath = path.join(PICTURES_DIR, filename);
+  await fs.writeFile(filePath, buffer);
+  const publicUrl = ensureAbsoluteUrl(`/documents/pictures/${filename}`);
+  return { filename, filePath, publicUrl };
+}
 
 /** Detect "lat,lon" input. */
 function isLatLon(input) {
@@ -98,9 +145,8 @@ function buildStreetViewPanoURL(latLon, language = "en") {
   return `https://www.google.com/maps/@?api=1&hl=${hl}&map_action=pano&viewpoint=${encodeURIComponent(latLon)}`;
 }
 
-/** Build Street View Static Image URL (exposes key; restrict API usage!). */
+/** Build Street View Static Image URL (server will download it). */
 function buildStreetViewImageURL(latLon, { size = "640x400", fov = 90, heading, pitch } = {}) {
-  // Optional direction parameters
   const params = new URLSearchParams({
     size,
     location: latLon,
@@ -109,13 +155,35 @@ function buildStreetViewImageURL(latLon, { size = "640x400", fov = 90, heading, 
   });
   if (heading !== undefined) params.set("heading", String(heading));
   if (pitch !== undefined) params.set("pitch", String(pitch));
-
   return `https://maps.googleapis.com/maps/api/streetview?${params.toString()}`;
 }
 
-/** Get directions text.
- * Degrades gracefully if Directions API is not enabled/allowed.
- */
+/** Optional: Street View Metadata check to vermeiden leerer Bilder. */
+async function hasStreetView(latLon) {
+  try {
+    const url = "https://maps.googleapis.com/maps/api/streetview/metadata";
+    const params = { location: latLon, key: GOOGLE_API_KEY };
+    const { data } = await axios.get(url, { params, timeout: 10000 });
+    return { ok: data?.status === "OK", status: data?.status || "UNKNOWN" };
+  } catch (e) {
+    console.error("[getLocation][sv-metadata] error:", e?.response?.data || e?.message || e);
+    return { ok: false, status: "ERROR" };
+  }
+}
+
+/** Download Street View image to local pictures dir; return { url, file }. */
+async function downloadStreetViewToLocal(imageUrl, nameHint) {
+  const res = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 30000 });
+  const buf = Buffer.from(res.data);
+  const ct = res.headers?.["content-type"] || "image/png";
+  const saved = await saveBufferAsPicture(buf, nameHint, ct);
+  return {
+    url: saved.publicUrl,                           // wie getImage.url
+    file: `/documents/pictures/${saved.filename}`   // wie getImage.file (relativ)
+  };
+}
+
+/** Get directions text (route). */
 async function getDirectionsText(origin, destination, waypoints = [], language = "en") {
   try {
     const params = {
@@ -150,7 +218,7 @@ async function getDirectionsText(origin, destination, waypoints = [], language =
   }
 }
 
-/** Tool entry: return Street View links & image, Maps link, and directions (if route). */
+/** Tool entry: return Street View links & LOCAL image URL, Maps link, and directions (if route). */
 async function getLocation(toolFunction) {
   try {
     if (!GOOGLE_API_KEY) {
@@ -192,18 +260,35 @@ async function getLocation(toolFunction) {
 
     const mapsUrl = buildMapsURLApi1({ points, isRoute, language });
 
-    // Street View: always try to produce pano link and static image for the last valid coord
+    // Street View: pano link + SERVERSEITIG heruntergeladenes Bild
     let streetPanoLink = "";
-    let streetImage = "";
+    let streetImageUrl = "";   // öffentliche, eigene URL
+    let streetImageFile = "";  // relativer Pfad (falls du ihn anzeigen willst)
+
     const lastCoord = geo[geo.length - 1]?.coord;
     if (lastCoord) {
       streetPanoLink = buildStreetViewPanoURL(lastCoord, language);
-      streetImage = buildStreetViewImageURL(lastCoord, {
-        size: streetSize,
-        fov: streetFov,
-        heading: streetHeading,
-        pitch: streetPitch,
-      });
+
+      // optionaler Verfügbarkeits-Check
+      const sv = await hasStreetView(lastCoord);
+      if (sv.ok) {
+        const srcUrl = buildStreetViewImageURL(lastCoord, {
+          size: streetSize,
+          fov: streetFov,
+          heading: streetHeading,
+          pitch: streetPitch,
+        });
+        try {
+          const saved = await downloadStreetViewToLocal(srcUrl, `streetview-${lastCoord}`);
+          streetImageUrl = saved.url;
+          streetImageFile = saved.file;
+        } catch (e) {
+          console.error("[getLocation][streetview-download] error:", e?.response?.data || e?.message || e);
+          // Falls Download fehlschlägt, geben wir wenigstens den interaktiven Link zurück
+        }
+      } else {
+        console.warn("[getLocation] No Street View imagery at", lastCoord, "status:", sv.status);
+      }
     }
 
     // Directions (route only)
@@ -215,14 +300,17 @@ async function getLocation(toolFunction) {
       directionsText = await getDirectionsText(origin, destination, waypoints, language);
     }
 
-    // Compose output (text with links) — no Static Map image
+    // Compose output (Text mit Links/URL) — weiterhin textbasiert (kompatibel zu deinem Tool-Contract)
     let out = "";
     if (streetPanoLink) out += `Street View (interactive): ${streetPanoLink}\n`;
-    if (streetImage) out += `Street View Image: ${streetImage}\n`;
+    if (streetImageUrl) {
+      out += `Street View Image: ${streetImageUrl}\n`;
+      // Optional: Dateipfad, falls du ihn im UI anzeigen möchtest
+      out += `Street View File: ${streetImageFile}\n`;
+    }
     out += `${isRoute ? "Route" : "Location"}: ${mapsUrl}\n\n`;
     if (isRoute) out += directionsText;
 
-    // If we couldn't build a static street view image (no geocode), still return links
     return out.trim();
   } catch (error) {
     console.error("getLocation error:", error?.message || error);
