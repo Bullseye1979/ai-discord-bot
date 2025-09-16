@@ -1,12 +1,14 @@
-// tools.js — smart history v2.1 (zentral robuste Normalisierung)
+// tools.js — smart history v2.2 (zentral robuste Normalisierung + YouTube-Search)
 // - findTimeframes: Keywords -> list of {start,end} windows (channel-scoped), no summarization
 // - getHistory: timeframe-only summarization (no chunking, single LLM pass; full history if no start/end)
-// - NEU: getToolRegistry() akzeptiert Strings oder Objekt-Items (name / function.name / id)
+// - getYoutube: Transcript-QA + (neu) Metadaten (Titel, Kanal, Datum)
+// - getYoutubeSearch: Themenbasierte YouTube-Suche (YouTube Data API v3)
+// - getToolRegistry() akzeptiert Strings oder Objekt-Items (name / function.name / id)
 
 const { getWebpage } = require("./webpage.js");
-const { getImage,getImageSD } = require("./image.js");
+const { getImage, getImageSD } = require("./image.js");
 const { getGoogle } = require("./google.js");
-const { getYoutube } = require("./youtube.js");
+const { getYoutube, getYoutubeSearch } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
@@ -76,7 +78,8 @@ const tools = [
       name: "getYoutube",
       description:
         "Parse YouTube subtitles (CC), EXECUTE the user_prompt directly against the full transcript (no chunking), " +
-        "and return only the answer and the video URL. Useful for summaries, quote search, scene extraction, etc.",
+        "and return the answer, video URL, and (if possible) metadata (title, channel, publishedAt). " +
+        "Useful for summaries, quote search, scene extraction, etc.",
       parameters: {
         type: "object",
         properties: {
@@ -85,6 +88,27 @@ const tools = [
           user_prompt: { type: "string", description: "Original natural-language user request (e.g., summarize, extract quotes, find a scene)." }
         },
         required: ["video_url", "user_id", "user_prompt"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getYoutubeSearch",
+      description:
+        "Search YouTube for topic-related videos via YouTube Data API v3. Returns compact results (title, channel, publishedAt, URL). " +
+        "Use when the user asks for an explanation WITH a video (e.g., 'erkläre mir mit einem Video advantage in dnd').",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search topic or natural-language query." },
+          max_results: { type: "number", description: "Max number of results (1-10). Default 5." },
+          relevance_language: { type: "string", description: "Hint language for relevance, e.g. 'de', 'en'. Default 'de'." },
+          region_code: { type: "string", description: "Region code, e.g. 'DE', 'US'. Default 'DE'." },
+          safe_search: { type: "string", description: "none | moderate | strict. Default 'none'." },
+          user_id: { type: "string", description: "User ID or display name." }
+        },
+        required: ["query", "user_id"]
       }
     }
   },
@@ -243,6 +267,7 @@ const fullToolRegistry = {
   getImage,
   getGoogle,
   getYoutube,
+  getYoutubeSearch, // ⬅︎ neu
   getImageDescription,
   getLocation,
   getPDF,
