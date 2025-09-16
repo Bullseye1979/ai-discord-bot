@@ -1,9 +1,9 @@
-// location.js — v3.5 (no locale; JSON return; robust Street View; server-side download)
-// - Keine Sprache/Region: es werden nirgendwo language/region/hl-Parameter gesetzt.
-// - Rückgabe ist EIN JSON-String. Reihenfolge: street_view, maps_url, directions_text, inputs, description (letztes Feld).
-// - Street View: Metadata (pano_id bevorzugt) → Static Street View serverseitig speichern (gleiches Schema wie getImage).
-// - Fallbacks: (1) Geocoded-Koordinate, (2) Directions-Endkoordinate, (3) Adresse direkt an SV-API.
-// - Keine Static-Map.
+// location.js — v3.6 (no locale; JSON return; robust Street View; server-side download + fallback URL)
+// - Keine Sprache/Region: nirgendwo language/region/hl-Parameter.
+// - Immer ein Static Street View Bild zurückgeben:
+//     1) bevorzugt: serverseitig herunterladen & als dauerhafte URL ausliefern
+//     2) Fallback: direkte Google-Static-Street-View-URL (image_src), falls Download scheitert
+// - Rückgabe: JSON-String mit Feldern: street_view, maps_url, directions_text, inputs, description (letztes Feld)
 // ENV: GOOGLE_API_KEY, PUBLIC_BASE_URL (oder BASE_URL)
 
 const axios = require("axios");
@@ -76,7 +76,7 @@ function trimLatLng(lat, lng, decimals = 5) {
   return `${la.toFixed(decimals)},${ln.toFixed(decimals)}`;
 }
 
-// Geocoding (ohne language/region)
+// Geocoding (ohne locale)
 async function geocodeOne(query) {
   const q = normalize(query);
   if (!q) return null;
@@ -131,7 +131,7 @@ function buildStreetViewPanoURLFromPanoId(panoId) {
   return `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`;
 }
 
-// Static Street View Image URL
+// Static Street View Image URL (Quelle immer Google)
 function buildStreetViewImageURL({ panoId, latLon, address, size = "640x400", fov = 90, heading, pitch }) {
   const params = new URLSearchParams({ size, fov: String(fov), key: GOOGLE_API_KEY });
   if (panoId) params.set("pano", panoId);
@@ -263,17 +263,18 @@ async function getLocation(toolFunction) {
     const destAddress = normalized[destIdx];
     let svCoord = coordFromGeocode || endCoordFromDirections || null;
 
-    // 5) Street View
-    const streetView = { interactive_url: "", image_url: "", file: "" };
+    // 5) Street View — wir versuchen IMMER auch ein Static Image zurückzugeben
+    const streetView = { interactive_url: "", image_url: "", image_src: "", file: "", downloaded: false };
     let svNote = "";
 
     const meta = await getStreetViewMeta({ latLon: svCoord, address: svCoord ? null : destAddress });
     const status = String(meta?.status || "").toUpperCase();
 
+    let interactive = "";
+    let imageSrc = "";
+
     if (status === "OK") {
       const panoId = meta?.pano_id || meta?.panoId || null;
-      let interactive = "";
-      let imageSrc = "";
 
       if (panoId) {
         interactive = buildStreetViewPanoURLFromPanoId(panoId);
@@ -288,41 +289,39 @@ async function getLocation(toolFunction) {
           interactive = buildStreetViewPanoURLFromLatLon(metaLatLon);
           imageSrc = buildStreetViewImageURL({ latLon: metaLatLon, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
         } else {
-          interactive = "";
           imageSrc = buildStreetViewImageURL({ address: destAddress, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
         }
       }
+    } else {
+      // Metadata nicht OK: trotzdem direkt versuchen, ein Bild über die Adresse zu holen
+      imageSrc = buildStreetViewImageURL({ address: destAddress, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
+    }
 
+    // Download versuchen — bei Fehler: Fallback auf direkte Google-URL
+    if (imageSrc) {
       try {
-        const saved = await downloadStreetViewToLocal(imageSrc, `streetview-${panoId || svCoord || destAddress}`);
-        streetView.image_url = saved.url;
+        const saved = await downloadStreetViewToLocal(imageSrc, `streetview-${svCoord || destAddress}`);
+        streetView.image_url = saved.url;     // dauerhafte eigene URL
         streetView.file = saved.file;
-        streetView.interactive_url = interactive || (svCoord ? buildStreetViewPanoURLFromLatLon(svCoord) : "");
-        if (!streetView.interactive_url) {
-          streetView.interactive_url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
-        }
-        svNote = "Street View image and interactive link generated.";
+        streetView.downloaded = true;
       } catch (e) {
         console.error("[getLocation][streetview-download] error:", e?.response?.data || e?.message || e);
-        streetView.interactive_url = interactive || (svCoord ? buildStreetViewPanoURLFromLatLon(svCoord) : "");
-        svNote = "Street View image download failed; interactive link provided.";
+        streetView.image_url = imageSrc;      // Fallback: direkte Google-URL
+        streetView.downloaded = false;
       }
-    } else {
-      try {
-        const imageSrc = buildStreetViewImageURL({ address: destAddress, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
-        const saved = await downloadStreetViewToLocal(imageSrc, `streetview-${destAddress}`);
-        streetView.image_url = saved.url;
-        streetView.file = saved.file;
-        streetView.interactive_url = svCoord
-          ? buildStreetViewPanoURLFromLatLon(svCoord)
-          : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
-        svNote = `Street View by address (metadata status: ${status || "UNKNOWN"}).`;
-      } catch (e) {
-        console.warn("[getLocation] No Street View imagery resolvable. status:", status, "err:", e?.message || e);
-        if (svCoord) streetView.interactive_url = buildStreetViewPanoURLFromLatLon(svCoord);
-        svNote = `No Street View image (metadata status: ${status || "UNKNOWN"}).`;
-      }
+      streetView.image_src = imageSrc;        // immer zur Transparenz/Debug
     }
+
+    // Interactive Link bestmöglich setzen
+    if (!interactive) {
+      if (svCoord) interactive = buildStreetViewPanoURLFromLatLon(svCoord);
+      else interactive = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
+    }
+    streetView.interactive_url = interactive;
+
+    svNote = streetView.downloaded
+      ? "Street View image stored locally and interactive link generated."
+      : "Street View image provided via Google URL (download failed or disabled).";
 
     // 6) Beschreibung als letztes Feld
     const descriptionParts = [];
