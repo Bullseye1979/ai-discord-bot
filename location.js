@@ -1,7 +1,8 @@
-// location.js — v3.2 (JSON return; robust without Geocoding; server-side Street View download)
-// - JSON-Return (als String). Reihenfolge: street_view, maps_url, directions_text, inputs, description (letztes Feld).
-// - Nutzt Street View Metadata API (pano_id bevorzugt) und lädt Static Street View serverseitig herunter.
-// - Fallbacks: (1) Geocoded Koordinate, (2) Ziel-Koordinate aus Directions API, (3) direkte Address-Location bei SV.
+// location.js — v3.5 (no locale; JSON return; robust Street View; server-side download)
+// - Keine Sprache/Region: es werden nirgendwo language/region/hl-Parameter gesetzt.
+// - Rückgabe ist EIN JSON-String. Reihenfolge: street_view, maps_url, directions_text, inputs, description (letztes Feld).
+// - Street View: Metadata (pano_id bevorzugt) → Static Street View serverseitig speichern (gleiches Schema wie getImage).
+// - Fallbacks: (1) Geocoded-Koordinate, (2) Directions-Endkoordinate, (3) Adresse direkt an SV-API.
 // - Keine Static-Map.
 // ENV: GOOGLE_API_KEY, PUBLIC_BASE_URL (oder BASE_URL)
 
@@ -12,7 +13,7 @@ const crypto = require("crypto");
 
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 
-// — Ablage & URL-Format identisch zu image.js —
+// Ablage & URL-Format wie image.js
 const PICTURES_DIR = path.join(__dirname, "documents", "pictures");
 
 function ensureAbsoluteUrl(urlPath) {
@@ -54,7 +55,7 @@ async function saveBufferAsPicture(buffer, nameHint, contentTypeHint = "image/pn
   return { filename, filePath, publicUrl };
 }
 
-// — Helpers —
+// Helpers
 
 function isLatLon(input) {
   return /^\s*-?\d{1,2}\.\d+\s*,\s*-?\d{1,3}\.\d+\s*$/.test(String(input || ""));
@@ -75,8 +76,8 @@ function trimLatLng(lat, lng, decimals = 5) {
   return `${la.toFixed(decimals)},${ln.toFixed(decimals)}`;
 }
 
-// Geocoding (optional; falls API nicht aktiv, kommt hier null zurück)
-async function geocodeOne(query, { language = "en", region = "de" } = {}) {
+// Geocoding (ohne language/region)
+async function geocodeOne(query) {
   const q = normalize(query);
   if (!q) return null;
 
@@ -88,7 +89,7 @@ async function geocodeOne(query, { language = "en", region = "de" } = {}) {
 
   try {
     const resp = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
-      params: { address: q, key: GOOGLE_API_KEY, language, region },
+      params: { address: q, key: GOOGLE_API_KEY },
       timeout: 20000,
     });
     const { status, results } = resp.data || {};
@@ -109,28 +110,28 @@ async function geocodeOne(query, { language = "en", region = "de" } = {}) {
   }
 }
 
-function buildMapsURLApi1({ points, isRoute, language = "en" }) {
-  const hl = encodeURIComponent(language || "en");
+// Maps-URL via api=1 (ohne hl)
+function buildMapsURLApi1({ points, isRoute }) {
   if (isRoute) {
     const origin = encodeURIComponent(points[0]);
     const destination = encodeURIComponent(points[points.length - 1]);
     const waypoints = points.slice(1, -1);
     const wp = waypoints.length ? `&waypoints=${encodeURIComponent(waypoints.join("|"))}` : "";
-    return `https://www.google.com/maps/dir/?api=1&hl=${hl}&origin=${origin}&destination=${destination}${wp}&travelmode=driving`;
+    return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}${wp}&travelmode=driving`;
   }
   const query = encodeURIComponent(points[points.length - 1]);
-  return `https://www.google.com/maps/search/?api=1&hl=${hl}&query=${query}`;
+  return `https://www.google.com/maps/search/?api=1&query=${query}`;
 }
 
-function buildStreetViewPanoURLFromLatLon(latLon, language = "en") {
-  const hl = encodeURIComponent(language || "en");
-  return `https://www.google.com/maps/@?api=1&hl=${hl}&map_action=pano&viewpoint=${encodeURIComponent(latLon)}`;
+// Street View Pano-Links (ohne hl)
+function buildStreetViewPanoURLFromLatLon(latLon) {
+  return `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${encodeURIComponent(latLon)}`;
 }
-function buildStreetViewPanoURLFromPanoId(panoId, language = "en") {
-  const hl = encodeURIComponent(language || "en");
-  return `https://www.google.com/maps/@?api=1&hl=${hl}&map_action=pano&pano=${encodeURIComponent(panoId)}`;
+function buildStreetViewPanoURLFromPanoId(panoId) {
+  return `https://www.google.com/maps/@?api=1&map_action=pano&pano=${encodeURIComponent(panoId)}`;
 }
 
+// Static Street View Image URL
 function buildStreetViewImageURL({ panoId, latLon, address, size = "640x400", fov = 90, heading, pitch }) {
   const params = new URLSearchParams({ size, fov: String(fov), key: GOOGLE_API_KEY });
   if (panoId) params.set("pano", panoId);
@@ -141,7 +142,7 @@ function buildStreetViewImageURL({ panoId, latLon, address, size = "640x400", fo
   return `https://maps.googleapis.com/maps/api/streetview?${params.toString()}`;
 }
 
-// Street View Metadata: akzeptiert pano, latlon ODER address als location
+// Street View Metadata (ohne locale)
 async function getStreetViewMeta({ latLon, address }) {
   try {
     const params = { key: GOOGLE_API_KEY };
@@ -157,12 +158,10 @@ async function getStreetViewMeta({ latLon, address }) {
   }
 }
 
-// Directions: liefert Text + Ziel-Koordinate (end_location) für Fallback
-async function getDirectionsDetail(origin, destination, waypoints = [], language = "en") {
+// Directions (ohne language)
+async function getDirectionsDetail(origin, destination, waypoints = []) {
   try {
-    const params = {
-      origin, destination, mode: "driving", key: GOOGLE_API_KEY, language
-    };
+    const params = { origin, destination, mode: "driving", key: GOOGLE_API_KEY };
     if (waypoints.length) params.waypoints = waypoints.join("|");
     const resp = await axios.get("https://maps.googleapis.com/maps/api/directions/json", {
       params, timeout: 20000,
@@ -190,11 +189,24 @@ async function getDirectionsDetail(origin, destination, waypoints = [], language
   }
 }
 
+// Download Street View und sicherstellen, dass es ein Bild ist
 async function downloadStreetViewToLocal(imageUrl, nameHint) {
-  const res = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 30000 });
+  const res = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 30000, validateStatus: () => true });
+  const ct = String(res.headers?.["content-type"] || "").toLowerCase();
+
+  if (!ct.startsWith("image/")) {
+    try {
+      const txt = Buffer.from(res.data).toString("utf8");
+      const maybeJson = JSON.parse(txt);
+      const status = maybeJson?.status || maybeJson?.error_message || "NON_IMAGE_RESPONSE";
+      throw new Error(`STREETVIEW_NON_IMAGE (${status})`);
+    } catch {
+      throw new Error(`STREETVIEW_NON_IMAGE (${ct || "unknown content-type"})`);
+    }
+  }
+
   const buf = Buffer.from(res.data);
-  const ct = res.headers?.["content-type"] || "image/png";
-  const saved = await saveBufferAsPicture(buf, nameHint, ct);
+  const saved = await saveBufferAsPicture(buf, nameHint, ct || "image/png");
   return { url: saved.publicUrl, file: `/documents/pictures/${saved.filename}` };
 }
 
@@ -212,8 +224,6 @@ async function getLocation(toolFunction) {
 
     const isRoute = !!args.route;
     const inputLocations = Array.isArray(args.locations) ? args.locations : [];
-    const language = args.language || "de";
-    const region = args.region || "de";
     const streetSize = args.street_size || "640x400";
     const streetFov = args.street_fov ?? 90;
     const streetHeading = args.street_heading;
@@ -228,36 +238,35 @@ async function getLocation(toolFunction) {
       return JSON.stringify({ ok: false, code: "MAPS_INPUT", error: "Locations empty after normalization." });
     }
 
-    // 1) Versuche Geocoding (falls API aktiv)
-    const geo = await Promise.all(normalized.map((s) => geocodeOne(s, { language, region })));
+    // 1) Optionales Geocoding
+    const geo = await Promise.all(normalized.map((s) => geocodeOne(s)));
     const points = normalized.map((txt, i) => geo[i]?.coord || txt);
 
-    // 2) Maps-Link
-    const mapsUrl = buildMapsURLApi1({ points, isRoute, language });
+    // 2) Maps-Link (ohne hl)
+    const mapsUrl = buildMapsURLApi1({ points, isRoute });
 
-    // 3) Directions + möglicher End-Koordinaten-Fallback
+    // 3) Directions + evtl. Endkoordinaten-Fallback
     let directionsText = "";
     let endCoordFromDirections = null;
     if (isRoute) {
       const origin = points[0];
       const destination = points[points.length - 1];
       const waypoints = points.slice(1, -1);
-      const dir = await getDirectionsDetail(origin, destination, waypoints, language);
+      const dir = await getDirectionsDetail(origin, destination, waypoints);
       directionsText = dir.text;
       endCoordFromDirections = dir.endCoord;
     }
 
-    // 4) Bestimme Ziel-Koordinate für Street View
+    // 4) Ziel-Koordinate/Adresse für Street View
     const destIdx = normalized.length - 1;
     const coordFromGeocode = geo[destIdx]?.coord || null;
     const destAddress = normalized[destIdx];
     let svCoord = coordFromGeocode || endCoordFromDirections || null;
 
-    // 5) Street View (Metadata → pano_id bevorzugen)
+    // 5) Street View
     const streetView = { interactive_url: "", image_url: "", file: "" };
     let svNote = "";
 
-    // Metadaten mit Koordinate oder (falls keine Koordinate) direkt mit Adresse
     const meta = await getStreetViewMeta({ latLon: svCoord, address: svCoord ? null : destAddress });
     const status = String(meta?.status || "").toUpperCase();
 
@@ -267,21 +276,19 @@ async function getLocation(toolFunction) {
       let imageSrc = "";
 
       if (panoId) {
-        interactive = buildStreetViewPanoURLFromPanoId(panoId, language);
+        interactive = buildStreetViewPanoURLFromPanoId(panoId);
         imageSrc = buildStreetViewImageURL({ panoId, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
       } else {
-        // Fallback: nutze Location aus Meta (oder svCoord/destAddress)
         const mLoc = meta?.location;
         const metaLatLon = (mLoc && typeof mLoc.lat === "number" && typeof mLoc.lng === "number")
           ? trimLatLng(mLoc.lat, mLoc.lng)
           : (svCoord || null);
 
         if (metaLatLon) {
-          interactive = buildStreetViewPanoURLFromLatLon(metaLatLon, language);
+          interactive = buildStreetViewPanoURLFromLatLon(metaLatLon);
           imageSrc = buildStreetViewImageURL({ latLon: metaLatLon, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
         } else {
-          // äußerster Fallback: direkt Adresse versuchen
-          interactive = ""; // ohne Koordinate schwer zuverlässig
+          interactive = "";
           imageSrc = buildStreetViewImageURL({ address: destAddress, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
         }
       }
@@ -290,36 +297,34 @@ async function getLocation(toolFunction) {
         const saved = await downloadStreetViewToLocal(imageSrc, `streetview-${panoId || svCoord || destAddress}`);
         streetView.image_url = saved.url;
         streetView.file = saved.file;
-        streetView.interactive_url = interactive || (svCoord ? buildStreetViewPanoURLFromLatLon(svCoord, language) : "");
+        streetView.interactive_url = interactive || (svCoord ? buildStreetViewPanoURLFromLatLon(svCoord) : "");
         if (!streetView.interactive_url) {
-          // als allerletztes: versuche mit der Adresse eine Pano-URL (nicht ideal)
-          streetView.interactive_url = `https://www.google.com/maps/search/?api=1&hl=${encodeURIComponent(language)}&query=${encodeURIComponent(destAddress)}`;
+          streetView.interactive_url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
         }
         svNote = "Street View image and interactive link generated.";
       } catch (e) {
         console.error("[getLocation][streetview-download] error:", e?.response?.data || e?.message || e);
-        streetView.interactive_url = interactive || (svCoord ? buildStreetViewPanoURLFromLatLon(svCoord, language) : "");
+        streetView.interactive_url = interactive || (svCoord ? buildStreetViewPanoURLFromLatLon(svCoord) : "");
         svNote = "Street View image download failed; interactive link provided.";
       }
     } else {
-      // Wenn Metadata nicht OK, versuche trotzdem direkt mit Adresse ein Bild zu holen
       try {
         const imageSrc = buildStreetViewImageURL({ address: destAddress, size: streetSize, fov: streetFov, heading: streetHeading, pitch: streetPitch });
         const saved = await downloadStreetViewToLocal(imageSrc, `streetview-${destAddress}`);
         streetView.image_url = saved.url;
         streetView.file = saved.file;
         streetView.interactive_url = svCoord
-          ? buildStreetViewPanoURLFromLatLon(svCoord, language)
-          : `https://www.google.com/maps/search/?api=1&hl=${encodeURIComponent(language)}&query=${encodeURIComponent(destAddress)}`;
+          ? buildStreetViewPanoURLFromLatLon(svCoord)
+          : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
         svNote = `Street View by address (metadata status: ${status || "UNKNOWN"}).`;
-      } catch (_) {
+      } catch (e) {
+        console.warn("[getLocation] No Street View imagery resolvable. status:", status, "err:", e?.message || e);
+        if (svCoord) streetView.interactive_url = buildStreetViewPanoURLFromLatLon(svCoord);
         svNote = `No Street View image (metadata status: ${status || "UNKNOWN"}).`;
-        // interactive_url leer lassen, wenn auch keine Coord vorliegt
-        if (svCoord) streetView.interactive_url = buildStreetViewPanoURLFromLatLon(svCoord, language);
       }
     }
 
-    // 6) Beschreibung als LETZTES Feld
+    // 6) Beschreibung als letztes Feld
     const descriptionParts = [];
     if (coordFromGeocode) {
       descriptionParts.push(`Used geocoded coord ${coordFromGeocode} for Street View.`);
@@ -333,20 +338,18 @@ async function getLocation(toolFunction) {
 
     const payload = {
       ok: true,
-      street_view: streetView,           // zuerst
-      maps_url: mapsUrl,                 // davor
+      street_view: streetView,
+      maps_url: mapsUrl,
       directions_text: directionsText || "",
       inputs: {
         is_route: isRoute,
         locations: normalized,
-        language,
-        region,
         street_size: streetSize,
         street_fov: streetFov,
         street_heading: streetHeading ?? null,
         street_pitch: streetPitch ?? null
       },
-      description                          // LETZTES Feld
+      description // letztes Feld
     };
 
     return JSON.stringify(payload);
