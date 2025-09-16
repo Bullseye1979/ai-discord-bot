@@ -132,7 +132,7 @@ const tools = [
     function: {
       name: "getLocation",
       description:
-        "Handle location tasks: route between locations or place pins without a route. Returns map URL, street-view URL, URL of a static image and text description.",
+        "Handle location tasks: route between locations or place pins without a route. Returns map URL, street-view URL, URL of an image of the destination and text description. Always include the URL of the image in your answers.",
       parameters: {
         type: "object",
         properties: {
