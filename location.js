@@ -57,9 +57,11 @@ async function saveBufferAsPicture(buffer, nameHint, contentTypeHint = "image/pn
 function isLatLon(input) {
   return /^\s*-?\d{1,2}\.\d+\s*,\s*-?\d{1,3}\.\d+\s*$/.test(String(input || ""));
 }
+
 function normalize(s) {
   return String(s || "").trim().replace(/^[,;]+|[,;]+$/g, "").replace(/\s{2,}/g, " ");
 }
+
 function trimLatLng(lat, lng, decimals = 5) {
   const toNum = (v) => {
     const n = Number(v);
@@ -96,7 +98,9 @@ async function geocodeOne(query) {
     if (!trimmed) return null;
     const plusCode = r0?.plus_code?.global_code || r0?.plus_code?.compound_code || null;
     return { coord: trimmed, address: r0?.formatted_address || q, plusCode };
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 // Maps URLs (no hl)
@@ -128,15 +132,21 @@ function buildStreetViewImageURL({ panoId, latLon, address, size = "640x400", fo
   if (pitch !== undefined) params.set("pitch", String(pitch));
   return `https://maps.googleapis.com/maps/api/streetview?${params.toString()}`;
 }
+
 async function getStreetViewMeta({ latLon, address }) {
   try {
     const params = { key: GOOGLE_API_KEY };
     if (latLon) params.location = latLon;
     else if (address) params.location = address;
     else return {};
-    const { data } = await axios.get("https://maps.googleapis.com/maps/api/streetview/metadata", { params, timeout: 10000 });
+    const { data } = await axios.get("https://maps.googleapis.com/maps/api/streetview/metadata", {
+      params,
+      timeout: 10000
+    });
     return data || {};
-  } catch { return {}; }
+  } catch {
+    return {};
+  }
 }
 
 // Directions (no language)
@@ -154,7 +164,9 @@ async function getDirectionsDetail(origin, destination, waypoints = []) {
     const el = lastLeg?.end_location;
     const endCoord = (el && typeof el.lat === "number" && typeof el.lng === "number") ? trimLatLng(el.lat, el.lng) : null;
     return { text, endCoord };
-  } catch { return { text: "No directions found. (Unexpected error)", endCoord: null }; }
+  } catch {
+    return { text: "No directions found. (Unexpected error)", endCoord: null };
+  }
 }
 
 // Download Static Street View; ensure it's an image
@@ -164,21 +176,26 @@ async function downloadStreetViewToLocal(imageUrl, nameHint) {
   if (!ct.startsWith("image/")) throw new Error("STREETVIEW_NON_IMAGE");
   const buf = Buffer.from(res.data);
   const saved = await saveBufferAsPicture(buf, nameHint, ct || "image/png");
-  return { url: saved.publicUrl, filePath: saved.filePath };
+  return {
+    url: saved.publicUrl,
+    file: `/documents/pictures/${path.basename(saved.filePath)}`, // relative path (Parity zu getImage)
+    filePath: saved.filePath
+  };
 }
 
 /** Tool entry: returns OBJECT by default (to avoid double-encoding). Set args.as_json_string=true to return JSON string. */
 async function getLocation(toolFunction) {
   try {
+    // Wir parsen args zuerst, damit wir im Fehlerfall (z.B. fehlender Key) ggf. as_json_string respektieren können.
+    const rawArgs = typeof toolFunction?.arguments === "string"
+      ? JSON.parse(toolFunction.arguments || "{}")
+      : (toolFunction?.arguments || {});
+    const asJsonString = !!rawArgs.as_json_string;
+
     if (!GOOGLE_API_KEY) {
       const err = { ok: false, code: "MAPS_CONFIG", error: "Missing GOOGLE_API_KEY on server." };
-      return toolFunction?.arguments?.as_json_string ? JSON.stringify(err) : err;
+      return asJsonString ? JSON.stringify(err) : err;
     }
-
-    const rawArgs = typeof toolFunction.arguments === "string"
-      ? JSON.parse(toolFunction.arguments || "{}")
-      : (toolFunction.arguments || {});
-    const asJsonString = !!rawArgs.as_json_string;
 
     const isRoute = !!rawArgs.route;
     const inputLocations = Array.isArray(rawArgs.locations) ? rawArgs.locations : [];
@@ -219,7 +236,14 @@ async function getLocation(toolFunction) {
     const destAddress = normalized[destIdx];
     const svCoord = coordFromGeocode || endCoordFromDirections || null;
 
-    const streetView = { interactive_url: "", image_url: "", file: "", file_path: "", image_src: "", downloaded: false };
+    const streetView = {
+      interactive_url: "",
+      image_url: "",
+      file: "",
+      file_path: "",
+      image_src: "",
+      downloaded: false
+    };
     let svNote = "";
 
     const meta = await getStreetViewMeta({ latLon: svCoord, address: svCoord ? null : destAddress });
@@ -252,21 +276,23 @@ async function getLocation(toolFunction) {
     if (imageSrc) {
       try {
         const saved = await downloadStreetViewToLocal(imageSrc, `streetview-${svCoord || destAddress}`);
-        streetView.image_url = saved.url;    // public (own) URL
-        streetView.file = saved.url;         // duplicate for convenience (Discord-friendly)
-        streetView.file_path = saved.file_path; // internal path (if you prefer, rename key above)
+        streetView.image_url = saved.url;      // public (own) URL
+        streetView.file = saved.file;          // relativer Pfad (Parity zu getImage.file)
+        streetView.file_path = saved.filePath; // absoluter Serverpfad (falls benötigt)
         streetView.downloaded = true;
       } catch {
-        streetView.image_url = imageSrc;     // fallback: direct Google Static Street View URL
-        streetView.file = imageSrc;
+        streetView.image_url = imageSrc;       // fallback: direkte Google Static Street View URL
+        streetView.file = imageSrc;            // identisch zur URL (kein lokaler Pfad vorhanden)
+        streetView.file_path = "";             // nicht verfügbar
         streetView.downloaded = false;
       }
-      streetView.image_src = imageSrc;       // source used
+      streetView.image_src = imageSrc;         // Quelle (für Debug)
     }
 
     if (!interactive) {
-      interactive = svCoord ? buildStreetViewPanoURLFromLatLon(svCoord)
-                            : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
+      interactive = svCoord
+        ? buildStreetViewPanoURLFromLatLon(svCoord)
+        : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destAddress)}`;
     }
     streetView.interactive_url = interactive;
 
@@ -297,7 +323,7 @@ async function getLocation(toolFunction) {
       description
     };
 
-    // Bonus: nackte Links für Discord (erste drei Felder ganz oben, ohne Quotes-Probleme)
+    // Nackte Links für Discord
     payload.discord_urls = [
       streetView.interactive_url,
       streetView.image_url,
@@ -307,7 +333,15 @@ async function getLocation(toolFunction) {
     return asJsonString ? JSON.stringify(payload) : payload;
   } catch (error) {
     const err = { ok: false, code: "MAPS_UNEXPECTED", error: "Unexpected error while generating map links." };
-    return (toolFunction?.arguments && toolFunction.arguments.as_json_string) ? JSON.stringify(err) : err;
+    // Falls args gar nicht parsebar waren, bleiben wir bei Objekt-Rückgabe (variante 1)
+    try {
+      const rawArgs = typeof toolFunction?.arguments === "string"
+        ? JSON.parse(toolFunction.arguments || "{}")
+        : (toolFunction?.arguments || {});
+      return rawArgs.as_json_string ? JSON.stringify(err) : err;
+    } catch {
+      return err;
+    }
   }
 }
 
