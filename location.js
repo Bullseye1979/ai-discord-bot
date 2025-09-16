@@ -1,10 +1,12 @@
-// location.js — clean v2.0 (no URL shortener)
-// Build Google Maps (route/search) links via api=1, optional Street View (maps pano link),
+// location.js — v2.5 (GOOGLE_API_KEY + Static Map + Street View image)
+// Build Google Maps (route/search) links via api=1, optional Street View pano link,
 // plus human-readable driving directions via Directions API.
+// NEW: Static Map (route image) and Street View Static Image URLs.
+// ENV: GOOGLE_API_KEY (was: GOOGLE_MAPS_API_KEY)
 
 const axios = require("axios");
 
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 
 /** Detect "lat,lon" input. */
 function isLatLon(input) {
@@ -44,7 +46,7 @@ async function geocodeOne(query, { language = "en", region = "de" } = {}) {
 
   try {
     const resp = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
-      params: { address: q, key: GOOGLE_MAPS_API_KEY, language, region },
+      params: { address: q, key: GOOGLE_API_KEY, language, region },
       timeout: 20000,
     });
     const { status, results, error_message } = resp.data || {};
@@ -90,24 +92,63 @@ function buildMapsURLApi1({ points, isRoute, language = "en" }) {
   return `https://www.google.com/maps/search/?api=1&hl=${hl}&query=${query}`;
 }
 
-/** Build Street View (pano) URL using api=1 (shorter than Static API image link). */
-function buildStreetViewURL(latLon, language = "en") {
+/** Build Street View (pano) URL using api=1 (does not expose API key). */
+function buildStreetViewPanoURL(latLon, language = "en") {
   const hl = encodeURIComponent(language || "en");
-  // Opens interactive Street View at viewpoint (short & no API key in URL).
   return `https://www.google.com/maps/@?api=1&hl=${hl}&map_action=pano&viewpoint=${encodeURIComponent(latLon)}`;
 }
 
-/** Get human-readable driving directions text (EN by default). */
-async function getDirectionsText(origin, destination, waypoints = [], language = "en") {
+/** Build Street View Static Image URL (exposes key; lock API restrictions!). */
+function buildStreetViewImageURL(latLon, { size = "640x400" } = {}) {
+  const params = new URLSearchParams({
+    size,
+    location: latLon,
+    key: GOOGLE_API_KEY,
+  });
+  return `https://maps.googleapis.com/maps/api/streetview?${params.toString()}`;
+}
+
+/** Build Static Map URL.
+ * If polyline is present, draw path; else show markers for origin/destination.
+ * Note: Contains API key → restrict usage!
+ */
+function buildStaticMapURL({ origin, destination, waypoints = [], polyline = "", size = "640x400" }) {
+  const base = "https://maps.googleapis.com/maps/api/staticmap";
+  const qp = new URLSearchParams();
+  qp.set("size", size);
+  qp.set("key", GOOGLE_API_KEY);
+
+  // Markers
+  if (origin) qp.append("markers", `color:green|label:S|${origin}`);
+  if (destination) qp.append("markers", `color:red|label:E|${destination}`);
+  for (const w of waypoints) qp.append("markers", `color:blue|${w}`);
+
+  if (polyline) {
+    // Draw route via encoded polyline (single path param)
+    qp.append("path", `weight:5|color:0x0000ff|enc:${polyline}`);
+  } else if (origin && destination) {
+    // As fallback, draw a simple path with points (no polyline)
+    const pts = [origin, ...waypoints, destination].join("|");
+    qp.append("path", `weight:5|color:0x0000ff|${pts}`);
+  }
+
+  return `${base}?${qp.toString()}`;
+}
+
+/** Get directions: returns { text, polyline }.
+ * Degrades gracefully if Directions API is not enabled/allowed.
+ */
+async function getDirections(origin, destination, waypoints = [], language = "en") {
   try {
     const params = {
       origin,
       destination,
       mode: "driving",
-      key: GOOGLE_MAPS_API_KEY,
+      key: GOOGLE_API_KEY,
       language,
     };
     if (waypoints.length) params.waypoints = waypoints.join("|");
+
     const resp = await axios.get("https://maps.googleapis.com/maps/api/directions/json", {
       params,
       timeout: 20000,
@@ -115,23 +156,31 @@ async function getDirectionsText(origin, destination, waypoints = [], language =
     const { status, routes, error_message } = resp.data || {};
     if (status !== "OK" || !routes?.length) {
       console.error("[getLocation][directions] status:", status, "msg:", error_message);
-      return "No directions found.";
+      const hint =
+        status === "REQUEST_DENIED"
+          ? "Directions API not enabled or key restricted."
+          : status || "No directions found.";
+      return { text: `No directions found. (${hint})`, polyline: "" };
     }
-    const steps = routes[0].legs.flatMap((leg) => leg.steps.map((s) => s.html_instructions));
+
+    const route0 = routes[0];
+    const polyline = route0?.overview_polyline?.points || "";
+
+    const steps = route0.legs.flatMap((leg) => leg.steps.map((s) => s.html_instructions));
     const textSteps = steps.map((s, i) => `${i + 1}. ${String(s || "").replace(/<[^>]+>/g, "")}`);
-    return textSteps.join("\n");
+    return { text: textSteps.join("\n"), polyline };
   } catch (e) {
     console.error("[getLocation][directions] error:", e?.response?.data || e?.message || e);
-    return "No directions found.";
+    return { text: "No directions found. (Unexpected error)", polyline: "" };
   }
 }
 
-/** Tool entry: return Street View (if available), Maps link, and directions (if route). */
+/** Tool entry: return Street View links & images, Maps link, Static Map (route image), and directions (if route). */
 async function getLocation(toolFunction) {
   try {
-    if (!GOOGLE_MAPS_API_KEY) {
-      console.error("getLocation: Missing GOOGLE_MAPS_API_KEY");
-      return "[ERROR]: MAPS_CONFIG — Missing GOOGLE_MAPS_API_KEY on server.";
+    if (!GOOGLE_API_KEY) {
+      console.error("getLocation: Missing GOOGLE_API_KEY");
+      return "[ERROR]: MAPS_CONFIG — Missing GOOGLE_API_KEY on server.";
     }
 
     const args =
@@ -143,6 +192,7 @@ async function getLocation(toolFunction) {
     const inputLocations = Array.isArray(args.locations) ? args.locations : [];
     const language = args.language || "en";
     const region = args.region || "de";
+    const staticSize = args.static_size || "640x400"; // e.g., "800x500"
 
     if (!inputLocations.length) {
       return "[ERROR]: MAPS_INPUT — No locations provided.";
@@ -164,22 +214,53 @@ async function getLocation(toolFunction) {
 
     const mapsUrl = buildMapsURLApi1({ points, isRoute, language });
 
-    let street = "";
+    // Build Street View links/images for the last location if geocoded
+    let streetPanoLink = "";
+    let streetImage = "";
     const lastCoord = geo[geo.length - 1]?.coord;
     if (lastCoord) {
-      const pano = buildStreetViewURL(lastCoord, language);
-      street = `Street View: ${pano}\n`;
+      streetPanoLink = buildStreetViewPanoURL(lastCoord, language);
+      streetImage = buildStreetViewImageURL(lastCoord, { size: staticSize });
     }
 
+    // If route: fetch directions + polyline for static map
     let directionsText = "";
+    let staticMapUrl = "";
     if (isRoute) {
       const origin = points[0];
       const destination = points[points.length - 1];
       const waypoints = points.slice(1, -1);
-      directionsText = await getDirectionsText(origin, destination, waypoints, language);
+
+      const { text, polyline } = await getDirections(origin, destination, waypoints, language);
+      directionsText = text;
+      staticMapUrl = buildStaticMapURL({
+        origin,
+        destination,
+        waypoints,
+        polyline,
+        size: staticSize,
+      });
+    } else {
+      // Non-route: just a static map centered on the place (as marker)
+      const center = points[points.length - 1];
+      staticMapUrl = buildStaticMapURL({
+        origin: center,
+        destination: "",
+        waypoints: [],
+        polyline: "",
+        size: staticSize,
+      });
     }
 
-    return `${street}${isRoute ? "Route" : "Location"}: ${mapsUrl}\n\n${directionsText}`.trim();
+    // Compose output (text with links). Keep backward-compatible format.
+    let out = "";
+    if (streetPanoLink) out += `Street View (interactive): ${streetPanoLink}\n`;
+    if (streetImage) out += `Street View Image: ${streetImage}\n`;
+    out += `${isRoute ? "Route" : "Location"}: ${mapsUrl}\n`;
+    if (staticMapUrl) out += `Static Map Image: ${staticMapUrl}\n\n`;
+    if (isRoute) out += directionsText;
+
+    return out.trim();
   } catch (error) {
     console.error("getLocation error:", error?.message || error);
     return "[ERROR]: MAPS_UNEXPECTED — An unexpected error occurred while generating the map links.";
