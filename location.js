@@ -264,8 +264,8 @@ async function getLocation(toolFunction) {
     // Zeile 3: Google Maps (Route/Location)
     // Leerzeile
     // Danach: directions_text (falls vorhanden)
-    const lines = ["Always show this:"+imageUrl, interactive, mapsUrl].filter(Boolean);
-    let out = lines.join("\n");
+    const lines = ["Streetview Image: "+imageUrl,"Interactive Streetview: "+interactive,"Google Maps: "+mapsUrl].filter(Boolean);
+    let out = lines.join(" \n ");
     if (directionsText) out += `\n\n${directionsText}`;
     return out;
   } catch (error) {
