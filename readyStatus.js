@@ -97,7 +97,7 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
     model || process.env.READY_STATUS_MODEL || "gpt-4o-mini"
   ))?.trim() || "";
 
-  return hardTrimOneLine(out, 30);
+  return hardTrimOneLine(out, 35);
 }
 
 /**
