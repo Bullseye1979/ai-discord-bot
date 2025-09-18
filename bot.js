@@ -1,12 +1,13 @@
-// bot.js — refactored v3.18.1 (API: system→user-merge + pseudo-toolcalls + dynamic ready presence)
+// bot.js — refactored v3.18.2 (API: system→user-merge + pseudo-toolcalls + dynamic ready memory)
 // - HTTP-Endpoint: POST /api/:channelId
-// - JSON-Middleware via useJson() (Express v3/v4 kompatibel)
-// - API: system-Prompt wird an user-Prompt angehängt (keine extra system message)
-// - Pseudo-Toolcalls per Block/_API-Flag → options.pseudotoolcalls an aiCore
-// - NEU: Dynamische "Ready"-Presence via readyStatus.js:
-//        * Beim Wechsel in "ready": Würfel 1..X (X=READY_STATUS_DIE_MAX)
-//        * Bei "1": KI-Einzeiler (<=30 Zeichen) aus letzter History setzen
-//        * Sonst: NICHTS ändern → vorheriger Presence-Text bleibt
+// - JSON-Middleware via useJson() (Express v3/v4 compatible)
+// - API: system prompt is appended to user prompt (no extra system message)
+// - Pseudo-toolcalls per Block/_API flag → options.pseudotoolcalls to aiCore
+// - Dynamic Ready presence:
+//    * We remember the last "Ready" text (default: "✅ Ready").
+//    * On switching to ready: immediately set the LAST ready text (so it shows while KI builds).
+//    * Then roll 1..X; on hit, generate a new <=30 chars line from history and replace it.
+//    * On miss: keep the last ready text. While generating, never show "Working".
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -34,10 +35,14 @@ const {
 const { reportError, reportInfo, reportWarn } = require("./error.js");
 const { getToolRegistry } = require("./tools.js");
 
-// ⬇️ NEU: Dynamischer Ready-Status (eigene Datei, siehe Kommentar am Ende)
-const { maybeSetDynamicReady } = require("./readyStatus.js");
+// Dynamic Ready helpers
+const {
+  getLastReadyText,
+  setLastReadyText,
+  maybeUpdateReadyStatus
+} = require("./readyStatus.js");
 
-// ---- JSON Middleware Shim (Express v3/v4 Kompatibilität) --------------------
+// ---- JSON middleware shim (Express v3/v4 compatibility) ---------------------
 let bodyParser = null;
 try { bodyParser = require("body-parser"); } catch {}
 function useJson(app, limit = "2mb") {
@@ -71,10 +76,10 @@ const voiceBusy = new Map();
 const busyNoticeSent = new Map();
 
 // ==== Presence counter ====
-// Regel: Beim Start eines Tasks → "⌛ Working" setzen.
-// Beim Ende: NICHT automatisch "Ready". Stattdessen würfeln:
-//   - Treffer (1): KI-Einzeiler setzen (ersetzen).
-//   - Miss: GAR NICHTS tun → alter Text (z. B. "⌛ Working") bleibt bestehen.
+// Rule: when a task starts → "⌛ Working".
+// When tasks drop to 0 (switching to ready):
+//   1) immediately show the LAST ready text (so "ready" remains visible during KI build)
+//   2) maybeUpdateReadyStatus() to optionally replace it after the dice hit.
 let _activeTasks = 0;
 function incPresence() {
   _activeTasks++;
@@ -83,15 +88,14 @@ function incPresence() {
 async function decPresence() {
   _activeTasks = Math.max(0, _activeTasks - 1);
 
-  // Wenn noch Tasks laufen, explizit "Working" belassen/setzen
   if (_activeTasks > 0) {
     try { await setBotPresence(client, "⌛ Working", "online"); } catch {}
     return;
   }
 
-  // == Wechsel in "ready": KEIN Default-"Ready" setzen ==
-  // Nur evtl. dynamischen KI-Status setzen; bei Miss bleibt der alte Text stehen.
-  try { await maybeSetDynamicReady(client); } catch {}
+  // === switching to "ready" ===
+  try { await setBotPresence(client, getLastReadyText(), "online", 4); } catch {}
+  try { await maybeUpdateReadyStatus(client); } catch {}
 }
 
 /** Ensure a Context instance for a channel, rebuilding when config signature changes */
@@ -234,7 +238,7 @@ async function deleteAllMessages(channel) {
   }
 }
 
-/** LLM-Endpunkt/Key/Modell pro Turn auflösen (Block > Channel > _API > ENV/Default) */
+/** Resolve effective LLM per turn (Block > Channel > _API > ENV/default) */
 function resolveEffectiveLLM(channelMeta, matchingBlock) {
   const api = channelMeta?.api || channelMeta?._API || {};
 
@@ -257,7 +261,7 @@ function resolveEffectiveLLM(channelMeta, matchingBlock) {
     process.env.OPENAI_BASE_URL ||
     "https://api.openai.com/v1";
 
-  // 🔧 Pseudo-Toolcalls: Block > Channel > _API (Fallback)
+  // Pseudo-toolcalls: Block > Channel > _API (fallback)
   const pseudo =
     (matchingBlock && matchingBlock.pseudotoolcalls === true) ||
     (channelMeta && channelMeta.pseudotoolcalls === true) ||
@@ -268,7 +272,7 @@ function resolveEffectiveLLM(channelMeta, matchingBlock) {
 }
 
 
-/** Voice transcript → AI reply (keine Tooländerung hier) */
+/** Voice transcript → AI reply (unchanged logic besides presence handling) */
 async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {
   let ch = null;
   let chatContext = null;
@@ -287,7 +291,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
     }
 
-    // Voice-Block nur via SPEAKER (Discord-ID)
+    // Voice-block by SPEAKER (Discord ID)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const userId = String(evt.userId || "").trim();
 
@@ -307,7 +311,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
     const matchingBlock = pickBlockForSpeakerId();
     if (!matchingBlock) return;
 
-    // Tools setzen
+    // Tools
     if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
@@ -367,7 +371,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
         pendingUser: pendingUserTurn || null,
         endpoint: effectiveEndpoint,
         noPendingUserInjection: true,
-        // NEW: pass pseudo-toolcalls flag from block
+        // pass pseudo-toolcalls flag from block
         pseudotoolcalls: !!blockPseudo
       }, 
       client
@@ -699,7 +703,7 @@ client.on("messageCreate", async (message) => {
     const bypassTrigger = matchingBlock.noTrigger === true;
     if (!bypassTrigger && !isTrigger) return;
 
-    // Falls Trigger/noTrigger -> ggf. noch nicht geloggt → jetzt loggen
+    // If trigger/noTrigger, ensure user turn is logged
     const textForLog = stripLeadingName(rawText, triggerName);
     if (!preLogged) {
       try {
@@ -718,7 +722,7 @@ client.on("messageCreate", async (message) => {
     await setMessageReaction(message, "⏳");
     incPresence();
 
-    // Tools setzen (Block-spezifisch, sonst global)
+    // Tools (block-specific or channel default)
     if (matchingBlock && Array.isArray(matchingBlock.tools) && matchingBlock.tools.length > 0) {
       const { tools: blockTools, registry: blockRegistry } = getToolRegistry(matchingBlock.tools);
       chatContext.tools = blockTools;
@@ -767,7 +771,6 @@ client.on("messageCreate", async (message) => {
           pendingUser: pendingUserTurn,
           endpoint: effectiveEndpoint,
           noPendingUserInjection: true,
-          // NEW: pass pseudo-toolcalls flag from block
           pseudotoolcalls: !!blockPseudo
         },
         client
@@ -798,13 +801,14 @@ client.on("messageCreate", async (message) => {
 });
 
 // ==== Ready handler ====
-// Beim Initial-Login kein erzwungenes "Ready" mehr.
-// Optional: gleich würfeln und evtl. KI-Status setzen; bei Miss bleibt default/alter Text.
+// On initial login, show the last ready text and optionally refresh it.
+// (No forced "Ready" string; we use the remembered one.)
 async function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
-    await maybeSetDynamicReady(client); // tut bei Miss nichts
+    await setBotPresence(client, getLastReadyText(), "online", 4);
+    await maybeUpdateReadyStatus(client); // will only change on dice hit
   } catch (err) {
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }
@@ -821,7 +825,7 @@ client.once("clientReady", onClientReadyOnce);
 })();
 
 /* =============================================================================
- * HTTP-Server: Static /documents + API
+ * HTTP server: Static /documents + API
  * =============================================================================
  */
 
@@ -845,7 +849,7 @@ expressApp.use(
   })
 );
 
-// CORS nur für /api/*
+// CORS only for /api/*
 expressApp.use((req, res, next) => {
   if (req.path.startsWith("/api/")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -862,9 +866,9 @@ expressApp.use((req, res, next) => {
  * Auth: Authorization: Bearer <channel-config._API.key>
  * Body: { system?: string, user: string }
  * Reply: { reply: string }
- * - Persistiert beide Turns (user="API", assistant="<botname>")
- * - Kein Posting in Discord
- * - Teilt Channel-Kontext (Persona/Instructions/Tools)
+ * - Persists both turns (user="API", assistant="<botname>")
+ * - No posting in Discord
+ * - Shares channel context (persona/instructions/tools)
  */
 expressApp.post("/api/:channelId", async (req, res) => {
 
@@ -892,14 +896,14 @@ expressApp.post("/api/:channelId", async (req, res) => {
     const userPromptRaw = String(body.user || "").trim();
     if (!userPromptRaw) return res.status(400).json({ error: "bad_request", message: "Missing 'user' in body." });
 
-    // 👇 System-Kontext in den User-Prompt einbetten (statt als extra system message)
+    // Append system context to the user prompt (no separate system message)
     const userPrompt = systemPrompt
       ? `${userPromptRaw}\n\n[API context]\n${systemPrompt}`
       : userPromptRaw;
 
     const chatContext = ensureChatContextForChannel(channelId, contextStorage, channelMeta);
 
-    // Tools: API-spezifisch oder Channel-Default
+    // Tools: API-specific or channel defaults
     if (apiBlock?.tools && Array.isArray(apiBlock.tools) && apiBlock.tools.length > 0) {
       const { tools: apiTools, registry: apiToolReg } = getToolRegistry(apiBlock.tools);
       chatContext.tools = apiTools;
@@ -909,7 +913,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
       chatContext.toolRegistry = channelMeta.toolRegistry;
     }
 
-    // Modell/Tokenlimit/Endpoint
+    // Model/token limit/endpoint
     const tokenlimit = (() => {
       const raw = apiBlock?.max_tokens ?? channelMeta.max_tokens_chat ?? channelMeta.maxTokensChat;
       const v = Number(raw);
@@ -933,9 +937,9 @@ expressApp.post("/api/:channelId", async (req, res) => {
       process.env.OPENAI_BASE_URL ||
       "https://api.openai.com/v1";
 
-    const pseudoFromApi = !!apiBlock?.pseudotoolcalls; // NEW
+    const pseudoFromApi = !!apiBlock?.pseudotoolcalls;
 
-    // PRE-LOG (persist): User turn als "API" mit eingebettetem Kontext
+    // PRE-LOG (persist): user turn as "API" with embedded context
     await chatContext.add("user", "API", userPrompt, Date.now());
 
     incPresence();
@@ -949,7 +953,6 @@ expressApp.post("/api/:channelId", async (req, res) => {
         {
           endpoint: effectiveEndpoint,
           noPendingUserInjection: true,
-          // NEW: pass pseudo-toolcalls from _API block
           pseudotoolcalls: pseudoFromApi
         },
         client
@@ -973,6 +976,6 @@ expressApp.post("/api/:channelId", async (req, res) => {
   }
 });
 
-// Server starten
-express.open?.(); // no-op guard for old environments
+// Server
+express.open?.(); // no-op for old environments
 expressApp.listen(3000, () => {});
