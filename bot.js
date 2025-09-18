@@ -1,8 +1,12 @@
-// bot.js — refactored v3.18.0 (API: system→user-merge + pseudo-toolcalls)
+// bot.js — refactored v3.18.1 (API: system→user-merge + pseudo-toolcalls + dynamic ready presence)
 // - HTTP-Endpoint: POST /api/:channelId
 // - JSON-Middleware via useJson() (Express v3/v4 kompatibel)
 // - API: system-Prompt wird an user-Prompt angehängt (keine extra system message)
-// - Neu: Pseudo-Toolcalls per Block/_API-Flag → options.pseudotoolcalls an aiCore
+// - Pseudo-Toolcalls per Block/_API-Flag → options.pseudotoolcalls an aiCore
+// - NEU: Dynamische "Ready"-Presence via readyStatus.js:
+//        * Beim Wechsel in "ready": Würfel 1..X (X=READY_STATUS_DIE_MAX)
+//        * Bei "1": KI-Einzeiler (<=30 Zeichen) aus letzter History setzen
+//        * Sonst: NICHTS ändern → vorheriger Presence-Text bleibt
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -29,6 +33,9 @@ const {
 
 const { reportError, reportInfo, reportWarn } = require("./error.js");
 const { getToolRegistry } = require("./tools.js");
+
+// ⬇️ NEU: Dynamischer Ready-Status (eigene Datei, siehe Kommentar am Ende)
+const { maybeSetDynamicReady } = require("./readyStatus.js");
 
 // ---- JSON Middleware Shim (Express v3/v4 Kompatibilität) --------------------
 let bodyParser = null;
@@ -64,17 +71,27 @@ const voiceBusy = new Map();
 const busyNoticeSent = new Map();
 
 // ==== Presence counter ====
+// Regel: Beim Start eines Tasks → "⌛ Working" setzen.
+// Beim Ende: NICHT automatisch "Ready". Stattdessen würfeln:
+//   - Treffer (1): KI-Einzeiler setzen (ersetzen).
+//   - Miss: GAR NICHTS tun → alter Text (z. B. "⌛ Working") bleibt bestehen.
 let _activeTasks = 0;
 function incPresence() {
   _activeTasks++;
   try { setBotPresence(client, "⌛ Working", "online"); } catch {}
 }
-function decPresence() {
+async function decPresence() {
   _activeTasks = Math.max(0, _activeTasks - 1);
-  try {
-    if (_activeTasks === 0) setBotPresence(client, "✅ Ready", "online");
-    else setBotPresence(client, "⌛ Working", "online");
-  } catch {}
+
+  // Wenn noch Tasks laufen, explizit "Working" belassen/setzen
+  if (_activeTasks > 0) {
+    try { await setBotPresence(client, "⌛ Working", "online"); } catch {}
+    return;
+  }
+
+  // == Wechsel in "ready": KEIN Default-"Ready" setzen ==
+  // Nur evtl. dynamischen KI-Status setzen; bei Miss bleibt der alte Text stehen.
+  try { await maybeSetDynamicReady(client); } catch {}
 }
 
 /** Ensure a Context instance for a channel, rebuilding when config signature changes */
@@ -391,7 +408,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       voiceBusy.set(evt.channelId, false);
       busyNoticeSent.delete(evt.channelId);
     } catch {}
-    decPresence();
+    await decPresence();
   }
 }
 
@@ -773,7 +790,7 @@ client.on("messageCreate", async (message) => {
       try { await setMessageReaction(message, "❌"); } catch {}
     } finally {
       try { chatContext.instructions = instrBackup; } catch {}
-      decPresence();
+      await decPresence();
     }
   } catch (err) {
     await reportError(err, message?.channel, "ON_MESSAGE_CREATE", { emit: "channel" });
@@ -781,11 +798,13 @@ client.on("messageCreate", async (message) => {
 });
 
 // ==== Ready handler ====
-function onClientReadyOnce() {
+// Beim Initial-Login kein erzwungenes "Ready" mehr.
+// Optional: gleich würfeln und evtl. KI-Status setzen; bei Miss bleibt default/alter Text.
+async function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
-    setBotPresence(client, "✅ Ready", "online");
+    await maybeSetDynamicReady(client); // tut bei Miss nichts
   } catch (err) {
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }
@@ -914,7 +933,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
       process.env.OPENAI_BASE_URL ||
       "https://api.openai.com/v1";
 
-    const pseudoFromApi = !!apiBlock?.pseudotoolcalls // NEW
+    const pseudoFromApi = !!apiBlock?.pseudotoolcalls; // NEW
 
     // PRE-LOG (persist): User turn als "API" mit eingebettetem Kontext
     await chatContext.add("user", "API", userPrompt, Date.now());
@@ -946,7 +965,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
       await reportError(err, null, "API_ENDPOINT", { emit: "console" });
       return res.status(500).json({ error: "ai_failure", message: String(err?.message || err) });
     } finally {
-      decPresence();
+      await decPresence();
     }
   } catch (err) {
     await reportError(err, null, "API_ENDPOINT_FATAL", { emit: "console" });
