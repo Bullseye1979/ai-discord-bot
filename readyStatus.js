@@ -81,7 +81,7 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
       "No quotation marks.",
       "Use ONLY the provided chat snippets as inspiration; do not invent facts.",
       "No names, IDs, links, emojis, hashtags, or markdown.",
-      "Prefer German if the snippets are mostly German."
+      "Always answer in english."
     ].join(" "),
     [],
     {},
