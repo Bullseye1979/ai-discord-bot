@@ -1,19 +1,30 @@
-// readyStatus.js — v1.3 (Ready memory + optional refresh)
+// readyStatus.js — v1.4 (ready memory + cron + die roll)
 // - Remembers the last "Ready" text (default: "✅ Ready").
-// - On ready-switch: caller sets the last ready text immediately so it stays visible.
-// - maybeUpdateReadyStatus(client): roll 1..X; on hit, build a new <=30 chars one-liner from history
-//   and update presence + memory. On miss or error: do nothing (keep current ready text).
+// - maybeUpdateReadyStatus(client):
+//     * Roll 1..X; on 1, generate a <= SOFTLEN one-liner from recent history,
+//       hard-cut at HARDLEN, set presence, and remember it.
+//     * On miss: do nothing (keep current ready text).
+// - startReadyStatusCron(client):
+//     * Runs every N minutes (READY_STATUS_CRON_MINUTES).
+//     * Skips if current presence contains the hourglass "⌛" (bot busy).
+//     * Otherwise calls maybeUpdateReadyStatus(client) — same die roll applies.
 //
 // ENV:
-//   READY_STATUS_ENABLED=1|0 (default 1)
-//   READY_STATUS_DIE_MAX=integer (default 12)
-//   READY_STATUS_MODEL=string (default "gpt-4o-mini")
+//   READY_STATUS_ENABLED=1|0          (default 1)
+//   READY_STATUS_DIE_MAX=integer      (default 12)
+//   READY_STATUS_MODEL=string         (default "gpt-4o-mini")
+//   READY_STATUS_CRON_MINUTES=number  (default 15)
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
+const cron = require("node-cron");
 const { setBotPresence } = require("./discord-helper.js");
 const { getAI } = require("./aiService.js");
 const Context = require("./context.js");
+
+// ---- soft vs hard length limits ----
+const SOFTLEN = 30;  // model target (prompt)
+const HARDLEN = 40;  // absolute safety cap
 
 // ===== Ready memory (module-level) =====
 let _lastReadyText = "✅ Ready";
@@ -49,10 +60,21 @@ function rollDie(max) {
   return Math.floor(Math.random() * m) + 1;
 }
 
-function hardTrimOneLine(s, max = 30) {
-  const one = String(s || "").replace(/\s+/g, " ").trim();
-  if (one.length <= max) return one;
-  return [...one].slice(0, max).join("");
+function hardTrimOneLine(input, max = HARDLEN) {
+  const oneLine = String(input || "").replace(/\s+/g, " ").trim();
+  if (!oneLine) return "";
+  try {
+    // Grapheme-safe (handles emojis/combining marks/ZWJ)
+    const seg = new Intl.Segmenter("und", { granularity: "grapheme" });
+    const graphemes = Array.from(seg.segment(oneLine), s => s.segment);
+    if (graphemes.length <= max) return oneLine;
+    return graphemes.slice(0, max).join("");
+  } catch {
+    // Fallback: code point slice
+    const cp = [...oneLine];
+    if (cp.length <= max) return oneLine;
+    return cp.slice(0, max).join("");
+  }
 }
 
 async function fetchLastLogs(limit = 20) {
@@ -77,13 +99,11 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
   const ctx = new Context(
     "",
     [
-      "Create EXACTLY ONE single-line status, maximum 30 characters.",
+      `Create EXACTLY ONE single-line status, maximum ${SOFTLEN} characters.`,
       "No quotation marks.",
       "Use ONLY the provided chat snippets as inspiration; do not invent facts.",
-      "No names, IDs, links, hashtags, or markdown.",
-      "Be unspecific about location and names (even fantasy ones)",
-      "Always answer in english.",
-      "Always start with a thematic emoji."
+      "No names, IDs, links, emojis, hashtags, or markdown.",
+      "Prefer German if the snippets are mostly German."
     ].join(" "),
     [],
     {},
@@ -99,13 +119,13 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
     model || process.env.READY_STATUS_MODEL || "gpt-4o-mini"
   ))?.trim() || "";
 
-  return hardTrimOneLine(out, 40);
+  return hardTrimOneLine(out, HARDLEN);
 }
 
 /**
  * maybeUpdateReadyStatus(client)
  * - Call this AFTER you've switched to "ready" and shown the last ready text.
- * - Rolls 1..X; on 1, generates a new <=30-char line from recent history and updates presence + memory.
+ * - Rolls 1..X; on 1, generates a new line from recent history and updates presence + memory.
  * - On miss or any error, keeps the currently shown ready text unchanged.
  */
 async function maybeUpdateReadyStatus(client) {
@@ -123,16 +143,44 @@ async function maybeUpdateReadyStatus(client) {
     const line = await buildStatusFromLogs(rows, process.env.READY_STATUS_MODEL || "gpt-4o-mini");
     if (!line) return;
 
-    setLastReadyText(line);                      // remember
-    await setBotPresence(client, line, "online", 4); // update presence
+    setLastReadyText(line);                         // remember
+    await setBotPresence(client, line, "online", 4); // update presence (custom status)
   } catch (err) {
     // Silent fail: keep current ready text
     console.error("[readyStatus] failed:", err?.message || err);
   }
 }
 
+// ===== Cron (hourglass-aware) =====
+function isBusyPresence(name) {
+  if (!name) return false;
+  return name.includes("⌛"); // only block when hourglass is shown
+}
+
+function startReadyStatusCron(client) {
+  const interval = Number(process.env.READY_STATUS_CRON_MINUTES || 15);
+  if (!interval || interval <= 0) return;
+
+  const schedule = `*/${interval} * * * *`;
+
+  cron.schedule(schedule, async () => {
+    try {
+      const presence = client.user?.presence?.activities?.[0]?.name || "";
+      if (isBusyPresence(presence)) return; // skip if busy
+
+      // Same die roll + generation logic as on ready-switch
+      await maybeUpdateReadyStatus(client);
+    } catch (err) {
+      console.error("[readyStatus-cron] failed:", err?.message || err);
+    }
+  });
+
+  console.log(`[readyStatus] Scheduled ready-status task every ${interval} min`);
+}
+
 module.exports = {
   getLastReadyText,
   setLastReadyText,
-  maybeUpdateReadyStatus
+  maybeUpdateReadyStatus,
+  startReadyStatusCron
 };

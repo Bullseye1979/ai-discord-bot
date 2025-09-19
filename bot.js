@@ -1,13 +1,8 @@
-// bot.js — refactored v3.18.2 (API: system→user-merge + pseudo-toolcalls + dynamic ready memory)
-// - HTTP-Endpoint: POST /api/:channelId
-// - JSON-Middleware via useJson() (Express v3/v4 compatible)
-// - API: system prompt is appended to user prompt (no extra system message)
-// - Pseudo-toolcalls per Block/_API flag → options.pseudotoolcalls to aiCore
-// - Dynamic Ready presence:
-//    * We remember the last "Ready" text (default: "✅ Ready").
-//    * On switching to ready: immediately set the LAST ready text (so it shows while KI builds).
-//    * Then roll 1..X; on hit, generate a new <=30 chars line from history and replace it.
-//    * On miss: keep the last ready text. While generating, never show "Working".
+// bot.js — refactored v3.18.2 (API: system→user-merge + pseudo-toolcalls + dynamic ready + cron)
+// - On switching to "ready": immediately show LAST ready text, then maybeUpdateReadyStatus() (die roll).
+// - Cron runs every READY_STATUS_CRON_MINUTES, skips if hourglass "⌛", uses the same die roll.
+//
+// NOTE: Requires: npm i node-cron
 
 require('dns').setDefaultResultOrder?.('ipv4first');
 const { Client, GatewayIntentBits, PermissionsBitField } = require("discord.js");
@@ -35,14 +30,14 @@ const {
 const { reportError, reportInfo, reportWarn } = require("./error.js");
 const { getToolRegistry } = require("./tools.js");
 
-// Dynamic Ready helpers
+// Dynamic Ready helpers (memory + die roll + cron)
 const {
   getLastReadyText,
-  setLastReadyText,
-  maybeUpdateReadyStatus
+  maybeUpdateReadyStatus,
+  startReadyStatusCron
 } = require("./readyStatus.js");
 
-// ---- JSON middleware shim (Express v3/v4 compatibility) ---------------------
+// ---- JSON Middleware Shim (Express v3/v4 compatibility) ---------------------
 let bodyParser = null;
 try { bodyParser = require("body-parser"); } catch {}
 function useJson(app, limit = "2mb") {
@@ -76,10 +71,10 @@ const voiceBusy = new Map();
 const busyNoticeSent = new Map();
 
 // ==== Presence counter ====
-// Rule: when a task starts → "⌛ Working".
-// When tasks drop to 0 (switching to ready):
-//   1) immediately show the LAST ready text (so "ready" remains visible during KI build)
-//   2) maybeUpdateReadyStatus() to optionally replace it after the dice hit.
+// Task start → "⌛ Working"
+// When tasks drop to 0 (switch to ready):
+//   1) set LAST ready text immediately (so it stays ready while generating)
+//   2) maybeUpdateReadyStatus() which does the die roll and may replace it
 let _activeTasks = 0;
 function incPresence() {
   _activeTasks++;
@@ -272,7 +267,7 @@ function resolveEffectiveLLM(channelMeta, matchingBlock) {
 }
 
 
-/** Voice transcript → AI reply (unchanged logic besides presence handling) */
+/** Voice transcript → AI reply */
 async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn) {
   let ch = null;
   let chatContext = null;
@@ -291,7 +286,7 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
       chatContext.setUserWindow(channelMeta.max_user_messages, { prunePerTwoNonUser: true });
     }
 
-    // Voice-block by SPEAKER (Discord ID)
+    // Voice-Block only via SPEAKER (Discord ID)
     const blocks = Array.isArray(channelMeta.blocks) ? channelMeta.blocks : [];
     const userId = String(evt.userId || "").trim();
 
@@ -371,7 +366,6 @@ async function handleVoiceTranscriptDirect(evt, client, storage, pendingUserTurn
         pendingUser: pendingUserTurn || null,
         endpoint: effectiveEndpoint,
         noPendingUserInjection: true,
-        // pass pseudo-toolcalls flag from block
         pseudotoolcalls: !!blockPseudo
       }, 
       client
@@ -425,7 +419,20 @@ client.on("messageCreate", async (message) => {
     if (!channelMeta?.hasConfig) return;
 
     const key = `channel:${baseChannelId}`;
-    const signature = metaSig(channelMeta);
+    const signature = crypto
+      .createHash("sha1")
+      .update(
+        JSON.stringify({
+          persona: channelMeta.persona || "",
+          instructions: channelMeta.instructions || "",
+          tools: (channelMeta.tools || [])
+            .map((t) => t?.function?.name || t?.name || "")
+            .sort(),
+          botname: channelMeta.botname || "",
+          voice: channelMeta.voice || "",
+        })
+      )
+      .digest("hex");
 
     if (!contextStorage.has(key)) {
       const ctx = new Context(
@@ -703,7 +710,7 @@ client.on("messageCreate", async (message) => {
     const bypassTrigger = matchingBlock.noTrigger === true;
     if (!bypassTrigger && !isTrigger) return;
 
-    // If trigger/noTrigger, ensure user turn is logged
+    // Ensure user turn is logged
     const textForLog = stripLeadingName(rawText, triggerName);
     if (!preLogged) {
       try {
@@ -801,14 +808,14 @@ client.on("messageCreate", async (message) => {
 });
 
 // ==== Ready handler ====
-// On initial login, show the last ready text and optionally refresh it.
-// (No forced "Ready" string; we use the remembered one.)
+// On initial login, show the last ready text and start the cron (die roll inside).
 async function onClientReadyOnce() {
   if (onClientReadyOnce._ran) return;
   onClientReadyOnce._ran = true;
   try {
     await setBotPresence(client, getLastReadyText(), "online", 4);
     await maybeUpdateReadyStatus(client); // will only change on dice hit
+    startReadyStatusCron(client);        // ⏰ scheduled updates (hourglass-aware)
   } catch (err) {
     reportError(err, null, "READY_INIT", { emit: "channel" });
   }
@@ -825,7 +832,7 @@ client.once("clientReady", onClientReadyOnce);
 })();
 
 /* =============================================================================
- * HTTP server: Static /documents + API
+ * HTTP-Server: Static /documents + API
  * =============================================================================
  */
 
@@ -903,7 +910,7 @@ expressApp.post("/api/:channelId", async (req, res) => {
 
     const chatContext = ensureChatContextForChannel(channelId, contextStorage, channelMeta);
 
-    // Tools: API-specific or channel defaults
+    // Tools: API-specific or channel default
     if (apiBlock?.tools && Array.isArray(apiBlock.tools) && apiBlock.tools.length > 0) {
       const { tools: apiTools, registry: apiToolReg } = getToolRegistry(apiBlock.tools);
       chatContext.tools = apiTools;
@@ -976,6 +983,6 @@ expressApp.post("/api/:channelId", async (req, res) => {
   }
 });
 
-// Server
-express.open?.(); // no-op for old environments
+// Server starten
+express.open?.(); // no-op guard for old environments
 expressApp.listen(3000, () => {});
