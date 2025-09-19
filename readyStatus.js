@@ -102,8 +102,10 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
       `Create EXACTLY ONE single-line status, maximum ${SOFTLEN} characters.`,
       "No quotation marks.",
       "Use ONLY the provided chat snippets as inspiration; do not invent facts.",
-      "No names, IDs, links, emojis, hashtags, or markdown.",
-      "Prefer German if the snippets are mostly German."
+      "No names, IDs, links, hashtags, or markdown.",
+      "Avoid possible spoilers."
+      "Alwasy set an emoji at the beginning of the text, but NEVER use the hourglass emoji."
+      "Always answer in english."
     ].join(" "),
     [],
     {},
