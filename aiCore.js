@@ -1,4 +1,4 @@
-// aiCore.js — unified flow v2.36 (Tool-Chaining + Finalizer, no link parsing)
+// aiCore.js — unified flow v2.37 (Tool-Chaining + Finalizer, no link parsing)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
@@ -12,6 +12,12 @@
 // v2.36 changes:
 // - Link-Parser entfernt: Tool-Outputs werden nicht mehr auf URLs/Listen/links reduziert.
 // - Finalizer wird nie wegen „single URL“ übersprungen.
+//
+// v2.37 changes (FOCUS: kein Kontextverlust):
+// - NEU: injectToolOutputAsAssistantParts(ctx, toolName, rawPayload[, partSize]) – injiziert lange Tool-Outputs als normale Assistant-Parts (Chunking)
+//   => NICHT von stripPersistedWrappers erfasst, bleiben vollständig im Verlauf.
+// - Finalizer nutzt die oberhalb eingespeisten Parts direkt (keine 2k-Char-Summary mehr).
+// - Continue-Logik unverändert; profitiert davon, dass vorherige Teile im Verlauf stehen.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -346,6 +352,46 @@ function getLastUserText(msgs) {
   return "";
 }
 
+/* ---- v2.37: Verlustfreie Einspeisung langer Tool-Outputs als Assistant-Parts ---- */
+
+const DEFAULT_PART_CHARS = Math.max(3000, Number(process.env.TOOL_PART_CHARS || 6000));
+
+function splitIntoParts(s, max = DEFAULT_PART_CHARS) {
+  const text = String(s ?? "");
+  const out = [];
+  for (let i = 0; i < text.length; i += max) out.push(text.slice(i, i + max));
+  return out.length ? out : [""];
+}
+
+/**
+ * Injiziere lange Tool-Outputs als *normale* Assistant-Messages (kein [TOOL_RESULT:*] Wrapper!)
+ * -> Dadurch greift stripPersistedWrappers NICHT, und der Inhalt bleibt für Finalizer/Continue sichtbar.
+ *
+ * @param {object} ctx - dein Chat-Kontext (mit ctx.messages.push({role,content}))
+ * @param {string} toolName - z.B. "getHistory"
+ * @param {any}    rawPayload - String oder Objekt
+ * @param {number} [partChars] - Zeichenlimit pro Part
+ * @returns {{anchor: string, parts: number}}
+ */
+function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars = DEFAULT_PART_CHARS) {
+  const anchor = `${toolName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  let s;
+  try { s = typeof rawPayload === "string" ? rawPayload : JSON.stringify(rawPayload, null, 2); }
+  catch { s = String(rawPayload); }
+
+  const chunks = splitIntoParts(s, partChars);
+  for (let i = 0; i < chunks.length; i++) {
+    const head = `«${toolName} • Part ${i + 1}/${chunks.length} • Anchor:${anchor}»`;
+    const tail = i < chunks.length - 1 ? "\n[...]" : "\n— END —";
+    ctx.messages.push({
+      role: "assistant",
+      // kein [TOOL_RESULT:*] am Zeilenanfang, damit stripPersistedWrappers NICHT greift
+      content: `${head}\n${chunks[i]}${tail}`
+    });
+  }
+  return { anchor, parts: chunks.length };
+}
+
 /* -------------------- Main -------------------- */
 
 async function getAIResponse(
@@ -659,12 +705,31 @@ async function getAIResponse(
       else responseMessage = "";
     }
 
-    /* ----- Finalisierungsturn ----- */
+    /* ----- Finalisierungsturn (v2.37: mit verlustfreier Part-Injektion) ----- */
 
     // v2.36: kein Skip-Finalize mehr für single URL
     const shouldSkipFinalizeForUrlOnly = false;
 
     if (postToolFinalize && toolResults.length > 0 && !shouldSkipFinalizeForUrlOnly) {
+      // 1) Alle Tool-Outputs *zusätzlich* als normale Assistant-Parts injizieren (ohne Wrapper), in den *aktuellen* Kontext.
+      for (const tr of toolResults) {
+        let payload = tr.raw;
+        if (payload != null && typeof payload !== "string") {
+          try { payload = JSON.stringify(payload, null, 2); } catch { payload = String(payload); }
+        }
+        injectToolOutputAsAssistantParts(context, tr.name || "tool", payload || "");
+      }
+
+      // 2) Finalizer Nachrichten aufbauen (ohne 2k-Trunkierung)
+      const finalizerSystem = buildFinalizerSystemPrompt();
+      const lastUserText = getLastUserText(stripPersistedWrappers(context.messages));
+
+      const finalizeMessages = [
+        { role: "system", content: finalizerSystem },
+        { role: "system", content: "Tool outputs were injected above as assistant messages (anchored parts). Use ONLY those as sources. If output is long, end with [...] and wait for 'continue'." },
+        { role: "user", content: lastUserText || "Finalize the answer now based on the provided parts." }
+      ];
+
       const configuredRaw =
         (options?.endpoint || "").trim() ||
         (process.env.OPENAI_API_URL || "").trim() ||
@@ -677,26 +742,10 @@ async function getAIResponse(
       const authKey = apiKey || process.env.OPENAI_API_KEY;
       if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
-      const finalizerSystem = buildFinalizerSystemPrompt();
-      const lastUserText = getLastUserText(stripPersistedWrappers(context.messages));
-
-      const MAX_ITEM_CHARS = 2000;
-      const toolSummaries = toolResults.map(tr => {
-        let s = tr.raw;
-        try { s = typeof s === "string" ? s : JSON.stringify(s); } catch { s = String(s); }
-        if (s.length > MAX_ITEM_CHARS) s = s.slice(0, MAX_ITEM_CHARS - 1) + "…";
-        return `• ${tr.name}: ${s}`;
-      }).join("\n");
-
-      const finalizeMessages = [
-        { role: "system", content: finalizerSystem },
-        { role: "system", content: `User question/context:\n${lastUserText || "(not provided)"}` },
-        { role: "user", content: `Tool outputs (summarize for the user, don't call tools):\n${toolSummaries}` }
-      ];
-
       const finalizePayload = {
         model,
-        messages: finalizeMessages,
+        // WICHTIG: Wir hängen die Finalizer-Messages HINTEN an den *bereits* injizierten Kontext an:
+        messages: buildStrictToolPairedMessages(stripPersistedWrappers(context.messages).concat(finalizeMessages)),
         max_tokens: tokenlimit
       };
 
