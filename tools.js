@@ -156,6 +156,7 @@ const tools = [
       name: "findTimeframes",
       description:
         "Find relevant timeframes in THIS Discord channel by AND-matching the provided keywords on message content, " +
+        "ONLY USE THIS, WHEN THE TIMEFRAME IS NOT YET KNOWN,"+
         "then expanding each hit to a window of ±N rows (same channel). Returns JSON with merged {start,end} ISO timestamps for each timeframe. " +
         "Use this to locate episodes (e.g., an arc with 'murphy'), then call getHistory with one or multiple returned timeframes.",
       parameters: {
