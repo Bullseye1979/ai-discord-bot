@@ -1,24 +1,29 @@
-// aiCore.js — unified flow v2.37+ (Tool-Chaining + Finalizer with Continue, no link parsing, NO_DB_PERSIST)
+// aiCore.js — unified flow v2.38 (Tool-Chaining + Finalizer w/ Continue, no link parsing, NO_DB_PERSIST)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
 //   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
-//   + NEU: Finalizer hat eigene Continue-Logik (finish_reason === "length") und holt weitere Chunks nach
+//   + NEU v2.38: Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
+//   + NEU v2.38: Finalizer kann auch bei "continue" ohne neue Tool-Outputs erzwungen werden
+// - Sonderfall (früher): Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)  => ENTFERNT
 // - Kein Fabricate, kein Auto-Prompt-Fill
 //
-// v2.36 changes:
-// - Link-Parser entfernt: Tool-Outputs werden nicht mehr auf URLs/Listen/links reduziert.
+// v2.36:
+// - Link-Parser entfernt
 // - Finalizer wird nie wegen „single URL“ übersprungen.
 //
-// v2.37 changes (FOCUS: kein Kontextverlust):
-// - NEU: injectToolOutputAsAssistantParts(ctx, toolName, rawPayload[, partSize]) – injiziert lange Tool-Outputs als normale Assistant-Parts (Chunking)
-//   => bleiben vollständig im Verlauf (RAM).
-// - Finalizer nutzt die oberhalb eingespeisten Parts direkt (keine 2k-Char-Summary mehr).
-// - Continue-Logik unverändert; profitiert davon, dass vorherige Teile im Verlauf stehen.
+// v2.37 (kein Kontextverlust):
+// - injectToolOutputAsAssistantParts(ctx, toolName, rawPayload[, partSize]) – lange Tool-Outputs als normale Assistant-Parts (RAM)
+// - Finalizer nutzt die injizierten Parts direkt.
+//
+// v2.38 (Finalizer-Continue):
+// - FINALIZER_MAX_ROUNDS / FINALIZER_CONTINUE_ON_LENGTH (per ENV konfigurierbar)
+// - Finalizer-Continue: Bei finish_reason === "length" wird intern "continue" injiziert und erneut finalisiert.
+// - Force-Finalizer bei reinen "continue"-Turns, wenn bereits anchored Parts vorhanden.
 //
 // NO_DB_PERSIST:
-// - Tool-Ergebnisse werden NICHT mehr in die Datenbank/History geschrieben (keine [TOOL_RESULT:*]-Einträge, kein context_orig.add).
+// - Tool-Ergebnisse werden NICHT in die Datenbank/History geschrieben.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -34,7 +39,6 @@ const DEBUG = String(process.env.PSEUDO_TOOLS_DEBUG || "1") === "1";
 const dbg = (...args) => { if (DEBUG) { try { console.log("[AI]", ...args); } catch {} } };
 
 /* -------------------- Transport -------------------- */
-
 const keepAliveHttpAgent = new http.Agent({
   keepAlive: true,
   maxSockets: 16,
@@ -47,7 +51,6 @@ const keepAliveHttpsAgent = new https.Agent({
   maxFreeSockets: 16,
   timeout: 30_000,
 });
-
 const axiosAI = axios.create({
   httpAgent: keepAliveHttpAgent,
   httpsAgent: keepAliveHttpsAgent,
@@ -99,7 +102,6 @@ async function postWithRetry(url, payload, headers, tries = 3) {
 }
 
 /* -------------------- Helpers -------------------- */
-
 function normalizeEndpoint(raw) {
   const fallback = "https://api.openai.com/v1/chat/completions";
   let url = (raw || "").trim();
@@ -150,7 +152,6 @@ function buildStrictToolPairedMessages(msgs) {
 }
 
 /* ---- Pseudo-Tools: Definition + Parser ---- */
-
 function buildPseudoToolsInstruction(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return "";
   const MAX_TOTAL = Math.max(2000, Number(process.env.PSEUDO_SCHEMA_MAX || 6000));
@@ -210,7 +211,7 @@ function buildPseudoToolsInstruction(tools) {
     "- Stick exactly to the example.",
     "- The <tool_call> and </tool_call> tags are mandatory.",
     "- JSON must be valid.",
-    "- NEVER output “Tool result: …”, [TOOL_RESULT:*] oder [TOOL_OUTPUT:*].",
+    "- NEVER output “Tool result: …”, [TOOL_RESULT:*] or [TOOL_OUTPUT:*].",
     "- Ignore previous attempts or pseudo tool-call drafts.",
     "- If you cannot call a tool, return NOTHING.",
     "",
@@ -274,7 +275,6 @@ function extractPseudoToolCalls(text) {
 }
 
 /* ---- Rendering für User-Antwort ---- */
-
 function prettyClipJSON(any, max = 1800) {
   let s;
   try { s = typeof any === "string" ? any : JSON.stringify(any, null, 2); }
@@ -289,15 +289,16 @@ function renderToolOutputGeneric(_name, raw) {
   try { return prettyClipJSON(raw); } catch { return String(raw); }
 }
 
-/* ---- Finalisierung: Zweiter Model-Call ohne Tools ---- */
-
+/* ---- Finalisierung: Systemprompt + Helpers ---- */
 function buildFinalizerSystemPrompt() {
   return [
     "FINALIZE_MODE:",
-    "- You will receive tool outputs.",
-    "- Write a concise, helpful answer for the user.",
-    "- DO NOT call any tools. DO NOT produce pseudo tool-calls or <tool_call> blocks.",
-    "- DO NOT include special wrappers.",
+    "- You will receive tool outputs in prior assistant messages (anchored parts).",
+    "- Write a complete, helpful answer for the user in multiple parts if needed.",
+    "- Do NOT call any tools. Do NOT produce pseudo tool-calls or <tool_call> blocks.",
+    "- Do NOT include special wrappers.",
+    "- If your answer is long and you hit your length limit, STOP mid-output and expect the user to send 'continue'.",
+    "- On 'continue', resume EXACTLY where you left off. No recap, no alternative phrasing, no new intro.",
     "- Be correct, avoid speculation, do not invent results.",
   ].join("\n");
 }
@@ -313,8 +314,7 @@ function getLastUserText(msgs) {
   return "";
 }
 
-/* ---- v2.37: Verlustfreie Einspeisung langer Tool-Outputs als Assistant-Parts ---- */
-
+/* ---- v2.37/38: Einspeisung langer Tool-Outputs als Assistant-Parts ---- */
 const DEFAULT_PART_CHARS = Math.max(3000, Number(process.env.TOOL_PART_CHARS || 6000));
 
 function splitIntoParts(s, max = DEFAULT_PART_CHARS) {
@@ -324,10 +324,7 @@ function splitIntoParts(s, max = DEFAULT_PART_CHARS) {
   return out.length ? out : [""];
 }
 
-/**
- * Injiziere lange Tool-Outputs als *normale* Assistant-Messages (kein Wrapper).
- * -> Bleiben im RAM-Kontext sichtbar für Finalizer/Continue.
- */
+/** Injiziere lange Tool-Outputs als normale Assistant-Messages (RAM) */
 function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars = DEFAULT_PART_CHARS) {
   const anchor = `${toolName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   let s;
@@ -346,12 +343,83 @@ function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars =
   return { anchor, parts: chunks.length };
 }
 
-/* ---- Finalizer Continue: ENV-Schalter ---- */
-const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 20));
+/* ---- v2.38: Finalizer Continue-Engine ---- */
+const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 50));
 const FINALIZER_CONTINUE_ON_LENGTH = String(process.env.FINALIZER_CONTINUE_ON_LENGTH || "1") === "1";
 
-/* -------------------- Main -------------------- */
+/** Heuristik: Sind bereits anchored Parts vorhanden? */
+function hasAnchoredParts(msgs) {
+  return (msgs || []).some(m =>
+    m && m.role === "assistant" &&
+    typeof m.content === "string" &&
+    /«.+?\s•\sPart\s\d+\/\d+\s•\sAnchor:/.test(m.content)
+  );
+}
 
+/** Baue Finalizer-Messages (System+User) */
+function buildFinalizeMessages(baseMsgs) {
+  const finalizerSystem = buildFinalizerSystemPrompt();
+  const lastUserText = getLastUserText(baseMsgs);
+
+  const finalizeMessages = [
+    { role: "system", content: finalizerSystem },
+    { role: "system", content: "Tool outputs were injected above as assistant messages (anchored parts). Use ONLY those as sources. If output is long, stop and expect 'continue'." },
+    { role: "user", content: lastUserText || "Finalize the answer now based on the provided parts." }
+  ];
+  return finalizeMessages;
+}
+
+/** Run Finalizer once */
+async function runFinalizeOnce(context, tokenlimit, model, apiKey, options) {
+  const configuredRaw =
+    (options?.endpoint || "").trim() ||
+    (process.env.OPENAI_API_URL || "").trim() ||
+    (OPENAI_API_URL || "").trim();
+  const endpoint = normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
+  const headers = {
+    "Content-Type": "application/json",
+    "Connection": "keep-alive",
+  };
+  const authKey = apiKey || process.env.OPENAI_API_KEY;
+  if (authKey) headers.Authorization = `Bearer ${authKey}`;
+
+  const finalizePayload = {
+    model,
+    messages: buildStrictToolPairedMessages(context.messages.concat(buildFinalizeMessages(context.messages))),
+    max_tokens: tokenlimit
+  };
+
+  dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, tools_in_payload: false });
+  const finalRes = await postWithRetry(endpoint, finalizePayload, headers, 3);
+  const choice = finalRes?.data?.choices?.[0] || {};
+  const finalText = (choice?.message?.content || "").trim();
+  const finishReason = choice?.finish_reason || "";
+  return { finalText, finishReason };
+}
+
+/** Run Finalizer with internal continue loop */
+async function runFinalizeWithContinue(context, tokenlimit, model, apiKey, options) {
+  let combined = "";
+  for (let round = 0; round < FINALIZER_MAX_ROUNDS; round++) {
+    const { finalText, finishReason } = await runFinalizeOnce(context, tokenlimit, model, apiKey, options);
+
+    if (finalText) {
+      combined += (combined ? "\n" : "") + finalText;
+      // für UI/Discord: lege den erzeugten Teil in den Verlauf, damit ein anschließendes 'continue' sauber anschließt
+      context.messages.push({ role: "assistant", content: finalText });
+    }
+
+    if (finishReason === "length" && FINALIZER_CONTINUE_ON_LENGTH) {
+      // Weiterlaufen: 'continue' injizieren
+      context.messages.push({ role: "user", content: "continue" });
+      continue;
+    }
+    break;
+  }
+  return combined.trim();
+}
+
+/* -------------------- Main -------------------- */
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
@@ -437,18 +505,17 @@ async function getAIResponse(
     while (continueLoop && rounds < Math.max(1, sequenceLimit)) {
       rounds += 1;
 
-      // 1) (Legacy) Entfernen wir evtl. alte Wrapper aus der History, falls vorhanden
+      // 1) (Legacy) Filter evtl. alte Wrapper in RAM
       const cleanedHistory = (context.messages || []).filter(m => {
         if (!m || typeof m.content !== "string") return true;
         const c = m.content.trim();
-        // Früher wurden [TOOL_RESULT:*]/[TOOL_OUTPUT:*] persistiert; falls noch im RAM, nicht mitsenden
         if (m.role === "assistant" || m.role === "system") {
           if (/^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:[^\]]+\]/i.test(c)) return false;
         }
         return true;
       });
 
-      // 2) Payload aufbauen
+      // 2) Payload
       const messagesToSend = buildStrictToolPairedMessages(cleanedHistory).map(m => {
         const out = { role: m.role, content: m.content };
         const safeName = cleanOpenAIName(m.role, m.name);
@@ -488,7 +555,7 @@ async function getAIResponse(
         tools_list: Array.isArray(context_orig.tools) ? context_orig.tools.map(t => t?.function?.name || t?.name) : []
       });
 
-      // 3) Model aufrufen
+      // 3) Model call
       let aiResponse;
       try {
         aiResponse = await postWithRetry(endpoint, payload, headers, 3);
@@ -570,9 +637,8 @@ async function getAIResponse(
         context.messages.push(assistantToolMsg);
       }
 
-      // 6) Tool(s) ausführen
+      // 6) Tools ausführen
       if (hadToolCallsThisTurn) {
-        // non-pseudo: alle Calls ausführen; pseudo: nur den ersten (wir haben ohnehin nur 1 erzeugt)
         const callsToRun = pseudotoolcalls ? normalizedCalls.slice(0, 1) : normalizedCalls;
 
         for (const call of callsToRun) {
@@ -587,11 +653,10 @@ async function getAIResponse(
               ? (content || "")
               : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
 
-            // tool-Message für Pairing (RAM-Kontext)
+            // tool-Message (RAM-Kontext)
             context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
 
-            // KEINE DB-Persistierung mehr!
-            // (Früher: wrapped = formatToolResultForPersistence(...); context_orig.add(...))
+            // KEINE DB-Persistierung mehr
 
             // Für Finalizer sammeln (RAM)
             toolResults.push({ name: fnName || "tool", raw: out });
@@ -618,14 +683,12 @@ async function getAIResponse(
         }
       }
 
-      // 7) Schleifensteuerung:
-      // - Pseudo: IMMER nach 1 Runde raus (max 1 Call)
-      // - Native: weiter, solange Tool-Calls; sonst ggf. Continue bei finish_reason === "length"
+      // 7) Schleifensteuerung (native tools)
       if (pseudotoolcalls) {
-        continueLoop = false; // genau ein Durchlauf
+        continueLoop = false;
       } else {
         if (hadToolCallsThisTurn) {
-          continueLoop = true; // noch mal Modell fragen, jetzt mit tool-Antworten in der History
+          continueLoop = true;
         } else if (finishReason === "length" && rounds < sequenceLimit) {
           if (rawText) {
             context.messages.push({ role: "assistant", content: rawText });
@@ -639,7 +702,6 @@ async function getAIResponse(
     } // END while chain
 
     /* ----- Antwortaufbereitung / Rendering ----- */
-
     let rendered = [];
     if (toolResults.length > 0) {
       for (const item of toolResults) {
@@ -662,91 +724,35 @@ async function getAIResponse(
       else responseMessage = "";
     }
 
-    /* ----- Finalisierungsturn (mit eigener Continue-Logik) ----- */
-
+    /* ----- Finalisierung (mit Continue, ggf. erzwungen bei 'continue') ----- */
     const shouldSkipFinalizeForUrlOnly = false;
 
-    if (postToolFinalize && toolResults.length > 0 && !shouldSkipFinalizeForUrlOnly) {
-      // 1) Tool-Outputs als normale Assistant-Parts injizieren (RAM)
-      for (const tr of toolResults) {
-        let payload = tr.raw;
-        if (payload != null && typeof payload !== "string") {
-          try { payload = JSON.stringify(payload, null, 2); } catch { payload = String(payload); }
-        }
-        injectToolOutputAsAssistantParts(context, tr.name || "tool", payload || "");
-      }
+    // Force-Finalizer, wenn:
+    // - postToolFinalize=true UND
+    //   (es gab Tool-Outputs ODER
+    //    der letzte User "continue" war und es bereits anchored Parts gibt)
+    const lastUser = getLastUserText(context.messages).toLowerCase();
+    const forceFinalizeOnContinue = (lastUser === "continue" || lastUser === "weiter" || lastUser === "fortsetzen") && hasAnchoredParts(context.messages);
 
-      // 2) Finalizer mit Continue-Schleife (nur System + User; keine Tool-Calls)
-      const finalizerSystem = buildFinalizerSystemPrompt();
-      const configuredRaw =
-        (options?.endpoint || "").trim() ||
-        (process.env.OPENAI_API_URL || "").trim() ||
-        (OPENAI_API_URL || "").trim();
-      const endpoint = normalizeEndpoint(configuredRaw) || "https://api.openai.com/v1/chat/completions";
-      const headers = {
-        "Content-Type": "application/json",
-        "Connection": "keep-alive",
-      };
-      const authKey = apiKey || process.env.OPENAI_API_KEY;
-      if (authKey) headers.Authorization = `Bearer ${authKey}`;
-
-      let finalizerRounds = 0;
-      let finalizerCollected = "";
-      let continueFinalize = true;
-      let firstPrompt = true;
-
-      while (continueFinalize && finalizerRounds < FINALIZER_MAX_ROUNDS) {
-        finalizerRounds += 1;
-
-        const userPrompt = firstPrompt
-          ? (getLastUserText(context.messages) || "Finalize the answer now based on the provided parts.")
-          : "continue";
-
-        const finalizeMessages = [
-          ...buildStrictToolPairedMessages(context.messages),
-          { role: "system", content: finalizerSystem },
-          { role: "user", content: userPrompt }
-        ];
-
-        const finalizePayload = {
-          model,
-          messages: finalizeMessages,
-          max_tokens: tokenlimit
-        };
-
-        dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, round: finalizerRounds, userPrompt });
-
-        let finalRes, finalChoice;
-        try {
-          finalRes = await postWithRetry(endpoint, finalizePayload, headers, 3);
-          finalChoice = finalRes?.data?.choices?.[0] || {};
-        } catch (finalErr) {
-          await reportError(finalErr, null, "OPENAI_FINALIZE", null);
-          dbg("Finalize error:", finalErr?.message || String(finalErr));
-          break;
-        }
-
-        const finalText = (finalChoice?.message?.content || "").trim();
-        const finalFinish = String(finalChoice?.finish_reason || "").toLowerCase();
-
-        if (finalText) {
-          finalizerCollected += (finalizerCollected ? "\n\n" : "") + finalText;
-          // damit der nächste Continue-Call Kontext hat:
-          context.messages.push({ role: "assistant", content: finalText });
-        }
-
-        if (FINALIZER_CONTINUE_ON_LENGTH && finalFinish === "length") {
-          // weiterholen
-          context.messages.push({ role: "user", content: "continue" });
-          firstPrompt = false;
-          continueFinalize = true;
-        } else {
-          continueFinalize = false;
+    if (postToolFinalize && (toolResults.length > 0 || forceFinalizeOnContinue) && !shouldSkipFinalizeForUrlOnly) {
+      // 1) Tool-Outputs als Assistant-Parts injizieren (nur wenn frisch vorhanden)
+      if (toolResults.length > 0) {
+        for (const tr of toolResults) {
+          let payload = tr.raw;
+          if (payload != null && typeof payload !== "string") {
+            try { payload = JSON.stringify(payload, null, 2); } catch { payload = String(payload); }
+          }
+          injectToolOutputAsAssistantParts(context, tr.name || "tool", payload || "");
         }
       }
 
-      if (finalizerCollected.trim()) {
-        responseMessage = finalizerCollected.trim();
+      // 2) Finalizer mit interner Continue-Schleife
+      try {
+        const finalCombined = await runFinalizeWithContinue(context, tokenlimit, model, apiKey, options);
+        if (finalCombined) responseMessage = finalCombined;
+      } catch (finalErr) {
+        await reportError(finalErr, null, "OPENAI_FINALIZE", null);
+        dbg("Finalize error:", finalErr?.message || String(finalErr));
       }
     }
 
