@@ -347,7 +347,7 @@ function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars =
 }
 
 /* ---- Finalizer Continue: ENV-Schalter ---- */
-const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 12));
+const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 20));
 const FINALIZER_CONTINUE_ON_LENGTH = String(process.env.FINALIZER_CONTINUE_ON_LENGTH || "1") === "1";
 
 /* -------------------- Main -------------------- */
