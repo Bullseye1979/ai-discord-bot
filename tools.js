@@ -1,9 +1,9 @@
-// tools.js — smart history v2.2 (zentral robuste Normalisierung + YouTube-Search)
+// tools.js — smart history v2.3 (getHistory supports frames[])
 // - findTimeframes: Keywords -> list of {start,end} windows (channel-scoped), no summarization
-// - getHistory: timeframe-only summarization (no chunking, single LLM pass; full history if no start/end)
-// - getYoutube: Transcript-QA + (neu) Metadaten (Titel, Kanal, Datum)
-// - getYoutubeSearch: Themenbasierte YouTube-Suche (YouTube Data API v3)
-// - getToolRegistry() akzeptiert Strings oder Objekt-Items (name / function.name / id)
+// - getHistory: timeframe summarization; accepts EITHER frames[] OR single start/end (or full history)
+// - getYoutube: Transcript-QA + metadata
+// - getYoutubeSearch: Topic-based YouTube search
+// - getToolRegistry() accepts strings or objects (name / function.name / id)
 
 const { getWebpage } = require("./webpage.js");
 const { getImage, getImageSD } = require("./image.js");
@@ -12,7 +12,7 @@ const { getYoutube, getYoutubeSearch } = require("./youtube.js");
 const { getImageDescription } = require("./vision.js");
 const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
-const { findTimeframes, getHistory } = require("./history.js"); // ⬅︎ neu
+const { findTimeframes, getHistory } = require("./history.js");
 const { reportError } = require("./error.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
@@ -157,7 +157,7 @@ const tools = [
       description:
         "Find relevant timeframes in THIS Discord channel by AND-matching the provided keywords on message content, " +
         "then expanding each hit to a window of ±N rows (same channel). Returns JSON with merged {start,end} ISO timestamps for each timeframe. " +
-        "Use this to locate episodes (e.g., an arc with 'murphy'), then call getHistory with one of the returned timeframes.",
+        "Use this to locate episodes (e.g., an arc with 'murphy'), then call getHistory with one or multiple returned timeframes.",
       parameters: {
         type: "object",
         properties: {
@@ -181,15 +181,28 @@ const tools = [
     function: {
       name: "getHistory",
       description:
-        "Summarize THIS Discord channel over a TIMEFRAME using a single LLM pass (no chunking). " +
+        "Summarize THIS Discord channel over one or MULTIPLE timeframes using a single LLM pass (no chunking). " +
         "Provide a 'user_prompt' that states exactly what to produce. " +
-        "If no start/end are provided, the FULL channel history is used — be sure your prompt is precise.",
+        "Prefer 'frames' from findTimeframes; alternatively provide a single 'start'/'end'. " +
+        "If neither frames nor start/end are provided, the FULL channel history is used (be precise!).",
       parameters: {
         type: "object",
         properties: {
           user_prompt: { type: "string", description: "Exact natural-language instruction for the summarization (required)." },
-          start: { type: "string", description: "ISO timestamp (inclusive) — optional." },
-          end: { type: "string", description: "ISO timestamp (inclusive) — optional." },
+          frames: {
+            type: "array",
+            description: "List of timeframes with ISO timestamps (use output from findTimeframes).",
+            items: {
+              type: "object",
+              properties: {
+                start: { type: "string", description: "ISO timestamp (inclusive)" },
+                end:   { type: "string", description: "ISO timestamp (inclusive)" }
+              },
+              required: ["start", "end"]
+            }
+          },
+          start: { type: "string", description: "ISO timestamp (inclusive) — optional if frames[] provided." },
+          end: { type: "string", description: "ISO timestamp (inclusive) — optional if frames[] provided." },
           model: { type: "string", description: "Optional model override (default gpt-4.1 via aiService.js)." },
           max_tokens: { type: "number", description: "Optional max output tokens (default from aiService.js)." },
           channel_id: { type: "string", description: "Channel ID (injected by runtime if omitted)." }
@@ -221,7 +234,7 @@ const tools = [
     }
   },
 
-  // ==== getPDF (unverändert) ================================================
+  // ==== getPDF (unchanged) ===================================================
   {
     type: "function",
     function: {
@@ -267,13 +280,13 @@ const fullToolRegistry = {
   getImage,
   getGoogle,
   getYoutube,
-  getYoutubeSearch, // ⬅︎ neu
+  getYoutubeSearch,
   getImageDescription,
   getLocation,
   getPDF,
   getImageSD,
-  findTimeframes, // ⬅︎ neu
-  getHistory      // ⬅︎ neu (timeframe summarization)
+  findTimeframes,
+  getHistory
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
@@ -292,12 +305,11 @@ function normalizeToolName(name) {
   return hit || raw;
 }
 
-/** Robust: akzeptiert Strings oder Objekte und extrahiert den gewünschten Namen. */
+/** Robust: accepts strings or objects and extracts the desired name. */
 function extractToolName(item) {
   try {
     if (typeof item === "string") return item.trim();
     if (item && typeof item === "object") {
-      // häufige Felder: name, id, function.name
       const n =
         item.name ||
         (item.function && item.function.name) ||
@@ -319,12 +331,12 @@ function getToolRegistry(toolNames = []) {
       return { tools: [], registry: {} };
     }
 
-    // 1) Zentrale Normalisierung: Strings/Objekte → String-Namen
+    // 1) Normalize inputs: strings/objects → names
     const normalizedRequested = toolNames
       .map(extractToolName)
       .filter(Boolean);
 
-    // 2) Canonical-Name, Reihenfolge beibehalten, Deduplizierung
+    // 2) Canonical names, keep order, dedupe
     const seen = new Set();
     const wanted = normalizedRequested
       .map((n) => normalizeToolName(n))
@@ -336,20 +348,20 @@ function getToolRegistry(toolNames = []) {
         return true;
       });
 
-    // 3) Warnung für Unbekannte
+    // 3) Warn unknown
     for (const name of wanted) {
       if (!fullToolRegistry[name]) {
         reportError(new Error(`Unknown tool '${name}'`), null, "GET_TOOL_REGISTRY_UNKNOWN", "WARN");
       }
     }
 
-    // 4) Filter auf bekannte Tools
+    // 4) Filter to known tools
     const availableNames = wanted.filter((n) => !!fullToolRegistry[n]);
 
-    // 5) OpenAI-Tool-Specs nach Namen filtern
+    // 5) OpenAI tool specs filtered by name
     const filteredTools = tools.filter((t) => availableNames.includes(t.function.name));
 
-    // 6) Callable-Registry bauen
+    // 6) Callable registry
     const registry = {};
     for (const name of availableNames) {
       registry[name] = fullToolRegistry[name];

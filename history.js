@@ -1,10 +1,11 @@
-// history.js — smart v5.0
+// history.js — smart v5.1 (multi-frame support)
 // - findTimeframes(keywords[], window=30): AND-match on content, expand ±window rows per hit, merge overlaps, return JSON windows [{start,end}].
-// - getHistory({start?,end?,user_prompt,model?,max_tokens?}): Load ALL rows for channel in timeframe (or full channel if none),
-//   build one big digest (no chunking), single LLM pass with user_prompt. No LIMIT. Very verbose logging.
-//
+// - getHistory({frames?=[{start,end}], start?, end?, user_prompt, model?, max_tokens?}):
+//   * If frames[] given -> loop frames (already normalized/merged by findTimeframes), load rows per frame (NO LIMIT), concat.
+//   * Else fall back to single start/end or FULL channel if neither is provided.
+//   * Build one big digest (no chunking) and run a single LLM pass.
 // Notes:
-// * This relies on sufficiently high OpenAI timeout in aiService.js (OPENAI_TIMEOUT_MS). Set e.g. 180000 or 240000.
+// * Ensure high enough OpenAI timeout in aiService.js (e.g., OPENAI_TIMEOUT_MS=180000).
 // * Queries are scoped to the channel_id resolved from ctx/runtime/args.
 
 const mysql = require("mysql2/promise");
@@ -67,19 +68,6 @@ function rowsToText(rows) {
       return `[${ts}] ${prefix}: ${content}`;
     })
     .join("\n");
-}
-
-function dedupRows(rows) {
-  const seen = new Set();
-  const out = [];
-  for (const r of rows || []) {
-    const key = `${r.id}::${r.timestamp}::${r.role || ""}::${r.sender || ""}::${r.content || ""}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(r);
-    }
-  }
-  return out;
 }
 
 /** Merge overlapping [{start,end}] intervals (ISO strings). */
@@ -178,7 +166,7 @@ async function findTimeframes(toolFunction, ctxOrUndefined, _getAIResponse, runt
   }
 }
 
-/* ----------------------------- getHistory (timeframe summarization) ----------------------------- */
+/* ----------------------------- getHistory (single or multiple timeframes) ----------------------------- */
 
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   const reqId = Math.random().toString(36).slice(2, 8);
@@ -187,46 +175,106 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       ? JSON.parse(toolFunction.arguments || "{}")
       : (toolFunction.arguments || {});
     const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
+
+    // New: accept frames[]; fall back to single start/end
+    const frames = Array.isArray(args.frames) ? args.frames : [];
     const start = args.start ? String(args.start).trim() : null;
     const end = args.end ? String(args.end).trim() : null;
+
     const userPrompt = String(args.user_prompt || "").trim();
     const model = String(args.model || process.env.TIMEFRAME_MODEL || "gpt-4.1");
     const maxTokens = Number.isFinite(Number(args.max_tokens))
       ? Math.max(256, Math.floor(Number(args.max_tokens)))
       : Math.max(256, Math.floor(Number(process.env.TIMEFRAME_TOKENS || 1400)));
 
-    console.log(`[history][getHistory#${reqId}:args]`, JSON.stringify({ channelId, start, end, userPromptLen: userPrompt.length, model, maxTokens }, null, 2));
+    console.log(
+      `[history][getHistory#${reqId}:args]`,
+      JSON.stringify({
+        channelId,
+        framesCount: frames.length,
+        start,
+        end,
+        userPromptLen: userPrompt.length,
+        model,
+        maxTokens
+      }, null, 2)
+    );
 
     if (!channelId) return "ERROR: channel_id missing";
     if (!userPrompt) return "ERROR: user_prompt is required";
 
     const db = await getPool();
 
-    // Build SQL (NO LIMIT), channel-scoped, ORDER BY id ASC for stability
-    const where = ["channel_id = ?"];
-    const vals = [channelId];
-    if (start) { where.push("timestamp >= ?"); vals.push(start); }
-    if (end)   { where.push("timestamp <= ?"); vals.push(end); }
+    let rows = [];
 
-    const sql =
-      `SELECT id, timestamp, role, sender, content
-         FROM context_log
-        WHERE ${where.join(" AND ")}
-     ORDER BY id ASC`;
-    console.log(`[history][getHistory#${reqId}:sql]`, JSON.stringify({ sql, values: vals }, null, 2));
+    if (frames.length > 0) {
+      // Assume frames already normalized/merged/sorted by findTimeframes
+      for (const f of frames) {
+        if (!f || !f.start || !f.end) continue;
+        const where = ["channel_id = ?", "timestamp >= ?", "timestamp <= ?"];
+        const vals = [channelId, f.start, f.end];
 
-    const t0 = Date.now();
-    const [rows] = await db.execute(sql, vals);
-    const dur = `${Date.now() - t0}ms`;
+        const sql =
+          `SELECT id, timestamp, role, sender, content
+             FROM context_log
+            WHERE ${where.join(" AND ")}
+         ORDER BY id ASC`;
 
-    console.log(`[history][getHistory#${reqId}:res]`, JSON.stringify({
-      rowCount: rows.length,
-      dur,
-      firstRow: rows[0] ? { id: rows[0].id, ts: rows[0].timestamp, role: rows[0].role, sender: rows[0].sender } : null,
-      lastRow: rows.length ? { id: rows[rows.length - 1].id, ts: rows[rows.length - 1].timestamp, role: rows[rows.length - 1].role, sender: rows[rows.length - 1].sender } : null
-    }, null, 2));
+        console.log(`[history][getHistory#${reqId}:frameSQL]`, JSON.stringify({ sql, values: vals }, null, 2));
+
+        // eslint-disable-next-line no-await-in-loop
+        const t0 = Date.now();
+        // eslint-disable-next-line no-await-in-loop
+        const [part] = await db.execute(sql, vals);
+        const dur = `${Date.now() - t0}ms`;
+
+        console.log(
+          `[history][getHistory#${reqId}:frameRES]`,
+          JSON.stringify({
+            frame: f,
+            rowCount: part.length,
+            dur
+          }, null, 2)
+        );
+
+        rows = rows.concat(part || []);
+      }
+    } else {
+      // Single timeframe (or full history)
+      const where = ["channel_id = ?"];
+      const vals = [channelId];
+      if (start) { where.push("timestamp >= ?"); vals.push(start); }
+      if (end)   { where.push("timestamp <= ?"); vals.push(end); }
+
+      const sql =
+        `SELECT id, timestamp, role, sender, content
+           FROM context_log
+          WHERE ${where.join(" AND ")}
+       ORDER BY id ASC`;
+
+      console.log(`[history][getHistory#${reqId}:sql]`, JSON.stringify({ sql, values: vals }, null, 2));
+
+      const t0 = Date.now();
+      const [all] = await db.execute(sql, vals);
+      const dur = `${Date.now() - t0}ms`;
+
+      console.log(
+        `[history][getHistory#${reqId}:res]`,
+        JSON.stringify({
+          rowCount: all.length,
+          dur,
+          firstRow: all[0] ? { id: all[0].id, ts: all[0].timestamp, role: all[0].role, sender: all[0].sender } : null,
+          lastRow: all.length ? { id: all[all.length - 1].id, ts: all[all.length - 1].timestamp, role: all[all.length - 1].role, sender: all[all.length - 1].sender } : null
+        }, null, 2)
+      );
+
+      rows = all || [];
+    }
 
     if (!rows.length) return "No data in timeframe / history.";
+
+    // Optional safety: stable sort by id ASC (frames should be disjoint already)
+    rows.sort((a, b) => (a.id || 0) - (b.id || 0));
 
     // Build one big digest (NO chunking)
     const digest = rowsToText(rows);
@@ -237,7 +285,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     await ctx.add("system", "history_timeframe",
       [
-        "You are given the chat logs from a single Discord channel for a specific timeframe (or full history).",
+        "You are given the chat logs from a single Discord channel for one or multiple timeframes (merged already by the caller).",
         "Follow the user instruction precisely. Keep factual details, decisions, tasks (owner & deadline), questions, numbers, URLs/IDs, code refs, and errors.",
         "Preserve chronology when relevant. If information is insufficient, say so briefly.",
         "Respond in the user's language; prefer English if unsure."
@@ -247,7 +295,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     await ctx.add("user", "logs", digest);
 
     const out = await getAI(ctx, maxTokens, model);
-    const result = (out || "").trim() || "No asnwer possible.";
+    const result = (out || "").trim() || "No answer possible.";
     console.log(`[history][getHistory#${reqId}:done]`, JSON.stringify({ outLen: result.length }, null, 2));
     return result;
   } catch (err) {
