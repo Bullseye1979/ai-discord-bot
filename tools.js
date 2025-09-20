@@ -156,7 +156,8 @@ const tools = [
       name: "findTimeframes",
       description:
         "Find relevant timeframes in THIS Discord channel by AND-matching the provided keywords on message content, " +
-        "ONLY USE THIS, WHEN THE TIMEFRAME IS NOT YET KNOWN,"+
+        "DO NOT USE THIS, WHEN THE TIMEFRAME ALREADY KNOWN,"+
+        "DO NOT USE THIS, WHEN THE TIME OR DATE ON WHICH TO SEARCH IS SPECIFIED,"+
         "then expanding each hit to a window of ±N rows (same channel). Returns JSON with merged {start,end} ISO timestamps for each timeframe. " +
         "Use this to locate episodes (e.g., an arc with 'murphy'), then call getHistory with one or multiple returned timeframes.",
       parameters: {
@@ -184,6 +185,7 @@ const tools = [
       description:
         "Summarize THIS Discord channel over one or MULTIPLE timeframes using a single LLM pass (no chunking). " +
         "Provide a 'user_prompt' that states exactly what to produce. " +
+        "USE THIS WITHOUT findTimeframes WHEN THE TIMEFRAME IS ALREADY KNOWN,"+
         "Prefer 'frames' from findTimeframes; alternatively provide a single 'start'/'end'. " +
         "If neither frames nor start/end are provided, the FULL channel history is used (be precise!).",
       parameters: {
