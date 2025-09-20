@@ -487,7 +487,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
   }
 }
 
-/** Reply via webhook as embeds (mit Avatar-Update und Versioning) */
+/** Reply via webhook as embeds (mit Avatar-Update, Budget-Guard und Multi-Message 10er-Batches) */
 async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
   const { botname, color, model } = options || {};
   try {
@@ -501,10 +501,11 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
-    let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
+    const authorName = botname || meta?.botname || "AI";
+    let hook = hooks.find((w) => w.name === authorName);
     if (!hook) {
       hook = await hookChannel.createWebhook({
-        name: botname || meta?.botname || "AI",
+        name: authorName,
         avatar: personaAvatarUrl || undefined
       });
     } else {
@@ -536,13 +537,31 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
         }).join("\n")
       : "";
 
+    // ====== Limits & Budgets ======
+    // Discord hard limits (per Embed):
+    // - total (title + description + fields + footer + author): <= 6000
+    // - description: <= 4096
+    const MAX_EMBED_TOTAL = 6000;
+    const MAX_DESC_HARD = 4096;
+
     const themeColor = Number.isInteger(color) ? color : 0x5865F2;
-    const MAX_EMBED = 4096;
+
+    const baseName = meta?.name ? `${meta.name}` : authorName;
+    const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
+    const footerText = `${baseName}${modelPart}`;
+
+    // konservativer Overhead (Author/Name/Avatar + Footer + Timestamp + JSON-Overhead)
+    const fixedOverhead =
+      (footerText?.length || 0) +
+      (authorName?.length || 0) +
+      50;
+
+    // dynamisches, sicheres Description-Budget
+    const MAX_DESC_SAFE = Math.max(500, Math.min(MAX_DESC_HARD, MAX_EMBED_TOTAL - fixedOverhead));
 
     const fullDesc = (bodyText + bulletsBlock).trim();
-    const descChunks = [];
-    let remaining = fullDesc;
 
+    // smarter Slicer, der an Absätzen/Zeilen/Spaces trennt
     const smartSlice = (s, limit) => {
       if (s.length <= limit) return s;
       const cut1 = s.lastIndexOf("\n\n", limit);
@@ -552,35 +571,34 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       return s.slice(0, cut).trim();
     };
 
+    // Description in Embeds splitten
+    const descChunks = [];
+    let remaining = fullDesc;
     while (remaining.length > 0) {
-      const part = smartSlice(remaining, MAX_EMBED);
+      const part = smartSlice(remaining, MAX_DESC_SAFE);
       descChunks.push(part);
       remaining = remaining.slice(part.length).trimStart();
       if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    const makeEmbed = (desc) => {
-      const baseName = meta?.name ? `${meta.name}` : (botname || meta?.botname || "AI");
-      const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
-      const footerText = `${baseName}${modelPart}`; // ⬅️ kein manueller Timestamp mehr
+    // Embed-Factory (mit Part-Header bei mehreren Embeds)
+    const makeEmbed = (desc, idx, total) => ({
+      color: themeColor,
+      author: { name: authorName, icon_url: personaAvatarUrl || undefined },
+      description: total > 1 ? `**Part ${idx + 1}/${total}**\n\n${desc}` : desc,
+      timestamp: new Date().toISOString(),
+      footer: { text: footerText }
+    });
 
-      return {
-        color: themeColor,
-        author: { name: botname || meta?.botname || "AI", icon_url: personaAvatarUrl || undefined },
-        description: desc,
-        timestamp: new Date().toISOString(), // Discord zeigt seinen eigenen, lokalisierten Timestamp
-        footer: { text: footerText }
-      };
-    };
-
-    const embeds = descChunks.map((d) => makeEmbed(d));
+    const embeds = descChunks.map((d, i) => makeEmbed(d, i, descChunks.length));
     if (firstImage?.url && embeds.length) embeds[0].image = { url: firstImage.url };
 
+    // In 10er-Batches senden (Discord-API-Limit pro Nachricht), beliebig viele Nachrichten hintereinander
     for (let i = 0; i < embeds.length; i += 10) {
       const slice = embeds.slice(i, i + 10);
       await hook.send({
-        content: "",
-        username: botname || meta?.botname || "AI",
+        content: "", // nur Embeds
+        username: authorName,
         avatarURL: personaAvatarUrl || undefined,
         embeds: slice,
         allowedMentions: { parse: [] },
@@ -589,6 +607,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     }
   } catch (err) {
     await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED");
+    // Fallback: Plain-Text-Chunking (2000er Blöcke)
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
