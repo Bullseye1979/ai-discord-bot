@@ -1,10 +1,8 @@
-// aiCore.js — unified flow v2.37 (Tool-Chaining + Finalizer, no link parsing)
+// aiCore.js — unified flow v2.37 (Tool-Chaining + Finalizer, no link parsing, NO_DB_PERSIST)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
 //   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
-// - [TOOL_RESULT:*]/[TOOL_OUTPUT:*] werden vor jedem Modell-Call aus der History gefiltert
-// - Schema VERBIETET explizit [TOOL_RESULT:*]; NEGATIVE Beispiele hinzugefügt
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
 // - Sonderfall (früher): Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)  => ***ENTFERNT***
 // - Kein Fabricate, kein Auto-Prompt-Fill
@@ -15,9 +13,12 @@
 //
 // v2.37 changes (FOCUS: kein Kontextverlust):
 // - NEU: injectToolOutputAsAssistantParts(ctx, toolName, rawPayload[, partSize]) – injiziert lange Tool-Outputs als normale Assistant-Parts (Chunking)
-//   => NICHT von stripPersistedWrappers erfasst, bleiben vollständig im Verlauf.
+//   => bleiben vollständig im Verlauf (RAM).
 // - Finalizer nutzt die oberhalb eingespeisten Parts direkt (keine 2k-Char-Summary mehr).
 // - Continue-Logik unverändert; profitiert davon, dass vorherige Teile im Verlauf stehen.
+//
+// NO_DB_PERSIST:
+// - Tool-Ergebnisse werden NICHT mehr in die Datenbank/History geschrieben (keine [TOOL_RESULT:*]-Einträge, kein context_orig.add).
 
 require("dotenv").config();
 const axios = require("axios");
@@ -148,39 +149,6 @@ function buildStrictToolPairedMessages(msgs) {
   return out;
 }
 
-/** Persist Tool Results */
-const TOOL_PERSIST_ROLE =
-  (process.env.TOOL_PERSIST_ROLE || "assistant").toLowerCase() === "system" ? "system" : "assistant";
-
-const MAX_TOOL_PERSIST_CHARS = Math.max(500, Math.min(10000, Number(process.env.TOOL_PERSIST_MAX || 8000)));
-
-function formatToolResultForPersistence(toolName, content) {
-  const header = `[TOOL_RESULT:${(toolName || "unknown").trim()}]`;
-  let payloadStr;
-  if (typeof content === "string") payloadStr = content;
-  else { try { payloadStr = JSON.stringify(content); } catch { payloadStr = String(content); } }
-  const looksJSON = /^\s*[\[{]/.test((payloadStr || "").trim());
-  let body = looksJSON ? `${header}\n${payloadStr}` : `${header}\n\`\`\`\n${payloadStr}\n\`\`\``;
-  if (body.length > MAX_TOOL_PERSIST_CHARS) {
-    const tail = "\n…[truncated]";
-    body = body.slice(0, MAX_TOOL_PERSIST_CHARS - tail.length) + tail;
-  }
-  return body;
-}
-
-/** Entfernt persistierte Wrapper ([TOOL_RESULT:*], [TOOL_OUTPUT:*]) aus der Historie */
-function stripPersistedWrappers(msgs) {
-  const reWrap = /^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:[^\]]+\]/i;
-  return (msgs || []).filter(m => {
-    if (!m || typeof m.content !== "string") return true;
-    const c = m.content.trim();
-    if (m.role === "assistant" || m.role === "system") {
-      if (reWrap.test(c)) return false;
-    }
-    return true;
-  });
-}
-
 /* ---- Pseudo-Tools: Definition + Parser ---- */
 
 function buildPseudoToolsInstruction(tools) {
@@ -242,12 +210,11 @@ function buildPseudoToolsInstruction(tools) {
     "- Stick exactly to the example.",
     "- The <tool_call> and </tool_call> tags are mandatory.",
     "- JSON must be valid.",
-    "- NEVER output [TOOL_RESULT:…], [TOOL_OUTPUT:…], \"Tool result:\", or similar markers.",
+    "- NEVER output “Tool result: …”, [TOOL_RESULT:*] oder [TOOL_OUTPUT:*].",
     "- Ignore previous attempts or pseudo tool-call drafts.",
     "- If you cannot call a tool, return NOTHING.",
     "",
     "INVALID examples (do NOT do this):",
-    "[TOOL_RESULT:getGoogle]\\n{ \"query\": \"example\" }",
     "Tool result: { \"url\": \"https://…\" }",
     '{ "name": "getImageSD", "arguments": {  "prompt": "elephant",  "user_id": "" } }',
     "",
@@ -275,7 +242,7 @@ function buildPseudoToolsInstruction(tools) {
   return text;
 }
 
-/** toleranter Pseudo-Call-Extractor (ignoriert TOOL_RESULT/OUTPUT) */
+/** toleranter Pseudo-Call-Extractor (ignoriert Wrapper) */
 function extractPseudoToolCalls(text) {
   if (!text || typeof text !== "string") return [];
   const trimmed = text.trim();
@@ -316,11 +283,6 @@ function prettyClipJSON(any, max = 1800) {
   return s;
 }
 
-/**
- * NEU (v2.36): Keine Link-/URL-Erkennung, keine Ergebnislistenbildung.
- * - Strings: 1:1 zurück (getrimmt).
- * - Objekte/Arrays: JSON-pretty (geclippt).
- */
 function renderToolOutputGeneric(_name, raw) {
   if (raw == null) return "";
   if (typeof raw === "string") return raw.trim();
@@ -335,7 +297,7 @@ function buildFinalizerSystemPrompt() {
     "- You will receive tool outputs.",
     "- Write a concise, helpful answer for the user.",
     "- DO NOT call any tools. DO NOT produce pseudo tool-calls or <tool_call> blocks.",
-    "- DO NOT include [TOOL_RESULT:*] or similar markers.",
+    "- DO NOT include special wrappers.",
     "- If you reference links, include them plainly in text.",
     "- Be correct, avoid speculation, do not invent results.",
   ].join("\n");
@@ -364,14 +326,8 @@ function splitIntoParts(s, max = DEFAULT_PART_CHARS) {
 }
 
 /**
- * Injiziere lange Tool-Outputs als *normale* Assistant-Messages (kein [TOOL_RESULT:*] Wrapper!)
- * -> Dadurch greift stripPersistedWrappers NICHT, und der Inhalt bleibt für Finalizer/Continue sichtbar.
- *
- * @param {object} ctx - dein Chat-Kontext (mit ctx.messages.push({role,content}))
- * @param {string} toolName - z.B. "getHistory"
- * @param {any}    rawPayload - String oder Objekt
- * @param {number} [partChars] - Zeichenlimit pro Part
- * @returns {{anchor: string, parts: number}}
+ * Injiziere lange Tool-Outputs als *normale* Assistant-Messages (kein Wrapper).
+ * -> Bleiben im RAM-Kontext sichtbar für Finalizer/Continue.
  */
 function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars = DEFAULT_PART_CHARS) {
   const anchor = `${toolName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -385,7 +341,6 @@ function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars =
     const tail = i < chunks.length - 1 ? "\n[...]" : "\n— END —";
     ctx.messages.push({
       role: "assistant",
-      // kein [TOOL_RESULT:*] am Zeilenanfang, damit stripPersistedWrappers NICHT greift
       content: `${head}\n${chunks[i]}${tail}`
     });
   }
@@ -469,7 +424,6 @@ async function getAIResponse(
       handoverContext.messages.push({ ...msg });
     }
 
-    const toolCommits = [];
     const toolResults = []; // { name, raw }[]
     let lastRawAssistant = "";
 
@@ -480,8 +434,16 @@ async function getAIResponse(
     while (continueLoop && rounds < Math.max(1, sequenceLimit)) {
       rounds += 1;
 
-      // 1) Persistierte Tool-Wrapper aus der History entfernen
-      const cleanedHistory = stripPersistedWrappers(context.messages);
+      // 1) (Legacy) Entfernen wir evtl. alte Wrapper aus der History, falls vorhanden
+      const cleanedHistory = (context.messages || []).filter(m => {
+        if (!m || typeof m.content !== "string") return true;
+        const c = m.content.trim();
+        // Früher wurden [TOOL_RESULT:*]/[TOOL_OUTPUT:*] persistiert; falls noch im RAM, nicht mitsenden
+        if (m.role === "assistant" || m.role === "system") {
+          if (/^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:[^\]]+\]/i.test(c)) return false;
+        }
+        return true;
+      });
 
       // 2) Payload aufbauen
       const messagesToSend = buildStrictToolPairedMessages(cleanedHistory).map(m => {
@@ -622,19 +584,14 @@ async function getAIResponse(
               ? (content || "")
               : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
 
-            // tool-Message für Pairing
+            // tool-Message für Pairing (RAM-Kontext)
             context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
 
-            // Persist (TOOL_RESULT)
-            const wrapped = formatToolResultForPersistence(fnName || "tool", out);
-            const persistName = TOOL_PERSIST_ROLE === "assistant" ? "ai" : undefined;
-            try { context_orig.add(TOOL_PERSIST_ROLE, persistName, wrapped, Date.now()); } catch {}
+            // KEINE DB-Persistierung mehr!
+            // (Früher: wrapped = formatToolResultForPersistence(...); context_orig.add(...))
 
-            // Für finale Ausgabe sammeln
+            // Für Finalizer sammeln (RAM)
             toolResults.push({ name: fnName || "tool", raw: out });
-
-            // Logging
-            toolCommits.push({ name: fnName || "tool", content: out });
           };
 
           if (!toolFunction) {
@@ -667,9 +624,7 @@ async function getAIResponse(
         if (hadToolCallsThisTurn) {
           continueLoop = true; // noch mal Modell fragen, jetzt mit tool-Antworten in der History
         } else if (finishReason === "length" && rounds < sequenceLimit) {
-          // Continue-Logik: falls Text durchgelaufen ist
           if (rawText) {
-            // optional: den Text in den Verlauf legen (damit er nicht verloren geht)
             context.messages.push({ role: "assistant", content: rawText });
           }
           context.messages.push({ role: "user", content: "continue" });
@@ -693,7 +648,6 @@ async function getAIResponse(
       }
     }
 
-    // Standardantwort, falls kein Finalizer:
     if (rendered.length > 0) {
       responseMessage = rendered.join("\n\n").trim();
     } else {
@@ -707,11 +661,10 @@ async function getAIResponse(
 
     /* ----- Finalisierungsturn (v2.37: mit verlustfreier Part-Injektion) ----- */
 
-    // v2.36: kein Skip-Finalize mehr für single URL
     const shouldSkipFinalizeForUrlOnly = false;
 
     if (postToolFinalize && toolResults.length > 0 && !shouldSkipFinalizeForUrlOnly) {
-      // 1) Alle Tool-Outputs *zusätzlich* als normale Assistant-Parts injizieren (ohne Wrapper), in den *aktuellen* Kontext.
+      // 1) Tool-Outputs als normale Assistant-Parts injizieren (RAM)
       for (const tr of toolResults) {
         let payload = tr.raw;
         if (payload != null && typeof payload !== "string") {
@@ -722,7 +675,7 @@ async function getAIResponse(
 
       // 2) Finalizer Nachrichten aufbauen (ohne 2k-Trunkierung)
       const finalizerSystem = buildFinalizerSystemPrompt();
-      const lastUserText = getLastUserText(stripPersistedWrappers(context.messages));
+      const lastUserText = getLastUserText(context.messages);
 
       const finalizeMessages = [
         { role: "system", content: finalizerSystem },
@@ -744,8 +697,7 @@ async function getAIResponse(
 
       const finalizePayload = {
         model,
-        // WICHTIG: Wir hängen die Finalizer-Messages HINTEN an den *bereits* injizierten Kontext an:
-        messages: buildStrictToolPairedMessages(stripPersistedWrappers(context.messages).concat(finalizeMessages)),
+        messages: buildStrictToolPairedMessages(context.messages.concat(finalizeMessages)),
         max_tokens: tokenlimit
       };
 
@@ -762,7 +714,6 @@ async function getAIResponse(
       }
     }
 
-    // Persist tool outputs (Schon pro Tool gemacht; hier kein Extra notwendig)
     return responseMessage;
   } catch (err) {
     const details = { status: err?.response?.status, data: err?.response?.data };
