@@ -1,10 +1,10 @@
-// aiCore.js — unified flow v2.37 (Tool-Chaining + Finalizer, no link parsing, NO_DB_PERSIST)
+// aiCore.js — unified flow v2.37+ (Tool-Chaining + Finalizer with Continue, no link parsing, NO_DB_PERSIST)
 // - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
 //   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
-// - Sonderfall (früher): Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)  => ***ENTFERNT***
+//   + NEU: Finalizer hat eigene Continue-Logik (finish_reason === "length") und holt weitere Chunks nach
 // - Kein Fabricate, kein Auto-Prompt-Fill
 //
 // v2.36 changes:
@@ -298,7 +298,6 @@ function buildFinalizerSystemPrompt() {
     "- Write a concise, helpful answer for the user.",
     "- DO NOT call any tools. DO NOT produce pseudo tool-calls or <tool_call> blocks.",
     "- DO NOT include special wrappers.",
-    "- If you reference links, include them plainly in text.",
     "- Be correct, avoid speculation, do not invent results.",
   ].join("\n");
 }
@@ -346,6 +345,10 @@ function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars =
   }
   return { anchor, parts: chunks.length };
 }
+
+/* ---- Finalizer Continue: ENV-Schalter ---- */
+const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 12));
+const FINALIZER_CONTINUE_ON_LENGTH = String(process.env.FINALIZER_CONTINUE_ON_LENGTH || "1") === "1";
 
 /* -------------------- Main -------------------- */
 
@@ -659,7 +662,7 @@ async function getAIResponse(
       else responseMessage = "";
     }
 
-    /* ----- Finalisierungsturn (v2.37: mit verlustfreier Part-Injektion) ----- */
+    /* ----- Finalisierungsturn (mit eigener Continue-Logik) ----- */
 
     const shouldSkipFinalizeForUrlOnly = false;
 
@@ -673,16 +676,8 @@ async function getAIResponse(
         injectToolOutputAsAssistantParts(context, tr.name || "tool", payload || "");
       }
 
-      // 2) Finalizer Nachrichten aufbauen (ohne 2k-Trunkierung)
+      // 2) Finalizer mit Continue-Schleife (nur System + User; keine Tool-Calls)
       const finalizerSystem = buildFinalizerSystemPrompt();
-      const lastUserText = getLastUserText(context.messages);
-
-      const finalizeMessages = [
-        { role: "system", content: finalizerSystem },
-        { role: "system", content: "Tool outputs were injected above as assistant messages (anchored parts). Use ONLY those as sources. If output is long, end with [...] and wait for 'continue'." },
-        { role: "user", content: lastUserText || "Finalize the answer now based on the provided parts." }
-      ];
-
       const configuredRaw =
         (options?.endpoint || "").trim() ||
         (process.env.OPENAI_API_URL || "").trim() ||
@@ -695,22 +690,63 @@ async function getAIResponse(
       const authKey = apiKey || process.env.OPENAI_API_KEY;
       if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
-      const finalizePayload = {
-        model,
-        messages: buildStrictToolPairedMessages(context.messages.concat(finalizeMessages)),
-        max_tokens: tokenlimit
-      };
+      let finalizerRounds = 0;
+      let finalizerCollected = "";
+      let continueFinalize = true;
+      let firstPrompt = true;
 
-      dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, tools_in_payload: false });
+      while (continueFinalize && finalizerRounds < FINALIZER_MAX_ROUNDS) {
+        finalizerRounds += 1;
 
-      try {
-        const finalRes = await postWithRetry(endpoint, finalizePayload, headers, 3);
-        const finalChoice = finalRes?.data?.choices?.[0] || {};
+        const userPrompt = firstPrompt
+          ? (getLastUserText(context.messages) || "Finalize the answer now based on the provided parts.")
+          : "continue";
+
+        const finalizeMessages = [
+          ...buildStrictToolPairedMessages(context.messages),
+          { role: "system", content: finalizerSystem },
+          { role: "user", content: userPrompt }
+        ];
+
+        const finalizePayload = {
+          model,
+          messages: finalizeMessages,
+          max_tokens: tokenlimit
+        };
+
+        dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, round: finalizerRounds, userPrompt });
+
+        let finalRes, finalChoice;
+        try {
+          finalRes = await postWithRetry(endpoint, finalizePayload, headers, 3);
+          finalChoice = finalRes?.data?.choices?.[0] || {};
+        } catch (finalErr) {
+          await reportError(finalErr, null, "OPENAI_FINALIZE", null);
+          dbg("Finalize error:", finalErr?.message || String(finalErr));
+          break;
+        }
+
         const finalText = (finalChoice?.message?.content || "").trim();
-        if (finalText) responseMessage = finalText;
-      } catch (finalErr) {
-        await reportError(finalErr, null, "OPENAI_FINALIZE", null);
-        dbg("Finalize error:", finalErr?.message || String(finalErr));
+        const finalFinish = String(finalChoice?.finish_reason || "").toLowerCase();
+
+        if (finalText) {
+          finalizerCollected += (finalizerCollected ? "\n\n" : "") + finalText;
+          // damit der nächste Continue-Call Kontext hat:
+          context.messages.push({ role: "assistant", content: finalText });
+        }
+
+        if (FINALIZER_CONTINUE_ON_LENGTH && finalFinish === "length") {
+          // weiterholen
+          context.messages.push({ role: "user", content: "continue" });
+          firstPrompt = false;
+          continueFinalize = true;
+        } else {
+          continueFinalize = false;
+        }
+      }
+
+      if (finalizerCollected.trim()) {
+        responseMessage = finalizerCollected.trim();
       }
     }
 
