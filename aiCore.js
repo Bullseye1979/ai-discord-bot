@@ -736,9 +736,21 @@ async function getAIResponse(
     // Force-Finalizer, wenn:
     // - postToolFinalize=true UND
     //   (es gab Tool-Outputs ODER
-    //    der letzte User "continue" war und es bereits anchored Parts gibt)
+    //    der letzte User "continue" war und es schon sichtbaren Finalizer-Text ODER Anchors gibt)
     const lastUser = getLastUserText(context.messages).toLowerCase();
-    const forceFinalizeOnContinue = (lastUser === "continue" || lastUser === "weiter" || lastUser === "fortsetzen") && hasAnchoredParts(context.messages);
+    const userWantsContinue = ["continue", "weiter", "fortsetzen"].includes(lastUser);
+
+    // Schon finalisierte Textteile (keine Tool-Wrapper) im Verlauf?
+    const hasAnyFinalizedText = (context.messages || []).some(
+      m => m.role === "assistant" &&
+           typeof m.content === "string" &&
+           m.content.trim() &&
+           !/^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:/.test(m.content)
+    );
+
+    // Änderung A: continue erzwingt Finalizer auch ohne Anchors, sofern Textteile existieren
+    const forceFinalizeOnContinue =
+      userWantsContinue && (hasAnchoredParts(context.messages) || hasAnyFinalizedText);
 
     if (postToolFinalize && (toolResults.length > 0 || forceFinalizeOnContinue) && !shouldSkipFinalizeForUrlOnly) {
       // 1) Tool-Outputs als Assistant-Parts injizieren (nur wenn frisch vorhanden)
