@@ -337,7 +337,7 @@ function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars =
 }
 
 /* ---- v2.38: Finalizer Continue-Engine ---- */
-const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 50));
+const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 200));
 const FINALIZER_CONTINUE_ON_LENGTH = String(process.env.FINALIZER_CONTINUE_ON_LENGTH || "1") === "1";
 
 /** Heuristik: Sind bereits anchored Parts vorhanden? */
