@@ -504,10 +504,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     const authorName = botname || meta?.botname || "AI";
     let hook = hooks.find((w) => w.name === authorName);
     if (!hook) {
-      hook = await hookChannel.createWebhook({
-        name: authorName,
-        avatar: personaAvatarUrl || undefined
-      });
+      hook = await hookChannel.createWebhook({ name: authorName, avatar: personaAvatarUrl || undefined });
     } else {
       try { await hook.edit({ avatar: personaAvatarUrl }); } catch {}
     }
@@ -538,26 +535,14 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       : "";
 
     // ====== Limits & Budgets ======
-    // Discord hard limits (per Embed):
-    // - total (title + description + fields + footer + author): <= 6000
-    // - description: <= 4096
-    const MAX_EMBED_TOTAL = 6000;
-    const MAX_DESC_HARD = 4096;
-
+    const DESC_HARD = 4096;      // Discord: description max chars
+    const TOTAL_HARD = 6000;     // Discord: embed total char budget (title+desc+fields+footer+author)
+    const HEADER_RESERVE = 32;   // Platz für "**Part X/Y**\n\n"
     const themeColor = Number.isInteger(color) ? color : 0x5865F2;
 
     const baseName = meta?.name ? `${meta.name}` : authorName;
     const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
     const footerText = `${baseName}${modelPart}`;
-
-    // konservativer Overhead (Author/Name/Avatar + Footer + Timestamp + JSON-Overhead)
-    const fixedOverhead =
-      (footerText?.length || 0) +
-      (authorName?.length || 0) +
-      50;
-
-    // dynamisches, sicheres Description-Budget
-    const MAX_DESC_SAFE = Math.max(500, Math.min(MAX_DESC_HARD, MAX_EMBED_TOTAL - fixedOverhead));
 
     const fullDesc = (bodyText + bulletsBlock).trim();
 
@@ -571,7 +556,9 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       return s.slice(0, cut).trim();
     };
 
-    // Description in Embeds splitten
+    // 1) Vorab in Stücke schneiden und dabei Headroom für den Header lassen
+    // (wir wissen die Gesamtanzahl erst nach dem Split, reservieren aber pauschal HEADER_RESERVE)
+    const MAX_DESC_SAFE = Math.max(500, DESC_HARD - HEADER_RESERVE);
     const descChunks = [];
     let remaining = fullDesc;
     while (remaining.length > 0) {
@@ -581,23 +568,50 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    // Embed-Factory (mit Part-Header bei mehreren Embeds)
-    const makeEmbed = (desc, idx, total) => ({
-      color: themeColor,
-      author: { name: authorName, icon_url: personaAvatarUrl || undefined },
-      description: total > 1 ? `**Part ${idx + 1}/${total}**\n\n${desc}` : desc,
-      timestamp: new Date().toISOString(),
-      footer: { text: footerText }
-    });
+    // 2) Embeds erzeugen, Header hinzufügen und HART clampen (4096) + Total-Budget wahren (6000)
+    const makeEmbed = (desc, idx, total) => {
+      const header = total > 1 ? `**Part ${idx + 1}/${total}**\n\n` : "";
+      let description = header + (desc || "");
+
+      // HARTE 4096-Grenze sichern (inkl. Header)
+      if (description.length > DESC_HARD) {
+        description = description.slice(0, DESC_HARD - 1) + "…";
+      }
+
+      // Total-Budget grob absichern (description + footer + author)
+      const approxTotal =
+        (description?.length || 0) +
+        (footerText?.length || 0) +
+        (authorName?.length || 0);
+
+      if (approxTotal > TOTAL_HARD) {
+        const over = approxTotal - TOTAL_HARD + 1;
+        if (over > 0 && description.length > over) {
+          description = description.slice(0, Math.max(0, description.length - over));
+          if (description.length > 0 && description.length < DESC_HARD) {
+            // hübsches Ellipsis, falls abgeschnitten
+            if (!description.endsWith("…")) description = description.slice(0, Math.max(0, description.length - 1)) + "…";
+          }
+        }
+      }
+
+      return {
+        color: themeColor,
+        author: { name: authorName, icon_url: personaAvatarUrl || undefined },
+        description,
+        timestamp: new Date().toISOString(),
+        footer: { text: footerText }
+      };
+    };
 
     const embeds = descChunks.map((d, i) => makeEmbed(d, i, descChunks.length));
     if (firstImage?.url && embeds.length) embeds[0].image = { url: firstImage.url };
 
-    // In 10er-Batches senden (Discord-API-Limit pro Nachricht), beliebig viele Nachrichten hintereinander
+    // 3) In 10er-Batches senden (Discord-Limit pro Nachricht), beliebig viele Nachrichten nacheinander
     for (let i = 0; i < embeds.length; i += 10) {
       const slice = embeds.slice(i, i + 10);
       await hook.send({
-        content: "", // nur Embeds
+        content: "",
         username: authorName,
         avatarURL: personaAvatarUrl || undefined,
         embeds: slice,
@@ -607,7 +621,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     }
   } catch (err) {
     await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED");
-    // Fallback: Plain-Text-Chunking (2000er Blöcke)
+    // Fallback: Plain-Text-Chunking (2000er Blöcke), falls Embeds aus irgendeinem Grund scheitern
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
