@@ -1,21 +1,28 @@
-// readyStatus.js — v1.4 (ready memory + cron + die roll)
-// - Remembers the last "Ready" text (default: "✅ Ready").
+// readyStatus.js — v2.0 (presence allowlist via channel JSON configs)
+// - Berücksichtigt NUR Channels, deren JSON-Config "presence": 1 enthält
+//   * Ordner per ENV konfigurierbar: CHANNEL_CONFIG_DIR (Default: ./channel-configs)
+//   * JSON-Datei-Formate je Channel, z.B.:
+//       { "channel_id": "123456789012345678", "presence": 1, ... }
+//     oder
+//       { "id": "123456789012345678", "presence": 1, ... }
 // - maybeUpdateReadyStatus(client):
-//     * Roll 1..X; on 1, generate a <= SOFTLEN one-liner from recent history,
-//       hard-cut at HARDLEN, set presence, and remember it.
-//     * On miss: do nothing (keep current ready text).
+//     * Würfel 1..X; bei 1: baut <= SOFTLEN One-Liner aus letzter History dieser erlaubten Channels
+//       (hart auf HARDLEN gekappt), setzt Presence und merkt sich den Text.
 // - startReadyStatusCron(client):
-//     * Runs every N minutes (READY_STATUS_CRON_MINUTES).
-//     * Skips if current presence contains the hourglass "⌛" (bot busy).
-//     * Otherwise calls maybeUpdateReadyStatus(client) — same die roll applies.
+//     * Läuft alle READY_STATUS_CRON_MINUTES Minuten.
+//     * Skipped, wenn aktuelle Presence die Sanduhr "⌛" enthält.
+// - Allowlist wird lazy geladen und 5 Minuten gecached; Reload bei jedem Cron-Durchlauf.
 //
 // ENV:
-//   READY_STATUS_ENABLED=1|0          (default 1)
-//   READY_STATUS_DIE_MAX=integer      (default 12)
-//   READY_STATUS_MODEL=string         (default "gpt-4o-mini")
-//   READY_STATUS_CRON_MINUTES=number  (default 15)
+//   READY_STATUS_ENABLED=1|0
+//   READY_STATUS_DIE_MAX=integer         (default 12)
+//   READY_STATUS_MODEL=string            (default "gpt-4o-mini")
+//   READY_STATUS_CRON_MINUTES=number     (default 15)
+//   CHANNEL_CONFIG_DIR=path              (default "./channel-configs")
 
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const mysql = require("mysql2/promise");
 const cron = require("node-cron");
 const { setBotPresence } = require("./discord-helper.js");
@@ -54,6 +61,73 @@ async function getPool() {
   return pool;
 }
 
+// ===== presence allowlist (from JSON files) =====
+const ALLOWLIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+let _allowlistCache = { ts: 0, ids: [] };
+
+function safeReadJson(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function extractChannelIdFromConfig(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  // tolerate different keys
+  const cid = obj.channel_id || obj.id || obj.channelId || obj.channel || null;
+  if (!cid) return null;
+  const s = String(cid).trim();
+  return s || null;
+}
+
+function getChannelConfigDir() {
+  const p = String(process.env.CHANNEL_CONFIG_DIR || "./channel-configs").trim();
+  return path.resolve(process.cwd(), p);
+}
+
+function loadPresenceAllowlistNow() {
+  const dir = getChannelConfigDir();
+  const out = [];
+  try {
+    if (!fs.existsSync(dir)) return out;
+    const files = fs.readdirSync(dir).filter(f => f.toLowerCase().endsWith(".json"));
+    for (const f of files) {
+      const full = path.join(dir, f);
+      const obj = safeReadJson(full);
+      if (!obj) continue;
+      // Accept: presence === 1 (number) OR "1" (string) OR true (boolean)
+      const presenceFlag = obj.presence;
+      const enabled =
+        presenceFlag === 1 ||
+        presenceFlag === true ||
+        (typeof presenceFlag === "string" && presenceFlag.trim() === "1");
+      if (!enabled) continue;
+
+      const cid = extractChannelIdFromConfig(obj);
+      if (cid) out.push(cid);
+    }
+  } catch (err) {
+    console.error("[readyStatus] loadPresenceAllowlistNow failed:", err?.message || err);
+  }
+  return out;
+}
+
+function shouldReloadAllowlist() {
+  return Date.now() - _allowlistCache.ts > ALLOWLIST_CACHE_TTL_MS;
+}
+
+function getPresenceAllowlist() {
+  if (shouldReloadAllowlist()) {
+    const ids = loadPresenceAllowlistNow();
+    _allowlistCache = { ts: Date.now(), ids };
+    console.log("[readyStatus] presence allowlist:", ids.length, "channels");
+  }
+  return _allowlistCache.ids || [];
+}
+
 // ===== helpers =====
 function rollDie(max) {
   const m = Math.max(2, Math.floor(Number(max) || 12));
@@ -77,15 +151,28 @@ function hardTrimOneLine(input, max = HARDLEN) {
   }
 }
 
-async function fetchLastLogs(limit = 20) {
+/**
+ * Holt die letzten N Log-Zeilen NUR aus Channels in der Allowlist.
+ * Falls Allowlist leer → leere Liste (keine Präsenzänderung).
+ */
+async function fetchLastLogsFromAllowedChannels(limit = 20) {
   const db = await getPool();
-  const [rows] = await db.execute(
-    `SELECT role, sender, content
+  const allow = getPresenceAllowlist();
+  if (!Array.isArray(allow) || allow.length === 0) return [];
+
+  // IN-Klausel mit variabler Länge
+  const placeholders = allow.map(() => "?").join(",");
+  const sql =
+    `SELECT channel_id, role, sender, content
        FROM context_log
+      WHERE channel_id IN (${placeholders})
    ORDER BY id DESC
-      LIMIT ?`,
-    [Math.max(1, Math.min(200, limit))]
-  );
+      LIMIT ?`;
+
+  // mysql2 erwartet Werte in korrekter Reihenfolge
+  const params = [...allow, Math.max(1, Math.min(200, limit))];
+
+  const [rows] = await db.execute(sql, params);
   return rows || [];
 }
 
@@ -104,8 +191,8 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
       "Use ONLY the provided chat snippets as inspiration; do not invent facts.",
       "No names, IDs, links, hashtags, or markdown.",
       "Avoid possible spoilers. Do not mention fictional or real names, locations, monikers, group names. Be unspecific.",
-      "Alwasy set an emoji at the beginning of the text, but NEVER use the hourglass emoji.",
-      "Always answer in english."
+      "Always set an emoji at the beginning of the text, but NEVER use the hourglass emoji.",
+      "Always answer in English."
     ].join(" "),
     [],
     {},
@@ -127,7 +214,7 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
 /**
  * maybeUpdateReadyStatus(client)
  * - Call this AFTER you've switched to "ready" and shown the last ready text.
- * - Rolls 1..X; on 1, generates a new line from recent history and updates presence + memory.
+ * - Rolls 1..X; on 1, generates a new line from recent allowlisted history and updates presence + memory.
  * - On miss or any error, keeps the currently shown ready text unchanged.
  */
 async function maybeUpdateReadyStatus(client) {
@@ -135,17 +222,21 @@ async function maybeUpdateReadyStatus(client) {
     const enabled = String(process.env.READY_STATUS_ENABLED ?? "1").trim() !== "0";
     if (!enabled) return;
 
+    // Falls keine Channels erlaubt sind → nichts tun
+    const allow = getPresenceAllowlist();
+    if (!allow.length) return;
+
     const dieMax = Math.max(2, Math.floor(Number(process.env.READY_STATUS_DIE_MAX || 12)));
     const hit = rollDie(dieMax) === 1;
     if (!hit) return;
 
-    const rows = await fetchLastLogs(20);
+    const rows = await fetchLastLogsFromAllowedChannels(20);
     if (!rows.length) return;
 
     const line = await buildStatusFromLogs(rows, process.env.READY_STATUS_MODEL || "gpt-4o-mini");
     if (!line) return;
 
-    setLastReadyText(line);                         // remember
+    setLastReadyText(line);                          // remember
     await setBotPresence(client, line, "online", 4); // update presence (custom status)
   } catch (err) {
     // Silent fail: keep current ready text
@@ -169,6 +260,9 @@ function startReadyStatusCron(client) {
     try {
       const presence = client.user?.presence?.activities?.[0]?.name || "";
       if (isBusyPresence(presence)) return; // skip if busy
+
+      // Refresh Allowlist regelmäßig (lazy caching übernimmt das intern)
+      getPresenceAllowlist();
 
       // Same die roll + generation logic as on ready-switch
       await maybeUpdateReadyStatus(client);
