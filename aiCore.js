@@ -350,17 +350,23 @@ function hasAnchoredParts(msgs) {
   );
 }
 
-/** Baue Finalizer-Messages (System+User) */
+/** Baue Finalizer-Messages – WICHTIG: User-Instruktion ALS LETZTE Nachricht (System → History → User) */
 function buildFinalizeMessages(baseMsgs) {
   const finalizerSystem = buildFinalizerSystemPrompt();
   const lastUserText = getLastUserText(baseMsgs);
 
-  const finalizeMessages = [
+  const pre = [
     { role: "system", content: finalizerSystem },
-    { role: "system", content: "Tool outputs were injected above as assistant messages (anchored parts). Use ONLY those as sources. If output is long, stop and expect 'continue'." },
+    { role: "system", content: "Tool outputs were injected above as assistant messages (anchored parts). Use ONLY those as sources. If output is long, stop and expect 'continue'." }
+  ];
+
+  const history = buildStrictToolPairedMessages(baseMsgs);
+
+  const post = [
     { role: "user", content: lastUserText || "Finalize the answer now based on the provided parts." }
   ];
-  return finalizeMessages;
+
+  return [...pre, ...history, ...post];
 }
 
 /** Run Finalizer once */
@@ -377,9 +383,8 @@ async function runFinalizeOnce(context, tokenlimit, model, apiKey, options) {
   const authKey = apiKey || process.env.OPENAI_API_KEY;
   if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
-  // WICHTIG: Systemnachrichten zuerst, dann die bestehende History
-  const finalizeMessages = buildFinalizeMessages(context.messages);
-  const payloadMessages = finalizeMessages.concat(buildStrictToolPairedMessages(context.messages));
+  // Richtige Reihenfolge (System → History → User als letzte Nachricht)
+  const payloadMessages = buildFinalizeMessages(context.messages);
 
   const finalizePayload = {
     model,
@@ -594,7 +599,7 @@ async function getAIResponse(
 
       const choice = aiResponse?.data?.choices?.[0] || {};
       const aiMessage = choice.message || {};
-      const finishReason = choice.finish_reason; // lokal
+      theFinishReason = choice.finish_reason; // lokal
       const rawText = (aiMessage.content || "").trim();
       lastRawAssistant = rawText;
 
@@ -720,7 +725,7 @@ async function getAIResponse(
       } else {
         if (hadToolCallsThisTurn) {
           continueLoop = true;
-        } else if (finishReason === "length" && rounds < sequenceLimit) {
+        } else if (theFinishReason === "length" && rounds < sequenceLimit) {
           // Bei Abbruch wegen Token-Limit: dieses Teilstück in den Verlauf + "continue" anstoßen
           if (rawText) {
             context.messages.push({ role: "assistant", content: rawText });
