@@ -487,7 +487,7 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
   }
 }
 
-/** Reply via webhook as embeds (exaktes 6000-Budget & 4096-Guards, 10er-Batches, multi-message) */
+/** Reply via webhook as embeds (avatar/versioning, hard-safe chunking) */
 async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
   const { botname, color, model } = options || {};
   try {
@@ -501,17 +501,19 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     const personaAvatarUrl = await ensureChannelAvatar(effectiveChannelId, meta);
 
     const hooks = await hookChannel.fetchWebhooks();
-    const authorName = (botname || meta?.botname || "AI").toString();
-    let hook = hooks.find((w) => w.name === authorName);
+    let hook = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
     if (!hook) {
-      hook = await hookChannel.createWebhook({ name: authorName, avatar: personaAvatarUrl || undefined });
+      hook = await hookChannel.createWebhook({
+        name: botname || meta?.botname || "AI",
+        avatar: personaAvatarUrl || undefined
+      });
     } else {
       try { await hook.edit({ avatar: personaAvatarUrl }); } catch {}
     }
 
+    // --- Links/Bilder extrahieren + Text vorbereiten ---
     const links = collectUrlsWithLabels(aiText);
 
-    // bestes Bild (falls vorhanden)
     const firstImage = await (async (list) => {
       if (!Array.isArray(list) || list.length === 0) return null;
       const mdImg = list.find(l => l.kind === "md_image"); if (mdImg) return mdImg;
@@ -534,19 +536,28 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
         }).join("\n")
       : "";
 
-    // ====== Limits exakt ======
-    const DESC_HARD = 4096;
-    const TOTAL_HARD = 6000; // title + description + fields(names+values) + footer.text + author.name
-    const HEADER_RESERVE = 24; // für "**Part X/Y**" + 2x \n, konservativ
     const themeColor = Number.isInteger(color) ? color : 0x5865F2;
+    const fullDesc = (bodyText + bulletsBlock).trim();
 
+    // --- Harte Limits (Discord) ---
+    const HARD_DESC_MAX = 4096;     // max description chars
+    const HARD_EMBED_SUM = 6000;    // max total per single embed (desc + title + footer + author + fields)
+    const MAX_EMBEDS_PER_MSG = 10;  // per message
+
+    // --- Feste Meta/Overhead berechnen, um "Gesamt 6000" einzuhalten ---
+    const authorName = String(botname || meta?.botname || "AI");
     const baseName = meta?.name ? `${meta.name}` : authorName;
     const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
     const footerText = `${baseName}${modelPart}`;
 
-    const fullDesc = (bodyText + bulletsBlock).trim();
+    // Schätze den Overhead (Discord zählt UTF-16 Code Units; hier reicht einfache Länge)
+    const EST_OVERHEAD = authorName.length + footerText.length + 32; // +32 Sicherheitsmarge
+    // Budget für description unter 4096 und so, dass Summe < 6000 bleibt
+    let DESC_BUDGET = Math.min(HARD_DESC_MAX, Math.max(500, HARD_EMBED_SUM - EST_OVERHEAD));
+    // Extra Sicherheitsmarge gegen Off-by-one/Invisible chars
+    DESC_BUDGET = Math.min(DESC_BUDGET, 4000);
 
-    // Smarter Slicer für die Rohbeschreibung (ohne Header)
+    // Smarter Slicer
     const smartSlice = (s, limit) => {
       if (s.length <= limit) return s;
       const cut1 = s.lastIndexOf("\n\n", limit);
@@ -556,85 +567,72 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       return s.slice(0, cut).trim();
     };
 
-    // 1) Vorab chunking mit Headroom für Header
-    const firstPassLimit = Math.max(512, DESC_HARD - HEADER_RESERVE);
-    const rawChunks = [];
+    // In Embed-Beschreibungsteile splitten (unter Budget)
+    const descChunks = [];
     let remaining = fullDesc;
     while (remaining.length > 0) {
-      const part = smartSlice(remaining, firstPassLimit);
-      rawChunks.push(part);
+      const part = smartSlice(remaining, DESC_BUDGET);
+      descChunks.push(part);
       remaining = remaining.slice(part.length).trimStart();
       if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    // 2) Exakte Clamping-Funktion pro Embed basierend auf TOTAL_HARD
-    const clampForEmbed = (raw, idx, total) => {
-      const header = total > 1 ? `**Part ${idx + 1}/${total}**\n\n` : "";
-      // Exaktes erlaubtes Budget für description:
-      // total ≤ 6000 ⇒ description.length ≤ 6000 - footerText.length - authorName.length - title.length (0 bei uns)
-      const allowedByTotal = Math.max(0, TOTAL_HARD - (footerText.length + authorName.length));
-      // zusätzlich Discord-Hardcap 4096
-      const allowed = Math.min(DESC_HARD, allowedByTotal);
-      // Header zählt mit!
-      if (allowed <= 0) return "…".slice(0, Math.min(DESC_HARD, 1)); // Fallback falls Footer/Author extrem lang
-      let desc = (header + raw);
-      if (desc.length > allowed) {
-        desc = desc.slice(0, Math.max(0, allowed - 1)) + "…";
+    // Embed-Factory mit finalem Check (Total <= 6000)
+    const makeEmbed = (desc, addImage = false) => {
+      // Falls desc doch zu groß (extreme Unicode-Fälle) → hart trimmen
+      if (desc.length > HARD_DESC_MAX) desc = desc.slice(0, HARD_DESC_MAX);
+
+      // finale Gesamtsumme prüfen; wenn nötig, desc nachtrimmen
+      const totalLen = desc.length + authorName.length + footerText.length;
+      const maxDescByTotal = Math.min(HARD_DESC_MAX, Math.max(0, HARD_EMBED_SUM - (authorName.length + footerText.length)));
+      if (totalLen > HARD_EMBED_SUM && desc.length > maxDescByTotal) {
+        desc = desc.slice(0, maxDescByTotal);
       }
-      // absoluter 4096-Guard (falls allowed > 4096 theoretisch wäre)
-      if (desc.length > DESC_HARD) {
-        desc = desc.slice(0, DESC_HARD - 1) + "…";
+
+      const embed = {
+        color: themeColor,
+        author: { name: authorName, icon_url: personaAvatarUrl || undefined },
+        description: desc,
+        timestamp: new Date().toISOString(),
+        footer: { text: footerText }
+      };
+      if (addImage && firstImage?.url) {
+        embed.image = { url: firstImage.url };
       }
-      return desc;
+      return embed;
     };
 
-    // 3) Embeds bauen, exakt clampen
-    const embeds = rawChunks.map((chunk, i) => ({
-      color: themeColor,
-      author: { name: authorName, icon_url: personaAvatarUrl || undefined },
-      description: clampForEmbed(chunk, i, rawChunks.length),
-      timestamp: new Date().toISOString(),
-      footer: { text: footerText }
-    }));
+    // Embeds bauen, Bild nur im ersten
+    const embeds = descChunks.map((d, i) => makeEmbed(d, i === 0));
 
-    if (firstImage?.url && embeds.length) embeds[0].image = { url: firstImage.url };
-
-    // 4) Sende in 10er-Batches (Discord-Limit), beliebig viele Nachrichten hintereinander
-    for (let i = 0; i < embeds.length; i += 10) {
-      const slice = embeds.slice(i, i + 10);
-
-      // finaler Sicherheits-Check vor dem Senden: jedes Embed <= 6000 total + desc<=4096
-      for (const e of slice) {
-        const totalChars =
-          (e.title ? e.title.length : 0) +
-          (e.description ? e.description.length : 0) +
-          (e.footer?.text ? e.footer.text.length : 0) +
-          (e.author?.name ? e.author.name.length : 0) +
-          0; // keine fields genutzt
-        if (e.description && e.description.length > DESC_HARD) {
-          e.description = e.description.slice(0, DESC_HARD - 1) + "…";
-        }
-        if (totalChars > TOTAL_HARD) {
-          const over = totalChars - TOTAL_HARD;
-          if (e.description && over > 0) {
-            const newLen = Math.max(0, e.description.length - over - 1);
-            e.description = e.description.slice(0, newLen) + "…";
-          }
+    // In Paketen zu je 10 senden; wenn mehr → mehrere Nachrichten
+    for (let i = 0; i < embeds.length; i += MAX_EMBEDS_PER_MSG) {
+      const slice = embeds.slice(i, i + MAX_EMBEDS_PER_MSG);
+      try {
+        await hook.send({
+          content: "",
+          username: authorName,
+          avatarURL: personaAvatarUrl || undefined,
+          embeds: slice,
+          allowedMentions: { parse: [] },
+          threadId: isThread ? message.channel.id : undefined
+        });
+      } catch (err) {
+        // Fallback: wenn trotz Vorsicht 50035 kommt, weiche auf Plain-Text (chunked) aus.
+        const code = (err?.rawError?.code || err?.code || err?.status || "").toString();
+        const msg = (err?.message || "");
+        if (msg.includes("MAX_EMBED_SIZE_EXCEEDED") || msg.includes("BASE_TYPE_MAX_LENGTH") || code === "50035") {
+          // Plain-Text Fallback
+          const plain = descChunks.join("\n\n");
+          await sendChunked(isThread ? message.channel : hookChannel, plain);
+        } else {
+          throw err;
         }
       }
-
-      await hook.send({
-        content: "",
-        username: authorName,
-        avatarURL: personaAvatarUrl || undefined,
-        embeds: slice,
-        allowedMentions: { parse: [] },
-        threadId: isThread ? message.channel.id : undefined
-      });
     }
   } catch (err) {
     await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED");
-    // Fallback: Plain-Text-Chunking (2000er Blöcke)
+    // letzter Fallback
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
