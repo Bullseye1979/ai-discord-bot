@@ -1,12 +1,14 @@
-// history.js — smart v5.1 (multi-frame support)
-// - findTimeframes(keywords[], window=30): AND-match on content, expand ±window rows per hit, merge overlaps, return JSON windows [{start,end}].
-// - getHistory({frames?=[{start,end}], start?, end?, user_prompt, model?, max_tokens?}):
-//   * If frames[] given -> loop frames (already normalized/merged by findTimeframes), load rows per frame (NO LIMIT), concat.
-//   * Else fall back to single start/end or FULL channel if neither is provided.
-//   * Build one big digest (no chunking) and run a single LLM pass.
+// history.js — focused v5.2
+// - getInformation({ keywords[], window=10 }):
+//     OR-match on content for THIS channel; take the 30 newest hits (by id desc),
+//     for each hit include N rows before and after (same channel), deduplicate,
+//     return a flat, id-ascending list of { sender, timestamp(ISO), content }.
+// - getHistory({ frames?=[{start,end}], start?, end?, user_prompt, model?, max_tokens? }):
+//     Single-pass LLM over the selected rows (multi-frame or single range or full channel).
+//
 // Notes:
 // * Ensure high enough OpenAI timeout in aiService.js (e.g., OPENAI_TIMEOUT_MS=180000).
-// * Queries are scoped to the channel_id resolved from ctx/runtime/args.
+// * All queries are scoped to the channel_id resolved from ctx/runtime/args.
 
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
@@ -57,10 +59,14 @@ function normalizeKeywords(arr) {
   return out;
 }
 
+function toISO(ts) {
+  return ts ? new Date(String(ts).replace(" ", "T") + "Z").toISOString() : "";
+}
+
 function rowsToText(rows) {
   return (rows || [])
     .map((r) => {
-      const ts = r.timestamp ? new Date(String(r.timestamp).replace(" ", "T") + "Z").toISOString() : "";
+      const ts = r.timestamp ? toISO(r.timestamp) : "";
       const who = (r.sender || r.role || "unknown").trim();
       const role = (r.role || "").trim().toLowerCase();
       const prefix = role && who && role !== who ? `${role}/${who}` : who || role || "unknown";
@@ -70,34 +76,21 @@ function rowsToText(rows) {
     .join("\n");
 }
 
-/** Merge overlapping [{start,end}] intervals (ISO strings). */
-function mergeIntervals(intervals) {
-  if (!Array.isArray(intervals) || intervals.length === 0) return [];
-  const toMs = (s) => (s ? Date.parse(s) : 0);
-  const arr = intervals
-    .map((it) => ({ startMs: toMs(it.start), endMs: toMs(it.end) }))
-    .filter((it) => Number.isFinite(it.startMs) && Number.isFinite(it.endMs) && it.startMs <= it.endMs)
-    .sort((a, b) => a.startMs - b.startMs);
-
-  const merged = [];
-  for (const it of arr) {
-    if (!merged.length) { merged.push({ ...it }); continue; }
-    const last = merged[merged.length - 1];
-    if (it.startMs <= last.endMs) {
-      last.endMs = Math.max(last.endMs, it.endMs);
-    } else {
-      merged.push({ ...it });
-    }
-  }
-  return merged.map((m) => ({
-    start: new Date(m.startMs).toISOString(),
-    end: new Date(m.endMs).toISOString()
-  }));
-}
-
-/* ----------------------------- findTimeframes ----------------------------- */
-
-async function findTimeframes(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
+/* ----------------------------- getInformation ----------------------------- */
+/**
+ * Args:
+ *  - keywords: string[]  (OR-Suche)
+ *  - window?:  number    (N vor/nach — default 10)
+ *  - channel_id?: string (wird sonst aus ctx/runtime gezogen)
+ *
+ * Returns JSON string:
+ *  {
+ *    data: [{ sender, timestamp, content }],
+ *    count: number,
+ *    meta: { hits_considered: number, max_hits: 30, window: number }
+ *  }
+ */
+async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   const reqId = Math.random().toString(36).slice(2, 8);
   try {
     const args = typeof toolFunction.arguments === "string"
@@ -105,68 +98,75 @@ async function findTimeframes(toolFunction, ctxOrUndefined, _getAIResponse, runt
       : (toolFunction.arguments || {});
     const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
     const keywords = normalizeKeywords(args.keywords || []);
-    const window = Number.isFinite(Number(args.window)) ? Math.max(0, Math.floor(Number(args.window))) : 30;
+    const windowN = Number.isFinite(Number(args.window)) ? Math.max(0, Math.floor(Number(args.window))) : 10;
+    const MAX_HITS = 30; // feste Vorgabe: nur die 30 neuesten Treffer
 
-    console.log(`[history][findTimeframes#${reqId}:args]`, JSON.stringify({ channelId, keywords, window }, null, 2));
-
+    console.log(`[history][getInformation#${reqId}:args]`, JSON.stringify({ channelId, keywords, window: windowN }, null, 2));
     if (!channelId) return JSON.stringify({ error: "channel_id missing" });
     if (!keywords.length) return JSON.stringify({ error: "no keywords" });
 
     const db = await getPool();
 
-    // 1) Matches (AND-LIKE on content), no LIMIT
-    const clause = keywords.map(() => "content LIKE ?").join(" AND ");
+    // 1) OR über alle Keywords — neueste zuerst, LIMIT 30
+    const clause = keywords.map(() => "content LIKE ?").join(" OR ");
     const likes = keywords.map((k) => `%${k}%`);
-    const matchSQL =
-      "SELECT id, timestamp FROM context_log WHERE channel_id = ? AND " + clause + " ORDER BY id ASC";
-    const matchVals = [channelId, ...likes];
+    const hitSQL = `SELECT id FROM context_log WHERE channel_id = ? AND (${clause}) ORDER BY id DESC LIMIT ?`;
+    const hitVals = [channelId, ...likes, MAX_HITS];
 
-    console.log(`[history][findTimeframes#${reqId}:matchSQL]`, JSON.stringify({ sql: matchSQL, values: matchVals }, null, 2));
     const t0 = Date.now();
-    const [hits] = await db.execute(matchSQL, matchVals);
-    const dur = `${Date.now() - t0}ms`;
-    console.log(`[history][findTimeframes#${reqId}:matchRES]`, JSON.stringify({ rowCount: hits.length, dur }, null, 2));
+    const [hitRows] = await db.execute(hitSQL, hitVals);
+    console.log(`[history][getInformation#${reqId}:hits]`, JSON.stringify({ rowCount: hitRows.length, dur: `${Date.now() - t0}ms` }, null, 2));
+    if (!hitRows.length) return JSON.stringify({ data: [], count: 0, meta: { hits_considered: 0, max_hits: MAX_HITS, window: windowN }, note: "no matches" });
 
-    if (!hits.length) {
-      return JSON.stringify({ frames: [], rowCount: 0, note: "no matches" });
+    // 2) Für jeden Hit: N vorher + Hit + N nachher — jeweils nur im selben Channel
+    const idSet = new Set();
+
+    async function expandIdsAround(id) {
+      const beforeSQL = "SELECT id FROM context_log WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?";
+      const afterSQL  = "SELECT id FROM context_log WHERE channel_id = ? AND id > ? ORDER BY id ASC  LIMIT ?";
+      const [prevRows] = await db.execute(beforeSQL, [channelId, id, windowN]);
+      const [nextRows] = await db.execute(afterSQL,  [channelId, id, windowN]);
+      // prevRows kommen DESC — egal, deduplizieren & später global sortieren
+      for (const r of prevRows) idSet.add(r.id);
+      idSet.add(id);
+      for (const r of nextRows) idSet.add(r.id);
     }
 
-    // 2) Expand each hit to ±window rows (same channel) → get boundary timestamps
-    async function expandHitById(hit) {
-      const prevSQL =
-        "SELECT timestamp FROM context_log WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?";
-      const nextSQL =
-        "SELECT timestamp FROM context_log WHERE channel_id = ? AND id > ? ORDER BY id ASC LIMIT ?";
-      const [prev] = await db.execute(prevSQL, [channelId, hit.id, window]);
-      const [next] = await db.execute(nextSQL, [channelId, hit.id, window]);
-
-      const startTs = prev.length ? prev[prev.length - 1].timestamp : hit.timestamp;
-      const endTs = next.length ? next[next.length - 1].timestamp : hit.timestamp;
-
-      const startISO = new Date(String(startTs).replace(" ", "T") + "Z").toISOString();
-      const endISO = new Date(String(endTs).replace(" ", "T") + "Z").toISOString();
-      return { start: startISO, end: endISO };
-    }
-
-    const intervals = [];
-    for (const h of hits) {
+    for (const h of hitRows) {
       // eslint-disable-next-line no-await-in-loop
-      const frame = await expandHitById(h);
-      intervals.push(frame);
+      await expandIdsAround(h.id);
     }
 
-    // 3) Merge overlaps
-    const frames = mergeIntervals(intervals);
+    const ids = Array.from(idSet);
+    if (!ids.length) return JSON.stringify({ data: [], count: 0, meta: { hits_considered: hitRows.length, max_hits: MAX_HITS, window: windowN } });
 
-    console.log(`[history][findTimeframes#${reqId}:frames]`, JSON.stringify({ framesCount: frames.length, sample: frames.slice(0, 3) }, null, 2));
-    return JSON.stringify({ frames, rowCount: hits.length });
+    // 3) Alle Zeilen in einem Rutsch laden und aufbereiten
+    // mysql2 unterstützt Arrays mit IN (?) → expandiert automatisch
+    const loadSQL =
+      "SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id IN (?)";
+    const [rows] = await db.execute(loadSQL, [channelId, ids]);
+
+    // Sortierung nach id ASC
+    rows.sort((a, b) => (a.id || 0) - (b.id || 0));
+
+    const data = rows.map((r) => ({
+      sender: String(r.sender || "").trim(),
+      timestamp: toISO(r.timestamp),
+      content: String(r.content || "").trim()
+    }));
+
+    return JSON.stringify({
+      data,
+      count: data.length,
+      meta: { hits_considered: hitRows.length, max_hits: MAX_HITS, window: windowN }
+    });
   } catch (err) {
-    console.error(`[history][findTimeframes#${reqId}:ERROR]`, err?.message || err);
+    console.error(`[history][getInformation#${reqId}:ERROR]`, err?.message || err);
     return JSON.stringify({ error: String(err?.message || err) });
   }
 }
 
-/* ----------------------------- getHistory (single or multiple timeframes) ----------------------------- */
+/* ----------------------------- getHistory (multi-frame or single range) ----------------------------- */
 
 async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
   const reqId = Math.random().toString(36).slice(2, 8);
@@ -176,10 +176,9 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       : (toolFunction.arguments || {});
     const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
 
-    // New: accept frames[]; fall back to single start/end
     const frames = Array.isArray(args.frames) ? args.frames : [];
     const start = args.start ? String(args.start).trim() : null;
-    const end = args.end ? String(args.end).trim() : null;
+    const end   = args.end   ? String(args.end).trim()   : null;
 
     const userPrompt = String(args.user_prompt || "").trim();
     const model = String(args.model || process.env.TIMEFRAME_MODEL || "gpt-4.1");
@@ -189,58 +188,36 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     console.log(
       `[history][getHistory#${reqId}:args]`,
-      JSON.stringify({
-        channelId,
-        framesCount: frames.length,
-        start,
-        end,
-        userPromptLen: userPrompt.length,
-        model,
-        maxTokens
-      }, null, 2)
+      JSON.stringify({ channelId, framesCount: frames.length, start, end, userPromptLen: userPrompt.length, model, maxTokens }, null, 2)
     );
 
     if (!channelId) return "ERROR: channel_id missing";
     if (!userPrompt) return "ERROR: user_prompt is required";
 
     const db = await getPool();
-
     let rows = [];
 
     if (frames.length > 0) {
-      // Assume frames already normalized/merged/sorted by findTimeframes
       for (const f of frames) {
         if (!f || !f.start || !f.end) continue;
-        const where = ["channel_id = ?", "timestamp >= ?", "timestamp <= ?"];
-        const vals = [channelId, f.start, f.end];
-
         const sql =
           `SELECT id, timestamp, role, sender, content
              FROM context_log
-            WHERE ${where.join(" AND ")}
+            WHERE channel_id = ? AND timestamp >= ? AND timestamp <= ?
          ORDER BY id ASC`;
+        const vals = [channelId, f.start, f.end];
 
         console.log(`[history][getHistory#${reqId}:frameSQL]`, JSON.stringify({ sql, values: vals }, null, 2));
-
         // eslint-disable-next-line no-await-in-loop
         const t0 = Date.now();
         // eslint-disable-next-line no-await-in-loop
         const [part] = await db.execute(sql, vals);
         const dur = `${Date.now() - t0}ms`;
-
-        console.log(
-          `[history][getHistory#${reqId}:frameRES]`,
-          JSON.stringify({
-            frame: f,
-            rowCount: part.length,
-            dur
-          }, null, 2)
-        );
+        console.log(`[history][getHistory#${reqId}:frameRES]`, JSON.stringify({ frame: f, rowCount: part.length, dur }, null, 2));
 
         rows = rows.concat(part || []);
       }
     } else {
-      // Single timeframe (or full history)
       const where = ["channel_id = ?"];
       const vals = [channelId];
       if (start) { where.push("timestamp >= ?"); vals.push(start); }
@@ -253,11 +230,9 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
        ORDER BY id ASC`;
 
       console.log(`[history][getHistory#${reqId}:sql]`, JSON.stringify({ sql, values: vals }, null, 2));
-
       const t0 = Date.now();
       const [all] = await db.execute(sql, vals);
       const dur = `${Date.now() - t0}ms`;
-
       console.log(
         `[history][getHistory#${reqId}:res]`,
         JSON.stringify({
@@ -273,16 +248,12 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     if (!rows.length) return "No data in timeframe / history.";
 
-    // Optional safety: stable sort by id ASC (frames should be disjoint already)
     rows.sort((a, b) => (a.id || 0) - (b.id || 0));
 
-    // Build one big digest (NO chunking)
     const digest = rowsToText(rows);
     console.log(`[history][getHistory#${reqId}:digest]`, JSON.stringify({ chars: digest.length }, null, 2));
 
-    // Single-pass LLM
     const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
-
     await ctx.add("system", "history_timeframe",
       [
         "You are given the chat logs from a single Discord channel for one or multiple timeframes (merged already by the caller).",
@@ -304,4 +275,4 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
   }
 }
 
-module.exports = { findTimeframes, getHistory };
+module.exports = { getInformation, getHistory };
