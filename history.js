@@ -1,4 +1,4 @@
-// history.js — focused v5.2
+// history.js — focused v5.3
 // - getInformation({ keywords[], window=10 }):
 //     OR-match on content for THIS channel; take the 30 newest hits (by id desc),
 //     for each hit include N rows before and after (same channel), deduplicate,
@@ -108,15 +108,23 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
     const db = await getPool();
 
     // 1) OR über alle Keywords — neueste zuerst, LIMIT 30
-    const clause = keywords.map(() => "content LIKE ?").join(" OR ");
+    //    Stelle sicher, dass die Anzahl der Platzhalter exakt den Werten entspricht.
+    const clause = "(" + keywords.map(() => "content LIKE ?").join(" OR ") + ")";
     const likes = keywords.map((k) => `%${k}%`);
-    const hitSQL = `SELECT id FROM context_log WHERE channel_id = ? AND (${clause}) ORDER BY id DESC LIMIT ?`;
-    const hitVals = [channelId, ...likes, MAX_HITS];
+    const hitSQL = `SELECT id FROM context_log WHERE channel_id = ? AND ${clause} ORDER BY id DESC LIMIT ?`;
+    const hitVals = [channelId, ...likes, Number(MAX_HITS)];
 
     const t0 = Date.now();
     const [hitRows] = await db.execute(hitSQL, hitVals);
     console.log(`[history][getInformation#${reqId}:hits]`, JSON.stringify({ rowCount: hitRows.length, dur: `${Date.now() - t0}ms` }, null, 2));
-    if (!hitRows.length) return JSON.stringify({ data: [], count: 0, meta: { hits_considered: 0, max_hits: MAX_HITS, window: windowN }, note: "no matches" });
+    if (!hitRows.length) {
+      return JSON.stringify({
+        data: [],
+        count: 0,
+        meta: { hits_considered: 0, max_hits: MAX_HITS, window: windowN },
+        note: "no matches"
+      });
+    }
 
     // 2) Für jeden Hit: N vorher + Hit + N nachher — jeweils nur im selben Channel
     const idSet = new Set();
@@ -124,10 +132,9 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
     async function expandIdsAround(id) {
       const beforeSQL = "SELECT id FROM context_log WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?";
       const afterSQL  = "SELECT id FROM context_log WHERE channel_id = ? AND id > ? ORDER BY id ASC  LIMIT ?";
-      const [prevRows] = await db.execute(beforeSQL, [channelId, id, windowN]);
-      const [nextRows] = await db.execute(afterSQL,  [channelId, id, windowN]);
-      // prevRows kommen DESC — egal, deduplizieren & später global sortieren
-      for (const r of prevRows) idSet.add(r.id);
+      const [prevRows] = await db.execute(beforeSQL, [channelId, id, Number(windowN)]);
+      const [nextRows] = await db.execute(afterSQL,  [channelId, id, Number(windowN)]);
+      for (const r of prevRows) idSet.add(r.id); // prevRows sind DESC, egal – später global sortieren
       idSet.add(id);
       for (const r of nextRows) idSet.add(r.id);
     }
@@ -138,15 +145,22 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
     }
 
     const ids = Array.from(idSet);
-    if (!ids.length) return JSON.stringify({ data: [], count: 0, meta: { hits_considered: hitRows.length, max_hits: MAX_HITS, window: windowN } });
+    if (!ids.length) {
+      return JSON.stringify({
+        data: [],
+        count: 0,
+        meta: { hits_considered: hitRows.length, max_hits: MAX_HITS, window: windowN }
+      });
+    }
 
-    // 3) Alle Zeilen in einem Rutsch laden und aufbereiten
-    // mysql2 unterstützt Arrays mit IN (?) → expandiert automatisch
-    const loadSQL =
-      "SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id IN (?)";
-    const [rows] = await db.execute(loadSQL, [channelId, ids]);
+    // 3) Alle Zeilen in einem Rutsch laden — baue IN(?,?,...) mit exakt passender Placeholder-Anzahl
+    ids.sort((a, b) => a - b); // sortiere IDs aufsteigend, damit Ausgabe chronologisch ist
+    const ph = ids.map(() => "?").join(",");
+    const loadSQL = `SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id IN (${ph})`;
+    const loadVals = [channelId, ...ids];
+    const [rows] = await db.execute(loadSQL, loadVals);
 
-    // Sortierung nach id ASC
+    // Sortierung nach id ASC (falls DB nicht exakt in IN-Reihenfolge liefert)
     rows.sort((a, b) => (a.id || 0) - (b.id || 0));
 
     const data = rows.map((r) => ({
