@@ -1,16 +1,18 @@
-// aiCore.js — unified flow v2.40
-// (Fix v2.40: Synchronisiere die gesammelten Assistant-Teile in den Verlauf nach der Kettenschleife,
-//  damit der komplette Text auch im Kontext vorhanden ist; Duplikate werden vermieden.)
+// aiCore.js — unified flow v2.41
+// (Fix v2.41: Finalizer-first bei Tool-Outputs/Continue, robuste Fallbacks,
+//  kein Clipping bei Tool-Fallbacks, ein Rückgabepunkt; behält v2.40 Sync der
+//  gesammelten Assistant-Teile im Verlauf, um „nur der Schluss“ im Kontext zu verhindern.)
 // -------------------------------------------------------------------------------
 // - EIN Flow für native & Pseudo-Tools (pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
 //   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
-// - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
-//   + v2.38: Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
-//   + v2.38: Finalizer kann auch bei "continue" ohne neue Tool-Outputs erzwungen werden
+// - Finalisierungsturn: Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
+//   + Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
+//   + Finalizer kann auch bei "continue" ohne neue Tool-Outputs erzwungen werden
 // - v2.39: collectedAssistantParts sammelt ALLE Textteile, finish_reason-Handling gefixt
-// - v2.40: collectedAssistantParts werden nach der Schleife in context.messages gemerged (kein „nur der Schluss“ im Kontext)
+// - v2.40: collectedAssistantParts werden nach der Schleife in context.messages gemerged
+// - v2.41: Finalizer-first + saubere Fallbacks + kein Clipping + ein Return
 // - Kein Fabricate, kein Auto-Prompt-Fill
 //
 // NO_DB_PERSIST:
@@ -266,18 +268,18 @@ function extractPseudoToolCalls(text) {
 }
 
 /* ---- Rendering für User-Antwort ---- */
+// kein Clipping mehr für Fallbacks
 function prettyClipJSON(any, max = 1800) {
   let s;
   try { s = typeof any === "string" ? any : JSON.stringify(any, null, 2); }
   catch { s = String(any); }
-  if (s.length > max) s = s.slice(0, max - 1) + "…";
-  return s;
+  return s; // unverändert
 }
 
 function renderToolOutputGeneric(_name, raw) {
   if (raw == null) return "";
-  if (typeof raw === "string") return raw.trim();
-  try { return prettyClipJSON(raw); } catch { return String(raw); }
+  if (typeof raw === "string") return raw; // unverändert
+  try { return JSON.stringify(raw, null, 2); } catch { return String(raw); }
 }
 
 /* ---- Finalisierung: Systemprompt + Helpers ---- */
@@ -334,7 +336,7 @@ function injectToolOutputAsAssistantParts(ctx, toolName, rawPayload, partChars =
   return { anchor, parts: chunks.length };
 }
 
-/* ---- v2.38: Finalizer Continue-Engine ---- */
+/* ---- Finalizer Continue-Engine ---- */
 const FINALIZER_MAX_ROUNDS = Math.max(1, Number(process.env.FINALIZER_MAX_ROUNDS || 200));
 const FINALIZER_CONTINUE_ON_LENGTH = String(process.env.FINALIZER_CONTINUE_ON_LENGTH || "1") === "1";
 
@@ -721,41 +723,7 @@ async function getAIResponse(
       }
     }
 
-    /* ----- Antwortaufbereitung / Rendering ----- */
-    let rendered = [];
-    if (toolResults.length > 0) {
-      for (const item of toolResults) {
-        const { name, raw } = item;
-        let obj = null;
-        try { obj = JSON.parse(raw); } catch {}
-        const s = renderToolOutputGeneric(name, obj ?? raw);
-        if (s && s.trim()) rendered.push(s.trim());
-      }
-    }
-
-    if (rendered.length > 0) {
-      responseMessage = rendered.join("\n\n").trim();
-    } else {
-      // Wenn keine Tools beteiligt sind, nimm die gesammelte Antwort
-      if (collectedAssistantParts.length > 0) {
-        responseMessage = collectedAssistantParts.join("\n").trim();
-      } else {
-        responseMessage = String(lastRawAssistant || "");
-      }
-    }
-    if (!responseMessage) {
-      if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
-      else if (noToolcallPolicy === "echo") responseMessage = String(lastRawAssistant || "");
-      else responseMessage = "";
-    }
-
-    /* ----- Finalisierung (mit Continue, ggf. erzwungen bei 'continue') ----- */
-    const shouldSkipFinalizeForUrlOnly = false;
-
-    // Force-Finalizer, wenn:
-    // - postToolFinalize=true UND
-    //   (es gab Tool-Outputs ODER
-    //    der letzte User "continue" war und es schon sichtbaren Finalizer-Text ODER Anchors gibt)
+    /* ----- Finalisierung & Rückgabe (Finalizer hat Vorrang) ----- */
     const lastUser = getLastUserText(context.messages).toLowerCase();
     const userWantsContinue = ["continue", "weiter", "fortsetzen"].includes(lastUser);
 
@@ -770,8 +738,11 @@ async function getAIResponse(
     const forceFinalizeOnContinue =
       userWantsContinue && (hasAnchoredParts(context.messages) || hasAnyFinalizedText);
 
-    if (postToolFinalize && (toolResults.length > 0 || forceFinalizeOnContinue) && !shouldSkipFinalizeForUrlOnly) {
-      // 1) Tool-Outputs als Assistant-Parts injizieren (nur wenn frisch vorhanden)
+    // WICHTIG: Sobald Tools beteiligt waren ODER Continue erzwungen wurde → finalisieren
+    const mustFinalize = postToolFinalize && (toolResults.length > 0 || forceFinalizeOnContinue);
+
+    if (mustFinalize) {
+      // Tool-Outputs als Assistant-Parts injizieren (volle Länge, kein Clipping)
       if (toolResults.length > 0) {
         for (const tr of toolResults) {
           let payload = tr.raw;
@@ -782,16 +753,50 @@ async function getAIResponse(
         }
       }
 
-      // 2) Finalizer mit interner Continue-Schleife
+      // Finalizer mit interner Continue-Schleife
+      let finalCombined = "";
       try {
-        const finalCombined = await runFinalizeWithContinue(context, tokenlimit, model, apiKey, options);
-        if (finalCombined) responseMessage = finalCombined;
+        finalCombined = await runFinalizeWithContinue(context, tokenlimit, model, apiKey, options);
       } catch (finalErr) {
         await reportError(finalErr, null, "OPENAI_FINALIZE", null);
         dbg("Finalize error:", finalErr?.message || String(finalErr));
       }
+
+      // Rückgabe-Priorität:
+      // 1) Finalizer-Ergebnis
+      // 2) Gesammelte Assistant-Teile
+      // 3) Voller Tool-Output (erstes Tool) — OHNE Clipping
+      // 4) Letzter Raw Assistant
+      if (finalCombined && finalCombined.trim()) {
+        responseMessage = finalCombined.trim();
+      } else if (collectedAssistantParts.length > 0) {
+        responseMessage = collectedAssistantParts.join("\n").trim();
+      } else if (toolResults.length > 0) {
+        const firstTool = toolResults[0];
+        responseMessage = renderToolOutputGeneric(firstTool.name, firstTool.raw);
+      } else {
+        responseMessage = String(lastRawAssistant || "");
+      }
+    } else {
+      // Kein Finalizer nötig → gesammelte Teile oder (falls leer) Tool-Render oder letzter Raw
+      if (collectedAssistantParts.length > 0) {
+        responseMessage = collectedAssistantParts.join("\n").trim();
+      } else if (toolResults.length > 0) {
+        const firstTool = toolResults[0];
+        responseMessage = renderToolOutputGeneric(firstTool.name, firstTool.raw);
+      } else {
+        responseMessage = String(lastRawAssistant || "");
+      }
     }
 
+    // Safety: falls leer, anwenden der noToolcallPolicy
+    if (!responseMessage) {
+      if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
+      else if (noToolcallPolicy === "echo") responseMessage = String(lastRawAssistant || "");
+      else responseMessage = "";
+    }
+
+    // Einziger Rückgabepunkt
     return responseMessage;
   } catch (err) {
     const details = { status: err?.response?.status, data: err?.response?.data };
