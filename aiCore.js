@@ -383,10 +383,15 @@ async function runFinalizeOnce(context, tokenlimit, model, apiKey, options) {
   const authKey = apiKey || process.env.OPENAI_API_KEY;
   if (authKey) headers.Authorization = `Bearer ${authKey}`;
 
+  // WICHTIG: Systemnachrichten zuerst, dann die bestehende History
+  const finalizeMessages = buildFinalizeMessages(context.messages);
+  const payloadMessages = finalizeMessages.concat(buildStrictToolPairedMessages(context.messages));
+
   const finalizePayload = {
     model,
-    messages: buildStrictToolPairedMessages(context.messages.concat(buildFinalizeMessages(context.messages))),
+    messages: payloadMessages,
     max_tokens: tokenlimit
+    // keine tools im Finalizer!
   };
 
   dbg("Finalize Request →", { endpoint, model, tokens: tokenlimit, tools_in_payload: false });
@@ -405,7 +410,7 @@ async function runFinalizeWithContinue(context, tokenlimit, model, apiKey, optio
 
     if (finalText) {
       combined += (combined ? "\n" : "") + finalText;
-      // für UI/Discord: lege den erzeugten Teil in den Verlauf, damit ein anschließendes 'continue' sauber anschließt
+      // Für Pairing bei weiterem 'continue'
       context.messages.push({ role: "assistant", content: finalText });
     }
 
@@ -569,7 +574,8 @@ async function getAIResponse(
 
       const choice = aiResponse?.data?.choices?.[0] || {};
       const aiMessage = choice.message || {};
-      const finishReason = choice.finish_reason;
+      theFinish = choice.finish_reason;
+      const finishReason = theFinish;
       const rawText = (aiMessage.content || "").trim();
       lastRawAssistant = rawText;
       const nativeToolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
