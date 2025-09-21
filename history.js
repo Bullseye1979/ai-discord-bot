@@ -1,14 +1,18 @@
-// history.js — focused v5.3
-// - getInformation({ keywords[], window=10 }):
-//     OR-match on content for THIS channel; take the 30 newest hits (by id desc),
-//     for each hit include N rows before and after (same channel), deduplicate,
-//     return a flat, id-ascending list of { sender, timestamp(ISO), content }.
+// history.js — focused v6.0 (K-of-N + Window Relevance)
+// - getInformation({ keywords[], window=10, max_hits=30, min_match?, candidate_limit? }):
+//     1) K-von-N-Match (Score = #Keywords in content) über die *neusten* Kandidaten,
+//     2) Filter auf score >= min_match (Default: 2 wenn ≥2 Keywords, sonst 1),
+//     3) Window-Relevanz: für jeden Kandidaten ±N Reihen (im selben Channel) einbeziehen,
+//        WindowScore = (#distinct Keywords im Fenster) + Bonus (Zeilen mit >=2 Keywords) + kleiner Frequenzbonus,
+//     4) Sortierung: WindowScore DESC, dann id DESC; wähle Top max_hits Fenster,
+//     5) Flache, deduplizierte Ausgabe aller Zeilen dieser Fenster (id ASC) als {sender,timestamp,content}.
 // - getHistory({ frames?=[{start,end}], start?, end?, user_prompt, model?, max_tokens? }):
-//     Single-pass LLM over the selected rows (multi-frame or single range or full channel).
+//     Single-pass LLM über die selektierten Rows.
 //
 // Notes:
-// * Ensure high enough OpenAI timeout in aiService.js (e.g., OPENAI_TIMEOUT_MS=180000).
-// * All queries are scoped to the channel_id resolved from ctx/runtime/args.
+// * Stelle sicher, dass in aiService.js ein hohes Timeout gesetzt ist (OPENAI_TIMEOUT_MS ≥ 180000).
+// * Alle DB-Queries werden auf den Channel (channel_id) gescoped.
+// * Es werden (wenn möglich) sinnvolle Indizes angelegt: (channel_id,id), (channel_id,timestamp), FULLTEXT(content).
 
 const mysql = require("mysql2/promise");
 const { getAI } = require("./aiService.js");
@@ -76,18 +80,91 @@ function rowsToText(rows) {
     .join("\n");
 }
 
+/** Simple substring check (case-insensitive, keywords already lowercased). */
+function contains(textLower, kwLower) {
+  return textLower.indexOf(kwLower) !== -1;
+}
+
+/* ----------------------------- index management ----------------------------- */
+
+/**
+ * Ensure helpful indexes exist.
+ * - idx_context_channel_id_id (BTREE): (channel_id, id)
+ * - idx_context_channel_id_timestamp (BTREE): (channel_id, timestamp)
+ * - ft_context_content (FULLTEXT): (content) — optional, best effort
+ */
+async function ensureIndexes(db) {
+  const schema = process.env.DB_NAME;
+  const table = "context_log";
+
+  async function hasIndex(indexName) {
+    const sql = `
+      SELECT 1
+      FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+      LIMIT 1
+    `;
+    const [rows] = await db.execute(sql, [schema, table, indexName]);
+    return rows && rows.length > 0;
+  }
+
+  async function createIndexIfMissing(indexName, createSQL) {
+    const exists = await hasIndex(indexName);
+    if (exists) return false;
+    await db.execute(createSQL);
+    console.log(`[history][index] created: ${indexName}`);
+    return true;
+  }
+
+  try {
+    await createIndexIfMissing(
+      "idx_context_channel_id_id",
+      `CREATE INDEX idx_context_channel_id_id ON ${table} (channel_id, id)`
+    );
+  } catch (e) {
+    console.warn("[history][index] create idx_context_channel_id_id failed:", e.message || e);
+  }
+
+  try {
+    await createIndexIfMissing(
+      "idx_context_channel_id_timestamp",
+      `CREATE INDEX idx_context_channel_id_timestamp ON ${table} (channel_id, timestamp)`
+    );
+  } catch (e) {
+    console.warn("[history][index] create idx_context_channel_id_timestamp failed:", e.message || e);
+  }
+
+  // FULLTEXT is best-effort (works on InnoDB MySQL >=5.6). Might fail depending on collation/permissions.
+  try {
+    await createIndexIfMissing(
+      "ft_context_content",
+      `CREATE FULLTEXT INDEX ft_context_content ON ${table} (content)`
+    );
+  } catch (e) {
+    console.warn("[history][index] create FULLTEXT ft_context_content failed (optional):", e.message || e);
+  }
+}
+
 /* ----------------------------- getInformation ----------------------------- */
 /**
  * Args:
- *  - keywords: string[]  (OR-Suche)
- *  - window?:  number    (N vor/nach — default 10)
- *  - channel_id?: string (wird sonst aus ctx/runtime gezogen)
+ *  - keywords: string[]        (Suchbegriffe; case-insensitive)
+ *  - window?: number           (N vor/nach — default 10)
+ *  - max_hits?: number         (Anzahl der Top-Fenster — default 30)
+ *  - min_match?: number        (K in K-von-N; default=2 wenn ≥2 Keywords, sonst 1)
+ *  - candidate_limit?: number  (#neueste Kandidaten vor Scoring; default = max(3*max_hits, 90))
+ *  - channel_id?: string
  *
  * Returns JSON string:
  *  {
  *    data: [{ sender, timestamp, content }],
- *    count: number,
- *    meta: { hits_considered: number, max_hits: 30, window: number }
+ *    count,
+ *    meta: {
+ *      keywords, min_match, window, max_hits, candidate_limit,
+ *      candidates_found, candidates_after_min_match,
+ *      selected_windows,
+ *      scoring: "k-of-n + window relevance"
+ *    }
  *  }
  */
 async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
@@ -99,80 +176,187 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
     const channelId = resolveChannelId(ctxOrUndefined, runtime, args);
     const keywords = normalizeKeywords(args.keywords || []);
     const windowN = Number.isFinite(Number(args.window)) ? Math.max(0, Math.floor(Number(args.window))) : 10;
-    const MAX_HITS = 30; // feste Vorgabe: nur die 30 neuesten Treffer
+    const maxHits = Number.isFinite(Number(args.max_hits)) ? Math.max(1, Math.floor(Number(args.max_hits))) : 30;
+    const defaultMinMatch = keywords.length >= 2 ? 2 : 1;
+    const minMatch = Number.isFinite(Number(args.min_match))
+      ? Math.min(Math.max(1, Math.floor(Number(args.min_match))), Math.max(1, keywords.length || 1))
+      : defaultMinMatch;
+    const candidateLimit = Number.isFinite(Number(args.candidate_limit))
+      ? Math.max(maxHits, Math.floor(Number(args.candidate_limit)))
+      : Math.max(maxHits * 3, 90);
 
-    console.log(`[history][getInformation#${reqId}:args]`, JSON.stringify({ channelId, keywords, window: windowN }, null, 2));
+    console.log(
+      `[history][getInformation#${reqId}:args]`,
+      JSON.stringify({ channelId, keywords, window: windowN, maxHits, minMatch, candidateLimit }, null, 2)
+    );
+
     if (!channelId) return JSON.stringify({ error: "channel_id missing" });
     if (!keywords.length) return JSON.stringify({ error: "no keywords" });
 
     const db = await getPool();
+    await ensureIndexes(db);
 
-    // 1) OR über alle Keywords — neueste zuerst, LIMIT 30
-    //    Stelle sicher, dass die Anzahl der Platzhalter exakt den Werten entspricht.
-    const clause = "(" + keywords.map(() => "content LIKE ?").join(" OR ") + ")";
+    // --- 1) Kandidaten: neuste rows im Channel, die mind. eins der Keywords enthalten
+    // Score = Summe (content LIKE ?)
     const likes = keywords.map((k) => `%${k}%`);
-    const hitSQL = `SELECT id FROM context_log WHERE channel_id = ? AND ${clause} ORDER BY id DESC LIMIT ?`;
-    const hitVals = [channelId, ...likes, Number(MAX_HITS)];
+    const sumExpr = keywords.map(() => "(content LIKE ?)").join(" + ");
+    const whereOr = keywords.map(() => "content LIKE ?").join(" OR ");
+
+    // Reihenfolge der Platzhalter: [ ...likes (für sumExpr), channelId, ...likes (für WHERE), minMatch ]
+    const candidateSQL = `
+      SELECT id, score FROM (
+        SELECT id, (${sumExpr}) AS score
+        FROM context_log
+        WHERE channel_id = ?
+          AND (${whereOr})
+        ORDER BY id DESC
+        LIMIT ${candidateLimit}
+      ) AS t
+      WHERE score >= ?
+      ORDER BY score DESC, id DESC
+      LIMIT ${candidateLimit}  -- nach Filter ggf. weniger; wir behalten den Pool groß für Window-Scoring
+    `;
+    const candidateVals = [...likes, channelId, ...likes, minMatch];
 
     const t0 = Date.now();
-    const [hitRows] = await db.execute(hitSQL, hitVals);
-    console.log(`[history][getInformation#${reqId}:hits]`, JSON.stringify({ rowCount: hitRows.length, dur: `${Date.now() - t0}ms` }, null, 2));
-    if (!hitRows.length) {
+    const [candidates] = await db.execute(candidateSQL, candidateVals);
+    console.log(
+      `[history][getInformation#${reqId}:candidates]`,
+      JSON.stringify({ candidates_found: candidates.length, dur: `${Date.now() - t0}ms` }, null, 2)
+    );
+    if (!candidates.length) {
       return JSON.stringify({
         data: [],
         count: 0,
-        meta: { hits_considered: 0, max_hits: MAX_HITS, window: windowN },
+        meta: {
+          keywords, min_match: minMatch, window: windowN, max_hits: maxHits, candidate_limit: candidateLimit,
+          candidates_found: 0, candidates_after_min_match: 0, selected_windows: 0,
+          scoring: "k-of-n + window relevance"
+        },
         note: "no matches"
       });
     }
 
-    // 2) Für jeden Hit: N vorher + Hit + N nachher — jeweils nur im selben Channel
-    const idSet = new Set();
+    // --- 2) Window-Relevanz je Kandidat
+    // Für jeden Kandidaten: ±N Rows (selber Channel), WindowScore berechnen.
+    // Wir puffern Rows in rowCache, damit wir später nicht erneut laden müssen.
+    const rowCache = new Map(); // id -> {id,sender,timestamp,content}
+    const windows = [];         // { anchorId, score, ids:Set<number> }
 
-    async function expandIdsAround(id) {
-      const beforeSQL = "SELECT id FROM context_log WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?";
-      const afterSQL  = "SELECT id FROM context_log WHERE channel_id = ? AND id > ? ORDER BY id ASC  LIMIT ?";
-      const [prevRows] = await db.execute(beforeSQL, [channelId, id, Number(windowN)]);
-      const [nextRows] = await db.execute(afterSQL,  [channelId, id, Number(windowN)]);
-      for (const r of prevRows) idSet.add(r.id); // prevRows sind DESC, egal – später global sortieren
-      idSet.add(id);
-      for (const r of nextRows) idSet.add(r.id);
+    async function loadCenterRow(id) {
+      const sql = "SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id = ? LIMIT 1";
+      const [rows] = await db.execute(sql, [channelId, id]);
+      return rows && rows[0] ? rows[0] : null;
+    }
+    async function loadBefore(id, n) {
+      const sql = "SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?";
+      const [rows] = await db.execute(sql, [channelId, id, n]);
+      return rows || [];
+    }
+    async function loadAfter(id, n) {
+      const sql = "SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id > ? ORDER BY id ASC LIMIT ?";
+      const [rows] = await db.execute(sql, [channelId, id, n]);
+      return rows || [];
     }
 
-    for (const h of hitRows) {
+    const kwLower = keywords.map((k) => String(k || "").toLowerCase());
+
+    function computeWindowScore(rows) {
+      // unique keywords across window
+      const seenKw = new Set();
+      let totalMatches = 0;
+      let adjacencyCount = 0;
+
+      for (const r of rows) {
+        const textLower = String(r.content || "").toLowerCase();
+        let perRowDistinct = 0;
+        for (const kw of kwLower) {
+          if (contains(textLower, kw)) {
+            if (!seenKw.has(kw)) seenKw.add(kw);
+            totalMatches += 1;
+            perRowDistinct += 1;
+          }
+        }
+        if (perRowDistinct >= 2) adjacencyCount += 1;
+      }
+
+      const uniqueCount = seenKw.size;                 // 0..N
+      const freqBonus = Math.max(0, totalMatches - uniqueCount) * 0.05; // 0.05 je Wiederholung
+      const adjBonus = Math.min(adjacencyCount * 0.2, 0.6);             // max 0.6 Bonus
+      const score = uniqueCount + adjBonus + Math.min(freqBonus, 0.5);  // max +0.5 aus Frequenz
+      return score;
+    }
+
+    for (const c of candidates) {
+      const anchorId = c.id;
       // eslint-disable-next-line no-await-in-loop
-      await expandIdsAround(h.id);
+      const [prev, center, next] = await Promise.all([
+        loadBefore(anchorId, windowN),
+        loadCenterRow(anchorId),
+        loadAfter(anchorId, windowN)
+      ]);
+
+      const prevAsc = [...prev].reverse(); // prev kommt DESC
+      const winRows = prevAsc.concat(center ? [center] : []).concat(next);
+
+      // Cache rows
+      for (const r of winRows) {
+        if (r && !rowCache.has(r.id)) rowCache.set(r.id, r);
+      }
+
+      const winScore = computeWindowScore(winRows);
+      const idSet = new Set(winRows.map((r) => r.id));
+
+      windows.push({ anchorId, score: winScore, ids: idSet });
     }
 
-    const ids = Array.from(idSet);
-    if (!ids.length) {
-      return JSON.stringify({
-        data: [],
-        count: 0,
-        meta: { hits_considered: hitRows.length, max_hits: MAX_HITS, window: windowN }
-      });
+    // --- 3) Auswahl der Top-Fenster: WindowScore DESC, dann Anker id DESC
+    windows.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return b.anchorId - a.anchorId;
+    });
+    const selected = windows.slice(0, maxHits);
+
+    // --- 4) Alle IDs der Top-Fenster global deduplizieren und final sortieren (ASC)
+    const globalIdSet = new Set();
+    for (const w of selected) {
+      for (const id of w.ids) globalIdSet.add(id);
+    }
+    const finalIds = Array.from(globalIdSet).sort((a, b) => a - b);
+
+    // Daten aus Cache; falls etwas fehlt (sollte selten sein), einmalig nachladen
+    const missing = finalIds.filter((id) => !rowCache.has(id));
+    if (missing.length) {
+      // Baue sichere Platzhalter für IN (...)
+      const qs = missing.map(() => "?").join(",");
+      const loadSQL = `SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id IN (${qs})`;
+      const [rows] = await db.execute(loadSQL, [channelId, ...missing]);
+      for (const r of rows || []) if (!rowCache.has(r.id)) rowCache.set(r.id, r);
     }
 
-    // 3) Alle Zeilen in einem Rutsch laden — baue IN(?,?,...) mit exakt passender Placeholder-Anzahl
-    ids.sort((a, b) => a - b); // sortiere IDs aufsteigend, damit Ausgabe chronologisch ist
-    const ph = ids.map(() => "?").join(",");
-    const loadSQL = `SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id IN (${ph})`;
-    const loadVals = [channelId, ...ids];
-    const [rows] = await db.execute(loadSQL, loadVals);
-
-    // Sortierung nach id ASC (falls DB nicht exakt in IN-Reihenfolge liefert)
-    rows.sort((a, b) => (a.id || 0) - (b.id || 0));
-
-    const data = rows.map((r) => ({
-      sender: String(r.sender || "").trim(),
-      timestamp: toISO(r.timestamp),
-      content: String(r.content || "").trim()
-    }));
+    const data = finalIds.map((id) => {
+      const r = rowCache.get(id) || {};
+      return {
+        sender: String(r.sender || "").trim(),
+        timestamp: toISO(r.timestamp),
+        content: String(r.content || "").trim()
+      };
+    });
 
     return JSON.stringify({
       data,
       count: data.length,
-      meta: { hits_considered: hitRows.length, max_hits: MAX_HITS, window: windowN }
+      meta: {
+        keywords,
+        min_match: minMatch,
+        window: windowN,
+        max_hits: maxHits,
+        candidate_limit: candidateLimit,
+        candidates_found: candidates.length,
+        candidates_after_min_match: candidates.length, // bereits nach min_match gefiltert
+        selected_windows: selected.length,
+        scoring: "k-of-n + window relevance"
+      }
     });
   } catch (err) {
     console.error(`[history][getInformation#${reqId}:ERROR]`, err?.message || err);
@@ -209,6 +393,10 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     if (!userPrompt) return "ERROR: user_prompt is required";
 
     const db = await getPool();
+    // Diese Funktion ist weniger suchlastig; Index-Anlage hier nicht zwingend notwendig,
+    // aber harmless – wir rufen es nicht erneut auf, wenn bereits vorhanden.
+    await ensureIndexes(db);
+
     let rows = [];
 
     if (frames.length > 0) {
