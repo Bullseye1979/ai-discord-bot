@@ -382,7 +382,7 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
     const model = String(args.model || process.env.TIMEFRAME_MODEL || "gpt-4.1");
     const maxTokens = Number.isFinite(Number(args.max_tokens))
       ? Math.max(256, Math.floor(Number(args.max_tokens)))
-      : Math.max(256, Math.floor(Number(process.env.TIMEFRAME_TOKENS || 1400)));
+      : Math.max(256, Math.floor(Number(process.env.TIMEFRAME_TOKENS || 12000)));
 
     console.log(
       `[history][getHistory#${reqId}:args]`,
