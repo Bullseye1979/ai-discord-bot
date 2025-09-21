@@ -1,26 +1,19 @@
-// aiCore.js — unified flow v2.38 (Tool-Chaining + Finalizer w/ Continue, no link parsing, NO_DB_PERSIST)
-// - EIN Flow für native & Pseudo-Tools (gesteuert via pseudotoolcalls = true|false)
+// aiCore.js — unified flow v2.39
+// (Fix: sammle alle Assistant-Teile über Continue-Runden → kein "nur der Schluss" mehr; Bugfix für finish_reason-Handling)
+// -------------------------------------------------------------------------------
+// - EIN Flow für native & Pseudo-Tools (pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
 // - pseudotoolcalls=false: Tool-Chaining wie früher: solange das Modell tool_calls sendet, weiter ausführen
 //   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
-//   + NEU v2.38: Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
-//   + NEU v2.38: Finalizer kann auch bei "continue" ohne neue Tool-Outputs erzwungen werden
-// - Sonderfall (früher): Pseudo+einzelne Bild-URL -> skip Finale (URL-only Contract)  => ENTFERNT
+//   + v2.38: Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
+//   + v2.38: Finalizer kann auch bei "continue" ohne neue Tool-Outputs erzwungen werden
 // - Kein Fabricate, kein Auto-Prompt-Fill
 //
-// v2.36:
-// - Link-Parser entfernt
-// - Finalizer wird nie wegen „single URL“ übersprungen.
-//
-// v2.37 (kein Kontextverlust):
-// - injectToolOutputAsAssistantParts(ctx, toolName, rawPayload[, partSize]) – lange Tool-Outputs als normale Assistant-Parts (RAM)
-// - Finalizer nutzt die injizierten Parts direkt.
-//
-// v2.38 (Finalizer-Continue):
-// - FINALIZER_MAX_ROUNDS / FINALIZER_CONTINUE_ON_LENGTH (per ENV konfigurierbar)
-// - Finalizer-Continue: Bei finish_reason === "length" wird intern "continue" injiziert und erneut finalisiert.
-// - Force-Finalizer bei reinen "continue"-Turns, wenn bereits anchored Parts vorhanden.
+// v2.39 (dieser Build):
+// - NEU: collectedAssistantParts => akkumuliert ALLE Textteile über Runden (auch den letzten Turn)
+// - Rückgabe bevorzugt die kumulierte Ausgabe, wenn keine Tools/Finaisierung notwendig war
+// - Bugfix: finish_reason nicht mehr über globale Variable "theFinish"
 //
 // NO_DB_PERSIST:
 // - Tool-Ergebnisse werden NICHT in die Datenbank/History geschrieben.
@@ -502,6 +495,7 @@ async function getAIResponse(
 
     const toolResults = []; // { name, raw }[]
     let lastRawAssistant = "";
+    const collectedAssistantParts = []; // <<< v2.39: sammelt ALLE Teile
 
     /* ===== CHAIN LOOP (native tools) / SINGLE SHOT (pseudo) ===== */
     let rounds = 0;
@@ -574,10 +568,15 @@ async function getAIResponse(
 
       const choice = aiResponse?.data?.choices?.[0] || {};
       const aiMessage = choice.message || {};
-      theFinish = choice.finish_reason;
-      const finishReason = theFinish;
+      const finishReason = choice.finish_reason; // <<< v2.39: korrekt lokal, kein globales theFinish
       const rawText = (aiMessage.content || "").trim();
       lastRawAssistant = rawText;
+
+      // <<< v2.39: IMMER sammeln, egal ob length oder nicht
+      if (rawText) {
+        collectedAssistantParts.push(rawText);
+      }
+
       const nativeToolCalls = Array.isArray(aiMessage.tool_calls) ? aiMessage.tool_calls : [];
 
       dbg("Assistant text (raw):", rawText ? rawText.slice(0, 200) : "(empty)");
@@ -696,12 +695,15 @@ async function getAIResponse(
         if (hadToolCallsThisTurn) {
           continueLoop = true;
         } else if (finishReason === "length" && rounds < sequenceLimit) {
+          // Bei Abbruch wegen Token-Limit: dieses Teilstück in den Verlauf + "continue" anstoßen
           if (rawText) {
             context.messages.push({ role: "assistant", content: rawText });
           }
           context.messages.push({ role: "user", content: "continue" });
           continueLoop = true;
         } else {
+          // letzter Turn ohne Toolcalls und ohne length → Ende
+          // (letztes Stück ggf. noch NICHT im Verlauf – das ist okay; wir haben es in collectedAssistantParts)
           continueLoop = false;
         }
       }
@@ -722,7 +724,12 @@ async function getAIResponse(
     if (rendered.length > 0) {
       responseMessage = rendered.join("\n\n").trim();
     } else {
-      responseMessage = String(lastRawAssistant || "");
+      // v2.39: Wenn keine Tools beteiligt sind, nimm die GESAMTE gesammelte Antwort
+      if (collectedAssistantParts.length > 0) {
+        responseMessage = collectedAssistantParts.join("\n").trim();
+      } else {
+        responseMessage = String(lastRawAssistant || "");
+      }
     }
     if (!responseMessage) {
       if (noToolcallPolicy === "error") responseMessage = "TOOLCALL_MISSING";
@@ -748,7 +755,6 @@ async function getAIResponse(
            !/^\s*\[(TOOL_RESULT|TOOL_OUTPUT)\s*:/.test(m.content)
     );
 
-    // Änderung A: continue erzwingt Finalizer auch ohne Anchors, sofern Textteile existieren
     const forceFinalizeOnContinue =
       userWantsContinue && (hasAnchoredParts(context.messages) || hasAnyFinalizedText);
 
