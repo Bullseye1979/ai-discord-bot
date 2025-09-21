@@ -1,5 +1,6 @@
-// aiCore.js — unified flow v2.39
-// (Fix: sammle alle Assistant-Teile über Continue-Runden → kein "nur der Schluss" mehr; Bugfix für finish_reason-Handling)
+// aiCore.js — unified flow v2.40
+// (Fix v2.40: Synchronisiere die gesammelten Assistant-Teile in den Verlauf nach der Kettenschleife,
+//  damit der komplette Text auch im Kontext vorhanden ist; Duplikate werden vermieden.)
 // -------------------------------------------------------------------------------
 // - EIN Flow für native & Pseudo-Tools (pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
@@ -8,12 +9,9 @@
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
 //   + v2.38: Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
 //   + v2.38: Finalizer kann auch bei "continue" ohne neue Tool-Outputs erzwungen werden
+// - v2.39: collectedAssistantParts sammelt ALLE Textteile, finish_reason-Handling gefixt
+// - v2.40: collectedAssistantParts werden nach der Schleife in context.messages gemerged (kein „nur der Schluss“ im Kontext)
 // - Kein Fabricate, kein Auto-Prompt-Fill
-//
-// v2.39 (dieser Build):
-// - NEU: collectedAssistantParts => akkumuliert ALLE Textteile über Runden (auch den letzten Turn)
-// - Rückgabe bevorzugt die kumulierte Ausgabe, wenn keine Tools/Finaisierung notwendig war
-// - Bugfix: finish_reason nicht mehr über globale Variable "theFinish"
 //
 // NO_DB_PERSIST:
 // - Tool-Ergebnisse werden NICHT in die Datenbank/History geschrieben.
@@ -495,7 +493,7 @@ async function getAIResponse(
 
     const toolResults = []; // { name, raw }[]
     let lastRawAssistant = "";
-    const collectedAssistantParts = []; // <<< v2.39: sammelt ALLE Teile
+    const collectedAssistantParts = []; // v2.39+: sammelt ALLE Teile
 
     /* ===== CHAIN LOOP (native tools) / SINGLE SHOT (pseudo) ===== */
     let rounds = 0;
@@ -568,11 +566,11 @@ async function getAIResponse(
 
       const choice = aiResponse?.data?.choices?.[0] || {};
       const aiMessage = choice.message || {};
-      const finishReason = choice.finish_reason; // <<< v2.39: korrekt lokal, kein globales theFinish
+      const finishReason = choice.finish_reason; // korrekt lokal
       const rawText = (aiMessage.content || "").trim();
       lastRawAssistant = rawText;
 
-      // <<< v2.39: IMMER sammeln, egal ob length oder nicht
+      // Immer sammeln, egal ob length oder nicht
       if (rawText) {
         collectedAssistantParts.push(rawText);
       }
@@ -703,11 +701,25 @@ async function getAIResponse(
           continueLoop = true;
         } else {
           // letzter Turn ohne Toolcalls und ohne length → Ende
-          // (letztes Stück ggf. noch NICHT im Verlauf – das ist okay; wir haben es in collectedAssistantParts)
+          // (letztes Stück ggf. noch NICHT im Verlauf – wir haben es gesammelt)
           continueLoop = false;
         }
       }
     } // END while chain
+
+    // v2.40 — Synchronisiere die gesammelten Textteile in den Verlauf (ohne Duplikate)
+    if (collectedAssistantParts.length > 0) {
+      const combined = collectedAssistantParts.join("\n").trim();
+      const lastMsg = context.messages[context.messages.length - 1];
+      const alreadySame =
+        lastMsg && lastMsg.role === "assistant" &&
+        typeof lastMsg.content === "string" &&
+        lastMsg.content.trim() === combined;
+
+      if (!alreadySame) {
+        context.messages.push({ role: "assistant", content: combined });
+      }
+    }
 
     /* ----- Antwortaufbereitung / Rendering ----- */
     let rendered = [];
@@ -724,7 +736,7 @@ async function getAIResponse(
     if (rendered.length > 0) {
       responseMessage = rendered.join("\n\n").trim();
     } else {
-      // v2.39: Wenn keine Tools beteiligt sind, nimm die GESAMTE gesammelte Antwort
+      // Wenn keine Tools beteiligt sind, nimm die gesammelte Antwort
       if (collectedAssistantParts.length > 0) {
         responseMessage = collectedAssistantParts.join("\n").trim();
       } else {
