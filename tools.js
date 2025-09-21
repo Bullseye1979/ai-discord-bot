@@ -158,6 +158,8 @@ const tools = [
         "Find relevant timeframes in THIS Discord channel by AND-matching the provided keywords on message content, " +
         "DO NOT USE THIS, WHEN THE TIMEFRAME ALREADY KNOWN,"+
         "DO NOT USE THIS, WHEN THE TIME OR DATE ON WHICH TO SEARCH IS SPECIFIED,"+
+        "TRY TO AVOID USING THIS FUNCTION! ONLY USE IT WHEN REALLY NEEDED ! "+
+        "ONLY USE THIS FOR KEYWORD SEARCHES (e.g. when you search for a specific person or event, or if you want to answer a specific question)." +
         "then expanding each hit to a window of ±N rows (same channel). Returns JSON with merged {start,end} ISO timestamps for each timeframe. " +
         "Use this to locate episodes (e.g., an arc with 'murphy'), then call getHistory with one or multiple returned timeframes.",
       parameters: {

@@ -431,6 +431,15 @@ async function runFinalizeWithContinue(context, tokenlimit, model, apiKey, optio
     }
   }
 
+  // *** Sicherstellen, dass das KOMPLETTE Finalizer-Ergebnis als LETZTE
+  //     Assistant-Nachricht im Verlauf steht. ***
+  if (combined) {
+    const last = context.messages[context.messages.length - 1];
+    if (!(last && last.role === "assistant" && String(last.content || "").trim() === combined)) {
+      context.messages.push({ role: "assistant", content: combined });
+    }
+  }
+
   return combined.trim();
 }
 
