@@ -1,6 +1,9 @@
-// discord-helper.js — refactored v3.5 (v3.4 + _API.pseudotoolcalls flag)
+// discord-helper.js — refactored v3.6 (v3.5 + robust embed error logging & granular fallback)
 // Avatar aus Channel-Config-Prompt (+ Persona/Name-Addendum), Cache-Busting, strict channel-only config, safe URLs
-// NEU: getChannelConfig() normalisiert einen _API-Block → { api: { enabled, key, model?, max_tokens?, tools[], toolRegistry{}, apikey?, endpoint?, pseudotoolcalls? } }
+// NEU v3.6: setReplyAsWebhookEmbed mit verbessertem Fehlerhandling:
+//  - Gruppenversand der Embeds -> bei Fehler Logging + Einzelversand versuchen
+//  - Falls auch einzeln zu groß -> Plain-Text-Fallback pro Teil
+//  - Immer reportError() vor Fallback, optional Konsolen-Logs, optional Hinweis im Channel via ENV
 
 const fs = require("fs");
 const os = require("os");
@@ -46,11 +49,7 @@ function buildPublicAvatarUrl(channelId, withVersion = true) {
   return withVersion ? `${base}?v=${v}` : base;
 }
 
-/** Endgültigen Avatar-Prompt aufbauen:
- *  1) Primär: channelMeta.avatarPrompt / imagePrompt (wie in der Config)
- *  2) Zusatzinfos: Botname, Persona (kurz), und harte Discord-Avatar-Constraints
- *  3) Fallback: sehr kurzer generischer Prompt
- */
+/** Endgültigen Avatar-Prompt aufbauen */
 async function buildAvatarPrompt(channelMeta = {}) {
   try {
     const botname = String(channelMeta?.botname || channelMeta?.name || "bot").trim();
@@ -69,7 +68,7 @@ async function buildAvatarPrompt(channelMeta = {}) {
       return `${baseFromConfig} — for ${botname}; ${constraints}${personaLine ? "; " + personaLine : ""}`;
     }
 
-    // Minimaler Fallback, falls keine Vorgabe in der Config steht
+    // Minimaler Fallback
     const personaHint = persona ? `, subtle hints from persona: ${persona.slice(0, 120)}` : "";
     return `Minimal, friendly ${botname} mascot head-and-shoulders; clean vector lines${personaHint}; ${constraints}`;
   } catch (err) {
@@ -127,7 +126,6 @@ function getChannelConfig(channelId) {
         max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
         avatarPrompt: "", imagePrompt: "",
-        // Neuer API-Block: disabled default
         api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false }
       };
     }
@@ -170,20 +168,17 @@ function getChannelConfig(channelId) {
     const chatAppend = typeof cfgChatAppend === "string" ? cfgChatAppend.trim() : "";
     const speechAppend = typeof cfgSpeechAppend === "string" ? cfgSpeechAppend.trim() : "";
 
-    // Avatar-Prompt aus Config mitgeben (für ensureChannelAvatar → buildAvatarPrompt)
     const avatarPrompt = typeof cfg.avatarPrompt === "string" ? cfg.avatarPrompt : "";
     const imagePrompt = typeof cfg.imagePrompt === "string" ? cfg.imagePrompt : "";
 
-    // Channel-Tools normalisieren
     const { registry: toolRegistry, tools: ctxTools } = getToolRegistry(selectedTools);
 
-    // Avatar-URL berechnen
     const avatarPath = path.join(__dirname, "documents", "avatars", `${channelId}.png`);
     const avatarUrl = fs.existsSync(avatarPath) ? buildPublicAvatarUrl(channelId, true) : buildPublicAvatarUrl("default", true);
 
     const summariesEnabled = !!String(summaryPrompt || "").trim();
 
-    // ===== NEU: _API-Block normalisieren =====
+    // _API-Block normalisieren
     const apiRaw = (cfg._API && typeof cfg._API === "object") ? cfg._API : null;
     let api = {
       enabled: false,
@@ -203,9 +198,8 @@ function getChannelConfig(channelId) {
       api.max_tokens = Number.isFinite(Number(apiRaw.max_tokens)) ? Math.floor(Number(apiRaw.max_tokens)) : null;
       api.apikey = typeof apiRaw.apikey === "string" ? apiRaw.apikey : "";
       api.endpoint = typeof apiRaw.endpoint === "string" ? apiRaw.endpoint : "";
-      api.pseudotoolcalls = !!apiRaw.pseudotoolcalls; // <— NEU
+      api.pseudotoolcalls = !!apiRaw.pseudotoolcalls;
 
-      // API-Tools separat aufbereiten
       const apiToolsInput = Array.isArray(apiRaw.tools) ? apiRaw.tools : [];
       const { registry: apiToolReg, tools: apiTools } = getToolRegistry(apiToolsInput);
       api.tools = apiTools;
@@ -218,7 +212,6 @@ function getChannelConfig(channelId) {
       max_user_messages, hasConfig: true, summariesEnabled, admins,
       max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
       avatarPrompt, imagePrompt,
-      // neu
       api
     };
   } catch (err) {
@@ -299,11 +292,10 @@ async function setBotPresence(
     let activities = [];
 
     if (activityType === 4) {
-      // Custom Status → discord.js will trotzdem "name"
       activities.push({
         type: 4,
-        name: activityText,        // ja: hier MUSS "name" stehen
-        emoji: undefined           // oder { name: "⏳" }
+        name: activityText,
+        emoji: undefined
       });
     } else {
       activities.push({
@@ -424,36 +416,28 @@ function prepareTextForEmbed(text) {
 function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|bmp|tiff?)($|\?|\#)/i.test(u); }
 function cleanUrl(u) { try { return u.replace(/[),.]+$/g, ""); } catch { return u; } }
 
-/** NEW: TTS-Text so vorbereiten, dass keine Links vorgelesen werden.
- *  - Bilder-Markdown:  ![Alt](url)  →  "Alt" (oder "Bild" wenn Alt leer)
- *  - Links-Markdown:   [Label](url) →  "Label"
- *  - nackte URLs:      http(s)://…   →  entfernt
- */
+/** NEW: TTS-Text vorbereiten (keine URLs vorlesen) */
 function prepareTextForTTS(text) {
   if (!text) return "";
   let s = String(text);
 
-  // 1) Bilder: nur Alt lesen
   s = s.replace(/!\[([^\]]*)]\((https?:\/\/[^\s)]+)\)/g, (_m, alt) => {
     const a = (alt || "").trim();
     return a || "";
   });
 
-  // 2) Links: nur Label lesen
   s = s.replace(/\[([^\]]+)]\((https?:\/\/[^\s)]+)\)/g, (_m, label) => {
     return (label || "").trim();
   });
 
-  // 3) nackte URLs komplett entfernen
   s = s.replace(/https?:\/\/[^\s)]+/g, "");
 
-  // 4) Überzählige Klammern/Reste und Whitespace säubern
   s = s.replace(/[ \t]+/g, " ").replace(/\s*\(\s*\)\s*/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
   return s;
 }
 
-/** Reply via webhook plain text (chunked), mit Avatar-Update und Versioning */
+/** Reply via webhook plain text (chunked) */
 async function setReplyAsWebhook(message, content, { botname } = {}) {
   try {
     const isThread = typeof message.channel.isThread === "function" ? message.channel.isThread() : false;
@@ -485,6 +469,29 @@ async function setReplyAsWebhook(message, content, { botname } = {}) {
     await reportError(err, message?.channel, "REPLY_WEBHOOK");
     try { await sendChunked(message.channel, content); } catch {}
   }
+}
+
+/** Helper: Size/Validation Fehler erkennen */
+function isEmbedSizeError(err) {
+  const code = (err?.rawError?.code || err?.code || err?.status || "").toString();
+  const msg = (err?.message || "");
+  const raw = (err?.rawError && JSON.stringify(err.rawError)) || "";
+  return (
+    code === "50035" ||
+    msg.includes("MAX_EMBED_SIZE_EXCEEDED") ||
+    msg.includes("BASE_TYPE_MAX_LENGTH") ||
+    raw.includes("MAX_EMBED_SIZE_EXCEEDED") ||
+    raw.includes("BASE_TYPE_MAX_LENGTH")
+  );
+}
+
+/** Optionaler Kanalhinweis bei Fallback */
+async function maybeNotifyFallback(channel, text) {
+  try {
+    if (String(process.env.EMBED_FALLBACK_NOTICE || "0") === "1") {
+      await channel.send({ content: text });
+    }
+  } catch {}
 }
 
 /** Reply via webhook as embeds (avatar/versioning, hard-safe chunking) */
@@ -550,11 +557,9 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
     const footerText = `${baseName}${modelPart}`;
 
-    // Schätze den Overhead (Discord zählt UTF-16 Code Units; hier reicht einfache Länge)
-    const EST_OVERHEAD = authorName.length + footerText.length + 32; // +32 Sicherheitsmarge
-    // Budget für description unter 4096 und so, dass Summe < 6000 bleibt
+    // Overhead-Schätzung
+    const EST_OVERHEAD = authorName.length + footerText.length + 32;
     let DESC_BUDGET = Math.min(HARD_DESC_MAX, Math.max(500, HARD_EMBED_SUM - EST_OVERHEAD));
-    // Extra Sicherheitsmarge gegen Off-by-one/Invisible chars
     DESC_BUDGET = Math.min(DESC_BUDGET, 4000);
 
     // Smarter Slicer
@@ -567,7 +572,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       return s.slice(0, cut).trim();
     };
 
-    // In Embed-Beschreibungsteile splitten (unter Budget)
+    // In Embed-Beschreibungsteile splitten
     const descChunks = [];
     let remaining = fullDesc;
     while (remaining.length > 0) {
@@ -579,10 +584,8 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
 
     // Embed-Factory mit finalem Check (Total <= 6000)
     const makeEmbed = (desc, addImage = false) => {
-      // Falls desc doch zu groß (extreme Unicode-Fälle) → hart trimmen
       if (desc.length > HARD_DESC_MAX) desc = desc.slice(0, HARD_DESC_MAX);
 
-      // finale Gesamtsumme prüfen; wenn nötig, desc nachtrimmen
       const totalLen = desc.length + authorName.length + footerText.length;
       const maxDescByTotal = Math.min(HARD_DESC_MAX, Math.max(0, HARD_EMBED_SUM - (authorName.length + footerText.length)));
       if (totalLen > HARD_EMBED_SUM && desc.length > maxDescByTotal) {
@@ -605,7 +608,7 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     // Embeds bauen, Bild nur im ersten
     const embeds = descChunks.map((d, i) => makeEmbed(d, i === 0));
 
-    // In Paketen zu je 10 senden; wenn mehr → mehrere Nachrichten
+    // === Versand: Gruppenweise (bis 10), dann bei Fehler -> Einzelweise, dann -> Text-Fallback ===
     for (let i = 0; i < embeds.length; i += MAX_EMBEDS_PER_MSG) {
       const slice = embeds.slice(i, i + MAX_EMBEDS_PER_MSG);
       try {
@@ -618,21 +621,52 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
           threadId: isThread ? message.channel.id : undefined
         });
       } catch (err) {
-        // Fallback: wenn trotz Vorsicht 50035 kommt, weiche auf Plain-Text (chunked) aus.
-        const code = (err?.rawError?.code || err?.code || err?.status || "").toString();
-        const msg = (err?.message || "");
-        if (msg.includes("MAX_EMBED_SIZE_EXCEEDED") || msg.includes("BASE_TYPE_MAX_LENGTH") || code === "50035") {
-          // Plain-Text Fallback
-          const plain = descChunks.join("\n\n");
-          await sendChunked(isThread ? message.channel : hookChannel, plain);
+        // 1) Logging
+        try { await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED_GROUP_SEND"); } catch {}
+        try { console.error("[EMBED SEND ERROR - GROUP]", err?.rawError || err); } catch {}
+
+        // 2) Wenn Größenproblem: Einzel-Embeds versuchen
+        if (isEmbedSizeError(err)) {
+          await maybeNotifyFallback(isThread ? message.channel : hookChannel, "Embed war zu groß – versuche Einzel-Embeds …");
+          for (const single of slice) {
+            try {
+              await hook.send({
+                content: "",
+                username: authorName,
+                avatarURL: personaAvatarUrl || undefined,
+                embeds: [single],
+                allowedMentions: { parse: [] },
+                threadId: isThread ? message.channel.id : undefined
+              });
+            } catch (e2) {
+              // 3) Wieder Logging
+              try { await reportError(e2, message?.channel, "REPLY_WEBHOOK_EMBED_SINGLE_SEND"); } catch {}
+              try { console.error("[EMBED SEND ERROR - SINGLE]", e2?.rawError || e2); } catch {}
+
+              // 4) Wenn auch einzelnes Embed zu groß -> Plain-Text-Fallback für GANZ GENAU diesen Teil
+              if (isEmbedSizeError(e2)) {
+                await maybeNotifyFallback(isThread ? message.channel : hookChannel, "Embed weiterhin zu groß – sende als Text.");
+                const plain = String(single?.description || "");
+                if (plain.trim()) {
+                  await sendChunked(isThread ? message.channel : hookChannel, plain);
+                }
+              } else {
+                // Nicht-Größenfehler -> eskalieren (damit outer catch greifen kann)
+                throw e2;
+              }
+            }
+          }
         } else {
+          // Kein Größenfehler -> outer catch
           throw err;
         }
       }
     }
   } catch (err) {
+    // Outer Catch: allgemeiner Fehler beim gesamten Embed-Prozess
     await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED");
-    // letzter Fallback
+    try { console.error("[REPLY_WEBHOOK_EMBED - OUTER]", err?.rawError || err); } catch {}
+    // letzter Fallback: kompletter Text
     try { await sendChunked(message.channel, aiText); } catch {}
   }
 }
@@ -825,7 +859,7 @@ async function getSpeech(connection, guildId, text, client, voice) {
   try {
     if (!connection || !text?.trim()) return;
 
-    // WICHTIG: Links/URLs entfernen, nur Alt-/Link-Text vorlesen
+    // Links entfernen, nur Alt-/Link-Text vorlesen
     const prepared = prepareTextForTTS(text);
 
     const chunks = getSplitTextToChunks(prepared);
