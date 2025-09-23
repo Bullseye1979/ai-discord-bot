@@ -1,22 +1,5 @@
-// readyStatus.js — v2.0 (presence allow-list via channel-config/*.json)
-// - Lädt bei jedem Aufruf/Cron die Allow-List aus JSON-Dateien im Ordner channel-config/.
-//   Dateiname = <channelId>.json; nur Dateien mit { "presence": 1 } werden berücksichtigt.
-// - maybeUpdateReadyStatus(client, { force?: boolean }):
-//     * Baut Allow-List dynamisch (zur Laufzeit wirksam).
-//     * Rollt 1..X (READY_STATUS_DIE_MAX), außer force=true.
-//     * Überspringt bei "⌛" (busy), außer force=true.
-//     * Liest nur Logs aus erlaubten Channels (IN-Klausel).
-//     * Setzt Presence auf Einzeiler (SOFTLEN/HARDLEN), speichert letzten Text im Speicher.
-// - startReadyStatusCron(client):
-//     * Läuft alle READY_STATUS_CRON_MINUTES Minuten (default 15).
-//     * Nutzt dieselbe Logik wie maybeUpdateReadyStatus.
-//
-// ENV:
-//   READY_STATUS_ENABLED=1|0
-//   READY_STATUS_DIE_MAX=integer (default 12)
-//   READY_STATUS_CRON_MINUTES=number (default 15)
-//   READY_STATUS_MODEL=string (default "gpt-4o-mini")
-//   CHANNEL_CONFIG_DIR=string (default "./channel-config")
+// readyStatus.js — v2.1 (presence allow-list + DB-change guard)
+// - Neu: Generiert NUR neuen Status, wenn sich die höchste Log-ID seit letztem Update verändert hat.
 
 require("dotenv").config();
 const fs = require("fs");
@@ -33,12 +16,20 @@ const HARDLEN = 40;  // absolute safety cap
 
 // ===== Ready memory (module-level) =====
 let _lastReadyText = "✅ Ready";
+let _lastLogId = 0;  // höchste ID aus context_log, die bereits verarbeitet wurde
+
 function getLastReadyText() {
   return _lastReadyText;
 }
 function setLastReadyText(s) {
   const t = String(s || "").trim();
   _lastReadyText = t || "✅ Ready";
+}
+function getLastLogId() {
+  return _lastLogId;
+}
+function setLastLogId(id) {
+  _lastLogId = Number(id) || 0;
 }
 
 // ===== DB pool =====
@@ -69,24 +60,17 @@ function hardTrimOneLine(input, max = HARDLEN) {
   const oneLine = String(input || "").replace(/\s+/g, " ").trim();
   if (!oneLine) return "";
   try {
-    // Grapheme-safe (handles emojis/combining marks/ZWJ)
     const seg = new Intl.Segmenter("und", { granularity: "grapheme" });
     const graphemes = Array.from(seg.segment(oneLine), s => s.segment);
     if (graphemes.length <= max) return oneLine;
     return graphemes.slice(0, max).join("");
   } catch {
-    // Fallback: code point slice
     const cp = [...oneLine];
     if (cp.length <= max) return oneLine;
     return cp.slice(0, max).join("");
   }
 }
 
-/**
- * Lädt alle JSON-Dateien in CHANNEL_CONFIG_DIR (default ./channel-config) und
- * bildet eine Allow-List aller channel_ids, deren Datei "presence": 1 enthält.
- * Datei-Name muss <channelId>.json sein.
- */
 function loadPresenceAllowList() {
   const dir = String(process.env.CHANNEL_CONFIG_DIR || "./channel-config").trim();
   const allow = [];
@@ -119,32 +103,24 @@ function loadPresenceAllowList() {
   return allow;
 }
 
-/**
- * Baut eine sichere IN-Klausel und Werte für mysql2 execute().
- * Gibt { clause: "IN (?, ?, ...)", values: [v1, v2, ...] } zurück.
- */
 function buildInClause(values) {
   const arr = Array.from(values || []).filter(v => String(v || "").trim().length > 0);
-  if (arr.length === 0) return { clause: "IN (?)", values: [["__EMPTY__"]] }; // nie matchen
+  if (arr.length === 0) return { clause: "IN (?)", values: [["__EMPTY__"]] };
   const ph = arr.map(() => "?").join(", ");
   return { clause: `IN (${ph})`, values: arr };
 }
 
-/**
- * Holt die letzten N Logs, aber NUR aus erlaubten Channels.
- */
 async function fetchLastLogs(limit = 20, allowList = []) {
   const n = Math.max(1, Math.min(200, Number(limit) || 20));
   const db = await getPool();
 
   if (!Array.isArray(allowList) || allowList.length === 0) {
-    // Kein erlaubter Channel -> nichts tun
-    return [];
+    return { rows: [], maxId: 0 };
   }
 
   const { clause, values } = buildInClause(allowList);
   const sql =
-    `SELECT channel_id, role, sender, content
+    `SELECT id, channel_id, role, sender, content
        FROM context_log
       WHERE channel_id ${clause}
    ORDER BY id DESC
@@ -152,7 +128,8 @@ async function fetchLastLogs(limit = 20, allowList = []) {
 
   const params = [...values, n];
   const [rows] = await db.execute(sql, params);
-  return rows || [];
+  const maxId = rows && rows.length ? Math.max(...rows.map(r => Number(r.id) || 0)) : 0;
+  return { rows: rows || [], maxId };
 }
 
 async function buildStatusFromLogs(rows, model, maxTokens = 64) {
@@ -190,13 +167,6 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
   return hardTrimOneLine(out, HARDLEN);
 }
 
-/**
- * maybeUpdateReadyStatus(client, { force })
- * - Lädt Allow-List dynamisch
- * - Gibt bei leerer Allow-List ruhig auf
- * - Rollt die "Würfelchance", außer force = true
- * - Blockt bei "⌛", außer force = true
- */
 async function maybeUpdateReadyStatus(client, opts = {}) {
   try {
     const enabled = String(process.env.READY_STATUS_ENABLED ?? "1").trim() !== "0";
@@ -216,25 +186,30 @@ async function maybeUpdateReadyStatus(client, opts = {}) {
     const busy = presenceName.includes("⌛");
     if (busy && !opts.force) return;
 
-    const rows = await fetchLastLogs(20, allowList);
+    const { rows, maxId } = await fetchLastLogs(20, allowList);
     if (!rows.length) {
       console.log("[readyStatus] No recent logs in allowed channels; skipping.");
+      return;
+    }
+
+    // === NEU: Nur weiter, wenn maxId > _lastLogId ===
+    if (maxId <= getLastLogId() && !opts.force) {
+      console.log(`[readyStatus] No new logs since last update (lastLogId=${getLastLogId()}); skipping.`);
       return;
     }
 
     const line = await buildStatusFromLogs(rows, process.env.READY_STATUS_MODEL || "gpt-4o-mini");
     if (!line) return;
 
-    setLastReadyText(line);                           // remember
-    await setBotPresence(client, line, "online", 4);  // update presence (custom status)
-    console.log(`[readyStatus] presence updated: "${line}" (channels: ${allowList.length})`);
+    setLastReadyText(line);
+    setLastLogId(maxId); // merken!
+    await setBotPresence(client, line, "online", 4);
+    console.log(`[readyStatus] presence updated: "${line}" (channels: ${allowList.length}, lastLogId=${maxId})`);
   } catch (err) {
-    // Silent fail: keep current ready text
     console.error("[readyStatus] failed:", err?.message || err);
   }
 }
 
-// ===== Cron (hourglass-aware unless forced) =====
 function startReadyStatusCron(client) {
   const interval = Number(process.env.READY_STATUS_CRON_MINUTES || 15);
   if (!interval || interval <= 0) return;
