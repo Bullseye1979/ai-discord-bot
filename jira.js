@@ -1,9 +1,11 @@
-// jira.js — v1.4
+// jira.js — v1.5
 // Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries + ORDER BY fix
+// + Defaults: request useful fields (key, summary, status, …) if none provided
+//
 // - Accepts JSON and forwards directly to Jira; returns raw JSON
 // - Enforces defaultProjectKey unless meta.allowCrossProject === true
 // - ALWAYS migrates search to POST /rest/api/3/search/jql (maps legacy /search GET/POST automatically)
-// - Fix: keep ORDER BY at end of whole JQL (do not put it inside parentheses when prefixing project)
+// - Keeps ORDER BY at the end of the whole JQL (do not wrap it inside parentheses)
 // - Gentle retries for 5xx/429
 // - Lazy-require getChannelConfig to avoid circular dependency
 
@@ -82,7 +84,6 @@ function asArray(v) {
   if (v === undefined || v === null) return undefined;
   if (Array.isArray(v)) return v;
   const s = String(v);
-  // allow comma-separated lists
   if (s.includes(",")) return s.split(",").map(x => x.trim()).filter(Boolean);
   return [s];
 }
@@ -104,14 +105,13 @@ async function axiosWithRetry(opts, max = 2) {
 
 /* -------------------- ORDER BY handling + Project restriction -------------- */
 
-// Split JQL into { core, orderBy } so ORDER BY stays at the very end.
 function splitJqlOrderBy(jql) {
   const src = String(jql || "");
   const m = src.match(/\border\s+by\b/i);
   if (!m) return { core: src.trim(), orderBy: "" };
   const idx = m.index;
   const core = src.slice(0, idx).trim();
-  const orderBy = src.slice(idx).trim(); // includes "ORDER BY ..."
+  const orderBy = src.slice(idx).trim();
   return { core, orderBy };
 }
 
@@ -120,49 +120,63 @@ function prefixProjectToJql(jql, projectKey) {
   const base = String(core || "").trim();
   const proj = `project = "${projectKey}"`;
 
-  if (!projectKey) {
-    return [base, orderBy].filter(Boolean).join(" ").trim();
-  }
+  if (!projectKey) return [base, orderBy].filter(Boolean).join(" ").trim();
+  if (!base) return [proj, orderBy].filter(Boolean).join(" ").trim();
 
-  if (!base) {
-    const withProj = proj;
-    return [withProj, orderBy].filter(Boolean).join(" ").trim();
-  }
-
-  // If core already has same project, don't duplicate
   const re = new RegExp(`project\\s*=\\s*"?${projectKey.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}"?`, "i");
   const coreWithProj = re.test(base) ? base : `${proj} AND (${base})`;
-
   return [coreWithProj, orderBy].filter(Boolean).join(" ").trim();
 }
 
-/**
- * Normalize any search call to POST /rest/api/3/search/jql with body fields.
- * Accepts legacy:
- *   - GET /rest/api/3/search?jql=...&maxResults=...&startAt=...&fields=...&expand=...
- *   - POST /rest/api/3/search { jql, maxResults, startAt, fields, expand }
- * New canonical:
- *   - POST /rest/api/3/search/jql { jql, maxResults, startAt, fields, expand }
- */
+/* -------------------- Search normalization + default fields ---------------- */
+
+const DEFAULT_FIELDS = [
+  "summary",
+  "status",
+  "issuetype",
+  "priority",
+  "assignee",
+  "reporter",
+  "created",
+  "updated"
+];
+// (Hinweis: issue.key kommt in der Regel top-level mit, aber wir fragen hier
+// bewusst Kernfelder an, damit du nicht nur IDs siehst.)
+
 function normalizeSearchRequest(req, defaultProjectKey) {
   const allowCross = !!(req?.meta && req.meta.allowCrossProject === true);
-  const isSearchPath = (p) => /^https?:\/\/[^/]+\/rest\/api\/3\/search(?:\/jql)?\/?$|^\/rest\/api\/3\/search(?:\/jql)?\/?$/i.test(String(p || ""));
+  const isSearchPath = (p) =>
+    /^https?:\/\/[^/]+\/rest\/api\/3\/search(?:\/jql)?\/?$|^\/rest\/api\/3\/search(?:\/jql)?\/?$/i
+      .test(String(p || ""));
   const p = req.path || req.url || "";
-  if (!isSearchPath(p)) return req; // not a search endpoint
+  if (!isSearchPath(p)) return req;
 
   const q = req.query || {};
   const bodyIn = (req.body && typeof req.body === "object") ? { ...req.body } : {};
 
-  // Prefer body values; fall back to query
-  let jql = (bodyIn.jql ?? q.jql ?? "").toString();
-  const startAt    = (bodyIn.startAt ?? q.startAt);
-  const maxResults = (bodyIn.maxResults ?? q.maxResults);
-  const fields     = asArray(bodyIn.fields ?? q.fields);
-  const expand     = asArray(bodyIn.expand ?? q.expand);
+  let jql        = (bodyIn.jql ?? q.jql ?? "").toString();
+  const startAt  = (bodyIn.startAt ?? q.startAt);
+  let maxResults = (bodyIn.maxResults ?? q.maxResults);
+  let fields     = asArray(bodyIn.fields ?? q.fields);
+  let expand     = asArray(bodyIn.expand ?? q.expand);
 
-  // Project restriction (unless explicitly allowed)
+  // Project restriction unless explicitly allowed
   if (!allowCross && defaultProjectKey) {
     jql = prefixProjectToJql(jql, defaultProjectKey);
+  }
+
+  // Sensible defaults: ensure we get useful data if caller provided nothing
+  if (!fields || fields.length === 0) {
+    fields = DEFAULT_FIELDS.slice();
+  }
+  if (!expand || expand.length === 0) {
+    // renderedFields is handy if consumers want HTML-rendered summaries/descriptions later
+    expand = ["renderedFields"];
+  }
+
+  // Avoid huge payloads by default
+  if (maxResults === undefined || maxResults === null) {
+    maxResults = 50;
   }
 
   return {
@@ -206,23 +220,20 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
       });
     }
 
-    // Credentials
     const channelId = runtime?.channel_id || null;
     const creds = pickJiraCreds(channelId);
     if (!creds) {
       return JSON.stringify({ ok: false, error: "JIRA_CONFIG — Missing Jira credentials in channel-config" });
     }
 
-    // Base headers/url
     const baseUrl = creds.baseUrl;
     const headersIn = (reqIn.headers && typeof reqIn.headers === "object") ? { ...reqIn.headers } : {};
     const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
 
-    // Normalize search calls to the new endpoint (always)
+    // Always normalize search to /search/jql + project + default fields
     let req = { ...reqIn, headers };
     req = normalizeSearchRequest(req, creds.defaultProjectKey);
 
-    // Build axios request
     let method = String(req.method || "GET").toUpperCase();
     const responseType = req.responseType === "arraybuffer" ? "arraybuffer" : "json";
     const timeout = Number.isFinite(Number(req.timeoutMs)) ? Number(req.timeoutMs) : 60000;
@@ -241,7 +252,6 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
       }
     }
 
-    // Execute with retries
     debugLog("HTTP Request", { method, url: finalUrl, headers: Object.keys(finalHeaders), responseType, timeout });
     const res = await axiosWithRetry({
       method,
