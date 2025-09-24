@@ -182,7 +182,7 @@ function normalizeSearchRequest(req, defaultProjectKey) {
   return {
     ...req,
     method: "POST",
-    path: "/rest/api/3/search/jql",
+    path: "/rest/api/3/search",
     url: undefined,
     query: {},
     headers: {
