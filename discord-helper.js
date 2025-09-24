@@ -126,7 +126,8 @@ function getChannelConfig(channelId) {
         max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
         avatarPrompt: "", imagePrompt: "",
-        api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false }
+        api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false },
+        confluence: null
       };
     }
 
@@ -205,13 +206,16 @@ function getChannelConfig(channelId) {
       api.toolRegistry = apiToolReg;
     }
 
+    const confluence = (cfg.confluence && typeof cfg.confluence === "object") ? cfg.confluence : null;
+
     return {
       name, botname, voice, persona, avatarUrl, instructions,
       tools: ctxTools, toolRegistry, blocks, summaryPrompt,
       max_user_messages, hasConfig: true, summariesEnabled, admins,
       max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
       avatarPrompt, imagePrompt,
-      api
+      api,
+      confluence   // ✅ jetzt enthalten
     };
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
@@ -221,10 +225,12 @@ function getChannelConfig(channelId) {
       max_user_messages: null, hasConfig: false, summariesEnabled: false, admins: [],
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
       avatarPrompt: "", imagePrompt: "",
-      api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false }
+      api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false },
+      confluence: null
     };
   }
 }
+
 
 /** Split long text into <=2000 char chunks for Discord */
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
