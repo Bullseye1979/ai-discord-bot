@@ -4,7 +4,10 @@
 
 const axios = require("axios");
 const FormData = require("form-data");
-const getChannelConfig = require("./discord-helper.js").getChannelConfig;
+const helper = require("./discord-helper.js");
+console.log("[DEBUG] helper exports:", helper);
+const getChannelConfig = helper.getChannelConfig;
+
 const { reportError } = require("./error.js");
 
 function debugLog(label, obj) {
