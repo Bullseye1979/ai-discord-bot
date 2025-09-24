@@ -4,9 +4,9 @@
 
 const axios = require("axios");
 const FormData = require("form-data");
-const helper = require("./discord-helper.js");
-console.log("[DEBUG] helper exports:", helper);
-const getChannelConfig = helper.getChannelConfig;
+const { getChannelConfig } = require("./discord-helper.js");
+console.log("[Confluence DEBUG] helper typeof getChannelConfig:", typeof getChannelConfig);
+
 
 const { reportError } = require("./error.js");
 
