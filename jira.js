@@ -80,7 +80,11 @@ function isAbsoluteUrl(u) { return /^https?:\/\//i.test(String(u || "")); }
 
 function asArray(v) {
   if (v === undefined || v === null) return undefined;
-  return Array.isArray(v) ? v : [v];
+  if (Array.isArray(v)) return v;
+  const s = String(v);
+  // allow comma-separated lists
+  if (s.includes(",")) return s.split(",").map(x => x.trim()).filter(Boolean);
+  return [s];
 }
 
 /* -------------------- Gentle retries -------------------- */
@@ -117,12 +121,10 @@ function prefixProjectToJql(jql, projectKey) {
   const proj = `project = "${projectKey}"`;
 
   if (!projectKey) {
-    // No project restriction → return original (core + order by)
     return [base, orderBy].filter(Boolean).join(" ").trim();
   }
 
   if (!base) {
-    // Only ORDER BY present → prepend project then keep order by at end
     const withProj = proj;
     return [withProj, orderBy].filter(Boolean).join(" ").trim();
   }
