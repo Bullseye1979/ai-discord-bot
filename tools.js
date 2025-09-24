@@ -281,6 +281,7 @@ const tools = [
       name: "confluencePage",
       description:
         "Generic JSON proxy to Confluence Cloud REST API. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
+        "USE THIS FOR ANY REQUEST OR ACCESS TO CONFLUENCE. DO NOT USE OTHER TOOLCALLS TO TRY TO ACCESS CONFLUENCE. "+
         "This tool forwards the request 1:1 to Confluence (auth & baseUrl are injected from channel-config). " +
         "Space-Restriction ist standardmäßig aktiv: " +
         "• POST /rest/api/content erzwingt defaultSpace (und optional defaultParent). " +
