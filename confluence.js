@@ -1,11 +1,14 @@
-// confluence.js — v1.2 (create/update/delete page + upload/embed image + Debug Logs)
-// - Nutzt Lazy-Require für getChannelConfig, um Circular-Dependency zu vermeiden
-// - Loggt Requests, Statuscodes und Responses ins Console-Log
-// - Liest Credentials aus channel-config/<channelId>.json → blocks[].confluence
+// confluence.js — v2.0 (Generic JSON Proxy to Confluence)
+// - Accepts JSON and forwards directly to Confluence; returns raw JSON response
+// - Only restriction: default space/parent can be auto-injected from channel-config (toggle via meta)
+// - Lazy-require getChannelConfig to avoid circular dependency
+// - Debug logs for requests and responses
 
 const axios = require("axios");
 const FormData = require("form-data");
 const { reportError } = require("./error.js");
+
+/* -------------------- Helpers -------------------- */
 
 function debugLog(label, obj) {
   try {
@@ -15,26 +18,25 @@ function debugLog(label, obj) {
   }
 }
 
-function pickConfluenceCreds(channelId) {
-  // Lazy require → verhindert Circular Dependency
-  let getChannelConfig;
+// Lazy require to avoid circular dependency
+function getConfigFn() {
   try {
-    ({ getChannelConfig } = require("./discord-helper.js"));
-    debugLog("Helper typeof getChannelConfig", typeof getChannelConfig);
-  } catch (err) {
-    debugLog("Helper Load Error", err.message || err);
-    return null;
+    const mod = require("./discord-helper.js");
+    if (mod && typeof mod.getChannelConfig === "function") return mod.getChannelConfig;
+  } catch (e) {
+    debugLog("Helper Load Error", e?.message || String(e));
   }
+  return null;
+}
 
-  if (typeof getChannelConfig !== "function") {
-    debugLog("getChannelConfig not a function", {});
-    return null;
-  }
+function pickConfluenceCreds(channelId) {
+  const getChannelConfig = getConfigFn();
+  if (!getChannelConfig) return null;
 
   const meta = getChannelConfig(String(channelId || ""));
   if (!meta) return null;
 
-  // 1) Bevorzugt: Block mit .confluence
+  // Prefer blocks[].confluence
   const blocks = Array.isArray(meta.blocks) ? meta.blocks : [];
   for (const b of blocks) {
     const c = b?.confluence || b?.secrets?.confluence || null;
@@ -49,7 +51,7 @@ function pickConfluenceCreds(channelId) {
     }
   }
 
-  // 2) Fallback: channelMeta.confluence (optional)
+  // Fallback: meta.confluence
   const c = meta.confluence || null;
   if (c && c.baseUrl && c.email && c.token) {
     return {
@@ -60,7 +62,6 @@ function pickConfluenceCreds(channelId) {
       defaultParentId: c.defaultParentId ? String(c.defaultParentId) : ""
     };
   }
-
   return null;
 }
 
@@ -69,15 +70,38 @@ function authHeader(email, token) {
   return { Authorization: `Basic ${basic}` };
 }
 
-async function getPageVersion({ baseUrl, headers, pageId }) {
-  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(pageId)}?expand=version`;
-  debugLog("getPageVersion Request", { url });
-  const res = await axios.get(url, { headers, timeout: 20000, validateStatus: () => true });
-  debugLog("getPageVersion Response", { status: res.status, data: res.data });
-  if (!res.data || !res.data.version || typeof res.data.version.number !== "number") {
-    throw new Error("CONF_VERSION_LOOKUP_FAILED");
+function buildUrl(baseUrl, path, query) {
+  const root = String(baseUrl || "").replace(/\/+$/, "");
+  const p = String(path || "").trim();
+  const rel = p.startsWith("/") ? p : `/${p}`;
+  const qs = new URLSearchParams();
+  if (query && typeof query === "object") {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) v.forEach(val => qs.append(k, String(val)));
+      else qs.append(k, String(v));
+    }
   }
-  return res.data.version.number;
+  const q = qs.toString();
+  return q ? `${root}${rel}?${q}` : `${root}${rel}`;
+}
+
+function isAbsoluteUrl(u) {
+  return /^https?:\/\//i.test(String(u || ""));
+}
+
+async function downloadToBuffer(url) {
+  const res = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: 60000,
+    validateStatus: () => true
+  });
+  if (res.status >= 400) {
+    const err = new Error(`FILE_FETCH_${res.status}`);
+    err._raw = { status: res.status, headers: res.headers, data: res.data?.toString?.() || null };
+    throw err;
+  }
+  return Buffer.from(res.data);
 }
 
 function ensureStorageHtml(s) {
@@ -87,204 +111,187 @@ function ensureStorageHtml(s) {
   return hasTags ? str : `<p>${str.replace(/[<>&]/g, m => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[m]))}</p>`;
 }
 
-async function createPageApi({ baseUrl, headers, spaceKey, title, contentHtml, parentId }) {
-  const body = {
-    type: "page",
-    title,
-    space: { key: spaceKey },
-    body: { storage: { value: contentHtml, representation: "storage" } }
-  };
-  if (parentId) body.ancestors = [{ id: String(parentId) }];
-
-  const url = `${baseUrl}/rest/api/content`;
-  debugLog("createPageApi Request", { url, body });
-  const res = await axios.post(url, body, { headers: { ...headers, "Content-Type": "application/json" }, timeout: 30000, validateStatus: () => true });
-  debugLog("createPageApi Response", { status: res.status, data: res.data });
-  if (res.status >= 300) throw new Error(`CONF_CREATE_HTTP_${res.status}`);
-  return res.data;
-}
-
-async function updatePageApi({ baseUrl, headers, pageId, newTitle, newHtml }) {
-  const current = await getPageVersion({ baseUrl, headers, pageId });
-  const body = {
-    id: String(pageId),
-    type: "page",
-    title: newTitle,
-    version: { number: current + 1 },
-    body: { storage: { value: newHtml, representation: "storage" } }
-  };
-  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(pageId)}`;
-  debugLog("updatePageApi Request", { url, body });
-  const res = await axios.put(url, body, { headers: { ...headers, "Content-Type": "application/json" }, timeout: 30000, validateStatus: () => true });
-  debugLog("updatePageApi Response", { status: res.status, data: res.data });
-  if (res.status >= 300) throw new Error(`CONF_UPDATE_HTTP_${res.status}`);
-  return res.data;
-}
-
-async function deletePageApi({ baseUrl, headers, pageId }) {
-  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(pageId)}`;
-  debugLog("deletePageApi Request", { url });
-  const res = await axios.delete(url, { headers, timeout: 30000, validateStatus: () => true });
-  debugLog("deletePageApi Response", { status: res.status, data: res.data });
-  if (res.status >= 300) throw new Error(`CONF_DELETE_HTTP_${res.status}`);
-  return { ok: true };
-}
-
-async function uploadAttachmentApi({ baseUrl, headers, pageId, filename, buffer }) {
-  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(pageId)}/child/attachment`;
-  const form = new FormData();
-  form.append("file", buffer, filename);
-
-  debugLog("uploadAttachmentApi Request", { url, filename });
-  const res = await axios.post(url, form, {
-    headers: { ...headers, "X-Atlassian-Token": "no-check", ...form.getHeaders() },
-    timeout: 60000,
-    maxContentLength: 20 * 1024 * 1024,
-    maxBodyLength: 20 * 1024 * 1024,
-    validateStatus: () => true
-  });
-  debugLog("uploadAttachmentApi Response", { status: res.status, data: res.data });
-  if (res.status >= 300) throw new Error(`CONF_ATTACH_HTTP_${res.status}`);
-  const att = res?.data?.results?.[0];
-  if (!att?.title) throw new Error("CONF_ATTACH_PARSE_FAILED");
-  return { filename: att.title };
-}
-
-function buildImageMacro(filename) {
-  const safe = String(filename || "").replace(/[<>&"]/g, s => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;", '"':"&quot;" }[s]));
-  return `<ac:image><ri:attachment ri:filename="${safe}" /></ac:image>`;
-}
-
-async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
+/**
+ * Optional: inject default space/parent into a POST /rest/api/content body
+ * if not provided by the caller. Can be disabled via meta flags.
+ */
+function maybeInjectDefaults(req, creds) {
   try {
-    const args = typeof toolFunction?.arguments === "string"
+    const meta = req?.meta || {};
+    const allowSpace = meta.injectDefaultSpace !== false;
+    const allowParent = meta.injectDefaultParent !== false;
+
+    // Only for POST to /rest/api/content
+    const method = String(req?.method || "GET").toUpperCase();
+    const path = String(req?.path || "");
+    if (!(method === "POST" && /\/rest\/api\/content\/?$/.test(path))) return req;
+
+    if (!req.body || typeof req.body !== "object") return req;
+    const body = req.body;
+
+    // If body.type === 'page', default to storage representation for simple plaintext
+    if (body.type === "page" && body.body && body.body.storage && body.body.storage.value) {
+      body.body.storage.value = ensureStorageHtml(body.body.storage.value);
+      body.body.storage.representation = body.body.storage.representation || "storage";
+    }
+
+    if (allowSpace && creds?.defaultSpace) {
+      if (!body.space) body.space = {};
+      if (!body.space.key) body.space.key = creds.defaultSpace;
+    }
+
+    if (allowParent && creds?.defaultParentId && !Array.isArray(body.ancestors)) {
+      body.ancestors = [{ id: String(creds.defaultParentId) }];
+    }
+    return req;
+  } catch {
+    return req;
+  }
+}
+
+/* -------------------- Core Proxy -------------------- */
+
+/**
+ * Tool entry: "confluencePage" (generic JSON proxy)
+ * Accepted arguments:
+ *  {
+ *    "json": {                    // or put fields top-level; "json" takes precedence
+ *      "method": "GET|POST|PUT|DELETE|PATCH",   // default GET
+ *      "path": "/rest/api/...",  // or full "url"
+ *      "url": "https://.../rest/api/...",       // absolute URL (overrides path)
+ *      "query": { ... },         // optional query params
+ *      "headers": { ... },       // optional extra headers (Authorization will be overwritten)
+ *      "body": { ... } | "raw string",          // JSON body or raw string
+ *      "responseType": "json" | "arraybuffer",  // default "json"
+ *      "timeoutMs": 60000,                       // optional timeout
+ *      // Multipart upload:
+ *      "multipart": true,        // if true → build FormData
+ *      "form": { key:value },    // optional form fields
+ *      "files": [ { name, url, filename } ],    // optional files to upload
+ *
+ *      // Optional meta flags:
+ *      "meta": {
+ *        "injectDefaultSpace": true,   // default true
+ *        "injectDefaultParent": true   // default true
+ *      }
+ *    }
+ *  }
+ *
+ * Returns:
+ *  {
+ *    ok: boolean,
+ *    status: number,
+ *    url: string,
+ *    headers: { ...subset... },
+ *    data: any
+ *  }
+ */
+async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
+  const startedAt = Date.now();
+  try {
+    // 1) Parse args
+    const rawArgs = typeof toolFunction?.arguments === "string"
       ? JSON.parse(toolFunction.arguments || "{}")
       : (toolFunction?.arguments || {});
-    debugLog("ToolCall Arguments", args);
 
-    const action = String(args.action || "").toLowerCase();
-    const pageId = args.page_id ? String(args.page_id) : "";
-    const spaceKey = String(args.space_key || "");
-    const title = String(args.title || "");
-    const parentId = args.parent_id ? String(args.parent_id) : "";
-    const contentHtml = ensureStorageHtml(args.content_html || args.content || "");
-    const imageUrl = String(args.image_url || "");
-    const imageFilename = String(args.image_filename || "");
+    const req = rawArgs.json || rawArgs || {};
+    debugLog("ToolCall JSON (in)", req);
 
+    // 2) Credentials
     const channelId = runtime?.channel_id || null;
     const creds = pickConfluenceCreds(channelId);
-    debugLog("Picked Credentials", { baseUrl: creds?.baseUrl, email: creds?.email, hasToken: !!creds?.token });
-
     if (!creds) {
-      return JSON.stringify({ ok: false, error: "CONF_CONFIG — Missing confluence credentials in channel-config blocks[].confluence" });
-    }
-    const headers = authHeader(creds.email, creds.token);
-    const effectiveSpace = spaceKey || creds.defaultSpace || "";
-
-    if (!["create","update","delete"].includes(action)) {
-      return JSON.stringify({ ok: false, error: "CONF_ARGS — action must be create|update|delete" });
+      return JSON.stringify({ ok: false, error: "CONF_CONFIG — Missing confluence credentials in channel-config" });
     }
 
-    if (action === "create") {
-      if (!effectiveSpace) return JSON.stringify({ ok: false, error: "CONF_ARGS — space_key is required (or blocks[].confluence.defaultSpace)" });
-      if (!title) return JSON.stringify({ ok: false, error: "CONF_ARGS — title is required" });
+    // 3) Build request
+    let method = String(req.method || "GET").toUpperCase();
+    const responseType = req.responseType === "arraybuffer" ? "arraybuffer" : "json";
+    const timeout = Number.isFinite(Number(req.timeoutMs)) ? Number(req.timeoutMs) : 60000;
 
-      const data = await createPageApi({
-        baseUrl: creds.baseUrl,
-        headers,
-        spaceKey: effectiveSpace,
-        title,
-        contentHtml,
-        parentId: parentId || creds.defaultParentId || ""
-      });
+    const baseUrl = creds.baseUrl;
+    const url = isAbsoluteUrl(req.url) ? req.url : buildUrl(baseUrl, req.path || "/", req.query || {});
+    const headersIn = (req.headers && typeof req.headers === "object") ? { ...req.headers } : {};
+    const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
 
-      const id = data?.id;
-      let newTitle = data?.title || title;
+    // 4) Optional: inject default space/parent for POST content
+    const effectiveReq = maybeInjectDefaults(req, creds);
 
-      if (imageUrl) {
-        try {
-          const img = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 45000, validateStatus: () => true });
-          debugLog("Image Download Response", { status: img.status, headers: img.headers });
-          if (img.status >= 300) throw new Error(`IMG_FETCH_${img.status}`);
-          const ct = String(img.headers?.["content-type"] || "").toLowerCase();
-          if (!ct.startsWith("image/")) throw new Error("IMG_NOT_IMAGE");
+    // 5) Body / Multipart
+    let data = undefined;
+    let finalHeaders = { ...headers };
 
-          const fname = imageFilename || imageUrl.split("/").pop()?.split("?")[0] || "image.png";
-          await uploadAttachmentApi({
-            baseUrl: creds.baseUrl,
-            headers,
-            pageId: id,
-            filename: fname,
-            buffer: Buffer.from(img.data)
-          });
-
-          const macro = buildImageMacro(fname);
-          const html = contentHtml + "\n\n" + macro;
-
-          const upd = await updatePageApi({
-            baseUrl: creds.baseUrl,
-            headers,
-            pageId: id,
-            newTitle,
-            newHtml: html
-          });
-          newTitle = upd?.title || newTitle;
-        } catch (e) {
-          debugLog("Image Embed Error", { message: e.message, stack: e.stack });
-          await reportError(e, null, "CONF_IMAGE_EMBED", { emit: "channel" });
+    if (effectiveReq.multipart) {
+      const form = new FormData();
+      if (effectiveReq.form && typeof effectiveReq.form === "object") {
+        for (const [k, v] of Object.entries(effectiveReq.form)) {
+          if (v === undefined || v === null) continue;
+          form.append(k, typeof v === "string" ? v : JSON.stringify(v));
         }
       }
-
-      const url = data?._links?.webui ? `${creds.baseUrl}${data._links.webui}` : "";
-      return JSON.stringify({ ok: true, id, title: newTitle, url });
-    }
-
-    if (action === "update") {
-      if (!pageId) return JSON.stringify({ ok: false, error: "CONF_ARGS — page_id is required for update" });
-      if (!title) return JSON.stringify({ ok: false, error: "CONF_ARGS — title is required for update" });
-
-      let targetHtml = contentHtml;
-
-      if (imageUrl) {
-        const img = await axios.get(imageUrl, { responseType: "arraybuffer", timeout: 45000, validateStatus: () => true });
-        debugLog("Image Download Response", { status: img.status, headers: img.headers });
-        if (img.status >= 300) throw new Error(`IMG_FETCH_${img.status}`);
-        const ct = String(img.headers?.["content-type"] || "").toLowerCase();
-        if (!ct.startsWith("image/")) throw new Error("IMG_NOT_IMAGE");
-
-        const fname = imageFilename || imageUrl.split("/").pop()?.split("?")[0] || "image.png";
-        await uploadAttachmentApi({
-          baseUrl: creds.baseUrl,
-          headers,
-          pageId,
-          filename: fname,
-          buffer: Buffer.from(img.data)
-        });
-        targetHtml = (targetHtml || "<p></p>") + "\n\n" + buildImageMacro(fname);
+      if (Array.isArray(effectiveReq.files)) {
+        for (const f of effectiveReq.files) {
+          const name = f?.name || "file";
+          const filename = f?.filename || (String(f?.url || "").split("/").pop()?.split("?")[0]) || "upload.bin";
+          const buf = await downloadToBuffer(String(f?.url || ""));
+          form.append(name, buf, filename);
+        }
       }
-
-      const upd = await updatePageApi({
-        baseUrl: creds.baseUrl,
-        headers,
-        pageId,
-        newTitle: title,
-        newHtml: targetHtml
-      });
-
-      const url = upd?._links?.webui ? `${creds.baseUrl}${upd._links.webui}` : "";
-      return JSON.stringify({ ok: true, id: upd?.id || pageId, title: upd?.title || title, url });
+      data = form;
+      finalHeaders = { ...finalHeaders, ...form.getHeaders(), "X-Atlassian-Token": "no-check" };
+    } else if (["POST", "PUT", "PATCH"].includes(method)) {
+      if (typeof effectiveReq.body === "string") {
+        data = effectiveReq.body; // raw string
+        if (!finalHeaders["Content-Type"]) {
+          finalHeaders["Content-Type"] = "application/json"; // default
+        }
+      } else if (effectiveReq.body && typeof effectiveReq.body === "object") {
+        data = effectiveReq.body;
+        finalHeaders["Content-Type"] = "application/json";
+      } else {
+        data = undefined;
+      }
     }
 
-    if (action === "delete") {
-      if (!pageId) return JSON.stringify({ ok: false, error: "CONF_ARGS — page_id is required for delete" });
-      await deletePageApi({ baseUrl: creds.baseUrl, headers, pageId });
-      return JSON.stringify({ ok: true, id: pageId, deleted: true });
+    // 6) Execute
+    debugLog("HTTP Request", { method, url, headers: Object.keys(finalHeaders), responseType, timeout });
+    const res = await axios.request({
+      method,
+      url,
+      headers: finalHeaders,
+      data,
+      timeout,
+      responseType,
+      validateStatus: () => true
+    });
+
+    const hdrSubset = {};
+    for (const k of ["x-seraph-loginreason", "x-confluence-request-time", "content-type", "content-length", "location"]) {
+      if (res.headers?.[k]) hdrSubset[k] = res.headers[k];
     }
+
+    const out = {
+      ok: res.status < 400,
+      status: res.status,
+      url,
+      headers: hdrSubset,
+      data: responseType === "arraybuffer" ? { bufferLength: Buffer.isBuffer(res.data) ? res.data.length : 0 } : res.data,
+      took_ms: Date.now() - startedAt
+    };
+    debugLog("HTTP Response", { status: res.status, headers: hdrSubset, preview: (responseType === "json" ? res.data : `arraybuffer(${out.data.bufferLength})`) });
+    return JSON.stringify(out);
 
   } catch (err) {
-    debugLog("Tool Error", { message: err.message, stack: err.stack });
-    await reportError(err, null, "CONF_TOOL", { emit: "channel" });
-    return JSON.stringify({ ok: false, error: err?.message || String(err) });
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    debugLog("Proxy Error", { message: err?.message, status, dataPreview: typeof data === "string" ? data.slice(0, 500) : data });
+    await reportError(err, null, "CONF_PROXY", { emit: "channel" });
+    return JSON.stringify({
+      ok: false,
+      error: err?.message || String(err),
+      status: status || null,
+      data: data || null
+    });
   }
 }
 

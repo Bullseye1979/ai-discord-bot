@@ -1,10 +1,11 @@
-// tools.js — smart history v2.6 (+ Confluence ToolCall)
+// tools.js — smart history v2.7 (+ Confluence JSON Proxy)
 // - getInformation: OR-Keyword-Suche im CURRENT CHANNEL → NACHRICHTENKONTEXT
 // - getHistory: Timeframe-Summarization (Single LLM Pass)
 // - + getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
 //     getImageDescription, getLocation, getImageSD, getPDF
-// - NEU: confluencePage (create/update/delete + Attachment/Image-Embed)
-//   * Credentials kommen aus channel-config/<channelId>.json → blocks[].confluence{ baseUrl, email, token, defaultSpace, defaultParentId }
+// - NEU: confluencePage als GENERISCHER JSON-PROXY
+//   * KI liefert ein JSON-Objekt (HTTP-Request); wir senden es 1:1 an Confluence
+//   * Credentials (baseUrl, email, token, defaultSpace, defaultParentId) aus channel-config/<channelId>.json
 
 const { getWebpage } = require("./webpage.js");
 const { getImage, getImageSD } = require("./image.js");
@@ -16,7 +17,7 @@ const { getPDF } = require("./pdf.js");
 const { getInformation, getHistory } = require("./history.js");
 const { reportError } = require("./error.js");
 
-// NEU: Confluence Tool (eigene Datei erforderlich)
+// Confluence (JSON Proxy)
 const { confluencePage } = require("./confluence.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
@@ -270,30 +271,60 @@ const tools = [
     }
   },
 
-  // ==== Confluence (NEU) =====================================================
+  // ==== Confluence (JSON Proxy) =============================================
   {
     type: "function",
     function: {
       name: "confluencePage",
       description:
-        "Create, update or delete a Confluence page (Cloud). Can also upload an image (from URL) and embed it into the page content. " +
-        "Credentials are read from the channel-config block (blocks[].confluence).",
+        "Generic JSON proxy to Confluence Cloud REST API. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
+        "This tool forwards the request 1:1 to Confluence (auth & baseUrl are injected from channel-config). " +
+        "For POST /rest/api/content it can auto-inject default space/parent from config unless disabled via meta.",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["create", "update", "delete"], description: "Operation to perform." },
-          // create
-          space_key: { type: "string", description: "Confluence Space Key. If omitted, uses blocks[].confluence.defaultSpace." },
-          title: { type: "string", description: "Page title (required for create/update)." },
-          content_html: { type: "string", description: "Body in Confluence storage format or plain text (will be wrapped)." },
-          parent_id: { type: "string", description: "Optional ancestor page id for create." },
-          image_url: { type: "string", description: "Optional: remote image URL to upload & embed." },
-          image_filename: { type: "string", description: "Optional: filename override for the uploaded image." },
-          // update/delete
-          page_id: { type: "string", description: "Target page id (required for update/delete)." },
-          user_id: { type: "string", description: "Optional: User ID or display name (for attribution/logging only)." }
+          json: {
+            type: "object",
+            description:
+              "HTTP request definition for Confluence. Example: " +
+              "{ method:'POST', path:'/rest/api/content', body:{ type:'page', title:'T', body:{ storage:{ value:'<p>..</p>', representation:'storage' } } }, " +
+              "meta:{ injectDefaultSpace:true, injectDefaultParent:true } }",
+            properties: {
+              method: { type: "string", description: "HTTP method (GET|POST|PUT|DELETE|PATCH). Default GET." },
+              path:   { type: "string", description: "Relative API path, e.g. '/rest/api/content'. Ignored if 'url' is absolute." },
+              url:    { type: "string", description: "Absolute URL (optional). If provided, overrides 'path'." },
+              query:  { type: "object", description: "Query parameters object." },
+              headers:{ type: "object", description: "Extra headers (Authorization will be overwritten with Basic auth)." },
+              body:   { description: "JSON body object OR raw string (for POST/PUT/PATCH)." },
+              responseType: { type: "string", enum: ["json", "arraybuffer"], description: "Default 'json'." },
+              timeoutMs: { type: "number", description: "Request timeout in ms (default 60000)." },
+              multipart: { type: "boolean", description: "If true, send multipart/form-data. Use 'form' and 'files'." },
+              form: { type: "object", description: "Key/Value pairs added to multipart form (values are stringified when not strings)." },
+              files: {
+                type: "array",
+                description: "Files to attach when multipart=true. Each item: { name:'file', url:'https://..', filename:'my.png' }",
+                items: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    url: { type: "string" },
+                    filename: { type: "string" }
+                  },
+                  required: ["url"]
+                }
+              },
+              meta: {
+                type: "object",
+                description: "Optional flags for helper behavior on POST /rest/api/content.",
+                properties: {
+                  injectDefaultSpace: { type: "boolean", description: "Default true. If true, uses blocks[].confluence.defaultSpace when missing." },
+                  injectDefaultParent: { type: "boolean", description: "Default true. If true, uses blocks[].confluence.defaultParentId when missing." }
+                }
+              }
+            }
+          }
         },
-        required: ["action"]
+        required: ["json"]
       }
     }
   }
@@ -313,7 +344,7 @@ const fullToolRegistry = {
   getImageSD,
   getInformation, // ← ersetzt findTimeframes
   getHistory,
-  confluencePage // ← NEU
+  confluencePage // ← JSON Proxy
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
