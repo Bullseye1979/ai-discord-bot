@@ -283,7 +283,7 @@ const tools = [
         "Generic JSON proxy to Confluence Cloud REST API. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
         "USE THIS FOR ANY REQUEST OR ACCESS TO CONFLUENCE. DO NOT USE OTHER TOOLCALLS TO TRY TO ACCESS CONFLUENCE. " +
         "This tool forwards the request 1:1 to Confluence (auth & baseUrl are injected from channel-config). " +
-        "It might be required to run this tool 2 times, once to get the page-ID from the description and a second time to perform the actual action on this page. "+
+        "It might be required to run this tool 2 times, once to get the page-ID from the description and a second time to perform the actual action on this page. " +
         "Space restriction is ON by default:\n" +
         "• POST /rest/api/content → enforce defaultSpace (and defaultParent if available) unless meta.allowCrossSpace===true.\n" +
         "• GET /rest/api/content/search → prepend CQL with space=\"KEY\" unless allowCrossSpace.\n" +
@@ -295,7 +295,7 @@ const tools = [
         "{ \"json\": { \"method\":\"GET\", \"path\":\"/rest/api/content/search\", \"query\":{ \"cql\":\"type=page AND title ~ \\\"Session\\\"\", \"limit\":25 } } }\n" +
         "3) UPLOAD ATTACHMENT TO PAGE\n" +
         "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/content/12345/child/attachment\", \"multipart\":true, \"headers\":{ \"X-Atlassian-Token\":\"no-check\" }, \"files\":[{ \"name\":\"file\", \"url\":\"https://…/img.png\", \"filename\":\"img.png\" }], \"form\":{ \"comment\":\"Upload via bot\" } } }\n" +
-        "*Please note that 12345 is a pageID not a a title.*\n"+
+        "*Please note that 12345 is a pageID not a a title.*\n" +
         "4) UPDATE PAGE STORAGE (version is required by Confluence. If you omit it, Confluence will reject the request. Fetch the current version first and send version.number = current+1.)\n" +
         "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\", \"version\":{ \"number\": 2 }, \"body\":{ \"storage\":{ \"value\":\"<p>Updated</p>\", \"representation\":\"storage\" } } } } }",
       parameters: {
