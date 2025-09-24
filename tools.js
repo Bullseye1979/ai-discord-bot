@@ -366,6 +366,7 @@ const tools = [
       description:
         "Generic JSON proxy to Jira Cloud REST API v3. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
         "USE THIS FOR ANY REQUEST OR ACCESS TO JIRA. " +
+        "Prefer issue-keys to issue-ids. "+
         "This tool forwards the request 1:1 to Jira (auth & baseUrl are injected from channel-config). " +
         "Project restriction is ON by default:\n" +
         "• POST /rest/api/3/issue → enforce fields.project.key unless meta.allowCrossProject===true.\n" +
