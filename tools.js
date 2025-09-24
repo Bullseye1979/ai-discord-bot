@@ -295,9 +295,11 @@ const tools = [
         "{ \"json\": { \"method\":\"GET\", \"path\":\"/rest/api/content/search\", \"query\":{ \"cql\":\"type=page AND title ~ \\\"Session\\\"\", \"limit\":25 } } }\n" +
         "3) UPLOAD ATTACHMENT TO PAGE\n" +
         "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/content/12345/child/attachment\", \"multipart\":true, \"headers\":{ \"X-Atlassian-Token\":\"no-check\" }, \"files\":[{ \"name\":\"file\", \"url\":\"https://…/img.png\", \"filename\":\"img.png\" }], \"form\":{ \"comment\":\"Upload via bot\" } } }\n" +
-        "*Please note that 12345 is a pageID not a a title.*\n" +
-        "4) UPDATE PAGE STORAGE (version is required by Confluence. If you omit it, Confluence will reject the request. Fetch the current version first and send version.number = current+1.)\n" +
-        "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\", \"version\":{ \"number\": 2 }, \"body\":{ \"storage\":{ \"value\":\"<p>Updated</p>\", \"representation\":\"storage\" } } } } }",
+        "*Please note that 12345 is a pageID not a title.*\n" +
+        "4) UPDATE PAGE STORAGE\n" +
+        "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\", \"version\":{ \"number\": 2 }, \"body\":{ \"storage\":{ \"value\":\"<p>Updated</p>\", \"representation\":\"storage\" } } }, \"meta\":{ \"autoBumpVersion\":true } } }\n" +
+        "5) APPEND STORAGE HTML (e.g., embed an image macro) + auto version bump\n" +
+        "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\" }, \"meta\":{ \"appendStorageHtml\":\"<p>…HTML…</p>\", \"autoBumpVersion\":true } } }",
       parameters: {
         type: "object",
         properties: {
@@ -331,11 +333,13 @@ const tools = [
               },
               meta: {
                 type: "object",
-                description: "Optionale Helfer-Flags (Create/Space-Restriction).",
+                description: "Optionale Helfer-Flags (Create/Space-Restriction/Version/Append).",
                 properties: {
                   injectDefaultSpace: { type: "boolean", description: "Default true. Nutzt blocks[].confluence.defaultSpace beim Anlegen." },
                   injectDefaultParent: { type: "boolean", description: "Default true. Nutzt blocks[].confluence.defaultParentId beim Anlegen." },
-                  allowCrossSpace: { type: "boolean", description: "Default false. Wenn true, Space-Restriction für diesen Request aufheben." }
+                  allowCrossSpace: { type: "boolean", description: "Default false. Wenn true, Space-Restriction für diesen Request aufheben." },
+                  autoBumpVersion: { type: "boolean", description: "Wenn true und PUT auf Page: Holt aktuelle Version und setzt version.number = current+1, falls nicht angegeben." },
+                  appendStorageHtml: { type: "string", description: "Wenn gesetzt und PUT auf Page: Holt aktuellen body.storage.value, hängt diesen HTML-String an und schreibt zurück." }
                 }
               }
             }

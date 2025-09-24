@@ -1,7 +1,11 @@
-// confluence.js — v2.1 (Generic JSON Proxy + Space Restriction)
+// confluence.js — v2.2
+// Generic JSON Proxy + Space Restriction + Auto-Version-Bump + Append-Storage + Retries
 // - Accepts JSON and forwards directly to Confluence; returns raw JSON
 // - Enforces defaultSpace from channel-config unless meta.allowCrossSpace === true
 // - Verifies space on update/delete; prefixes CQL with space=KEY on search
+// - Optional meta.autoBumpVersion: fetches current version and bumps if missing
+// - Optional meta.appendStorageHtml: fetches current storage HTML and appends HTML safely
+// - Multipart upload with external file fetch
 // - Lazy-require getChannelConfig to avoid circular dependency
 
 const axios = require("axios");
@@ -96,6 +100,23 @@ function ensureStorageHtml(s) {
   return hasTags ? str : `<p>${str.replace(/[<>&]/g, m => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[m]))}</p>`;
 }
 
+/* -------------------- Helper: axios with gentle retries -------------------- */
+
+async function axiosWithRetry(opts, max = 2) {
+  let attempt = 0;
+  let last;
+  while (attempt <= max) {
+    const res = await axios.request({ ...opts, validateStatus: () => true });
+    // Pass through anything < 500 and not 429
+    if (res.status < 500 && res.status !== 429) return res;
+    last = res;
+    const delay = Math.min(1500 * (attempt + 1), 4000);
+    await new Promise(r => setTimeout(r, delay));
+    attempt++;
+  }
+  return last;
+}
+
 /* -------------------- Space helpers -------------------- */
 
 // Normalize: inject defaultSpace/parent for POST /rest/api/content
@@ -174,10 +195,11 @@ async function enforceSpaceRestriction(req, creds, headers) {
 
     // Fetch page space
     const checkUrl = `${creds.baseUrl}/rest/api/content/${encodeURIComponent(pageId)}?expand=space`;
-    const res = await axios.get(checkUrl, {
+    const res = await axiosWithRetry({
+      method: "GET",
+      url: checkUrl,
       headers,
-      timeout: 20000,
-      validateStatus: () => true
+      timeout: 20000
     });
 
     const key = res?.data?.space?.key || null;
@@ -194,8 +216,32 @@ async function enforceSpaceRestriction(req, creds, headers) {
     return req;
   }
 
-  // 5) Everything else: pass through (cannot leave space anyway w/o explicit id/params)
+  // 5) Everything else: pass through
   return req;
+}
+
+/* -------------------- Content helpers -------------------- */
+
+async function fetchVersionNumber(baseUrl, id, headers) {
+  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(id)}?expand=version`;
+  const r = await axiosWithRetry({ method: "GET", url, headers, timeout: 20000 });
+  if (r.status >= 400 || !r.data?.version?.number) {
+    const e = new Error(`FETCH_VERSION_FAILED_${r.status}`);
+    e._raw = r.data;
+    throw e;
+  }
+  return Number(r.data.version.number);
+}
+
+async function fetchStorageHtml(baseUrl, id, headers) {
+  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(id)}?expand=body.storage,version`;
+  const r = await axiosWithRetry({ method: "GET", url, headers, timeout: 20000 });
+  if (r.status >= 400 || !r.data?.body?.storage?.value) {
+    const e = new Error(`FETCH_STORAGE_FAILED_${r.status}`);
+    e._raw = r.data;
+    throw e;
+  }
+  return { html: String(r.data.body.storage.value), version: Number(r.data.version?.number || 1) };
 }
 
 /* -------------------- Core Proxy -------------------- */
@@ -208,6 +254,16 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
       : (toolFunction?.arguments || {});
     const req = rawArgs.json || rawArgs || {};
     debugLog("ToolCall JSON (in)", req);
+
+    // Early validation to stop empty/invalid toolcalls
+    if (!req || typeof req !== "object" || !req.method || (!req.path && !req.url)) {
+      debugLog("Bad Tool Args", req);
+      return JSON.stringify({
+        ok: false,
+        error: "BAD_TOOL_ARGS",
+        hint: "confluencePage requires {json:{method:'GET|POST|PUT|DELETE|PATCH', path:'/rest/api/...'} }"
+      });
+    }
 
     // Credentials
     const channelId = runtime?.channel_id || null;
@@ -226,9 +282,59 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
     const headersIn = (req.headers && typeof req.headers === "object") ? { ...req.headers } : {};
     const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
 
-    // Inject defaults for create page, then enforce space
+    // Inject defaults for create page, then enforce space restriction
     const withDefaults = maybeInjectDefaults({ ...req }, creds);
     const guardedReq = await enforceSpaceRestriction(withDefaults, creds, headers);
+
+    // ---- Meta features: append storage + auto-bump version (preparation) ----
+
+    // If appendStorageHtml is requested on PUT page, fetch current HTML & version and merge
+    if (
+      String(guardedReq.method || "").toUpperCase() === "PUT" &&
+      guardedReq.meta?.appendStorageHtml &&
+      typeof guardedReq.body === "object" &&
+      guardedReq.body?.type === "page"
+    ) {
+      const idMatch = (guardedReq.path || "").match(/\/rest\/api\/content\/(\d+)(?:\/.*)?$/);
+      const pageId = idMatch?.[1] || guardedReq.body?.id;
+      if (pageId) {
+        const { html: oldHtml, version: v } = await fetchStorageHtml(baseUrl, pageId, headers);
+        const add = ensureStorageHtml(guardedReq.meta.appendStorageHtml);
+        // Simple append. (Optional: smarter insert before closing body if needed.)
+        const merged = oldHtml + add;
+
+        if (!guardedReq.body.body) guardedReq.body.body = {};
+        guardedReq.body.body.storage = {
+          value: merged,
+          representation: "storage"
+        };
+
+        // If version not set, provisionally set to current+1; can be overridden by autoBumpVersion below
+        if (!guardedReq.body.version || !Number.isFinite(Number(guardedReq.body.version.number))) {
+          guardedReq.body.version = { number: v + 1 };
+        }
+      }
+    }
+
+    // If autoBumpVersion is requested on PUT page, ensure version.number exists
+    if (
+      String(guardedReq.method || "").toUpperCase() === "PUT" &&
+      typeof guardedReq.body === "object" &&
+      guardedReq.body?.type === "page" &&
+      guardedReq.meta?.autoBumpVersion === true
+    ) {
+      const idMatch = (guardedReq.path || "").match(/\/rest\/api\/content\/(\d+)(?:\/.*)?$/);
+      const pageId = idMatch?.[1] || guardedReq.body?.id;
+      if (pageId) {
+        const current = await fetchVersionNumber(baseUrl, pageId, headers);
+        if (!guardedReq.body.version || typeof guardedReq.body.version !== "object") {
+          guardedReq.body.version = {};
+        }
+        if (!Number.isFinite(Number(guardedReq.body.version.number))) {
+          guardedReq.body.version.number = current + 1;
+        }
+      }
+    }
 
     // Body / Multipart
     let data = undefined;
@@ -266,16 +372,15 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
 
     const finalUrl = isAbsoluteUrl(guardedReq.url) ? guardedReq.url : buildUrl(baseUrl, guardedReq.path || "/", guardedReq.query || {});
 
-    // Execute
+    // Execute with retries
     debugLog("HTTP Request", { method, url: finalUrl, headers: Object.keys(finalHeaders), responseType, timeout });
-    const res = await axios.request({
+    const res = await axiosWithRetry({
       method,
       url: finalUrl,
       headers: finalHeaders,
       data,
       timeout,
-      responseType,
-      validateStatus: () => true
+      responseType
     });
 
     const hdrSubset = {};
