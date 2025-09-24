@@ -1,14 +1,14 @@
 // tools.js — smart history v2.9 (+ Confluence JSON Proxy, Space Restriction, Few-Shot Examples)
-// - getInformation: OR-Keyword-Suche im CURRENT CHANNEL → NACHRICHTENKONTEXT
-// - getHistory: Timeframe-Summarization (Single LLM Pass)
+// - getInformation: OR-keyword search in CURRENT CHANNEL → MESSAGE CONTEXT
+// - getHistory: timeframe summarization (single LLM pass)
 // - + getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
 //     getImageDescription, getLocation, getImageSD, getPDF
-// - Confluence: confluencePage als GENERISCHER JSON-PROXY (Space-Restriction standardmäßig aktiv)
-//   * KI liefert ein JSON-Objekt (HTTP-Request); wir senden es 1:1 an Confluence
-//   * Credentials (baseUrl, email, token, defaultSpace, defaultParentId) aus channel-config/<channelId>.json
-//   * Standard: Requests werden auf den defaultSpace eingeschränkt (Create erzwingt space.key,
-//     Search bekommt cql-Präfix space="KEY", Update/Delete werden vorab verifiziert).
-//     Override möglich mit json.meta.allowCrossSpace === true.
+// - Confluence: confluencePage as a GENERIC JSON PROXY (space restriction enabled by default)
+//   * The model provides a JSON object (HTTP request); we forward it 1:1 to Confluence
+//   * Credentials (baseUrl, email, token, defaultSpace, defaultParentId) from channel-config/<channelId>.json
+//   * Default: requests are restricted to defaultSpace (Create enforces space.key,
+//     Search gets CQL prefix space="KEY", Update/Delete are pre-validated).
+//     Override possible via json.meta.allowCrossSpace === true.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage, getImageSD } = require("./image.js");
@@ -110,14 +110,14 @@ const tools = [
       name: "getYoutubeSearch",
       description:
         "Search YouTube for topic-related videos via YouTube Data API v3. Returns compact results (title, channel, publishedAt, URL). " +
-        "Use when the user asks for an explanation WITH a video (e.g., 'erkläre mir mit einem Video advantage in dnd').",
+        "Use when the user asks for an explanation WITH a video (e.g., 'explain advantage in DnD with a video').",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Search topic or natural-language query." },
           max_results: { type: "number", description: "Max number of results (1-10). Default 5." },
-          relevance_language: { type: "string", description: "Hint language for relevance, e.g. 'de', 'en'. Default 'de'." },
-          region_code: { type: "string", description: "Region code, e.g. 'DE', 'US'. Default 'DE'." },
+          relevance_language: { type: "string", description: "Hint language for relevance, e.g., 'de', 'en'. Default 'de'." },
+          region_code: { type: "string", description: "Region code, e.g., 'DE', 'US'. Default 'DE'." },
           safe_search: { type: "string", description: "none | moderate | strict. Default 'none'." },
           user_id: { type: "string", description: "User ID or display name." }
         },
@@ -258,7 +258,7 @@ const tools = [
     function: {
       name: "getPDF",
       description:
-        "Render a PDF from provided HTML and CSS. The CSS defines the design. If CSS missing, a default style is used. " +
+        "Render a PDF from provided HTML and CSS. The CSS defines the design. If CSS is missing, a default style is used. " +
         "Ensure that everything is correctly escaped for JSON.",
       parameters: {
         type: "object",
@@ -295,7 +295,7 @@ const tools = [
         "{ \"json\": { \"method\":\"GET\", \"path\":\"/rest/api/content/search\", \"query\":{ \"cql\":\"type=page AND title ~ \\\"Session\\\"\", \"limit\":25 } } }\n" +
         "3) UPLOAD ATTACHMENT TO PAGE\n" +
         "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/content/12345/child/attachment\", \"multipart\":true, \"headers\":{ \"X-Atlassian-Token\":\"no-check\" }, \"files\":[{ \"name\":\"file\", \"url\":\"https://…/img.png\", \"filename\":\"img.png\" }], \"form\":{ \"comment\":\"Upload via bot\" } } }\n" +
-        "*Please note that 12345 is a pageID not a title.*\n" +
+        "*Please note that 12345 is a pageID, not a title.*\n" +
         "4) UPDATE PAGE STORAGE\n" +
         "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\", \"version\":{ \"number\": 2 }, \"body\":{ \"storage\":{ \"value\":\"<p>Updated</p>\", \"representation\":\"storage\" } } }, \"meta\":{ \"autoBumpVersion\":true } } }\n" +
         "5) APPEND STORAGE HTML (e.g., embed an image macro) + auto version bump\n" +
@@ -309,18 +309,18 @@ const tools = [
               "HTTP request definition for Confluence. See the examples in the description.",
             properties: {
               method: { type: "string", description: "HTTP method (GET|POST|PUT|DELETE|PATCH). Default GET." },
-              path:   { type: "string", description: "Relative API path, z.B. '/rest/api/content'. Ignored if 'url' is absolute." },
+              path:   { type: "string", description: "Relative API path, e.g., '/rest/api/content'. Ignored if 'url' is absolute." },
               url:    { type: "string", description: "Absolute URL (optional). If provided, overrides 'path'." },
               query:  { type: "object", description: "Query parameters as object." },
-              headers:{ type: "object", description: "Extra headers (Authorization wird überschrieben mit Basic Auth)." },
-              body:   { description: "JSON body object ODER raw string (für POST/PUT/PATCH)." },
+              headers:{ type: "object", description: "Extra headers (Authorization will be overwritten with Basic Auth)." },
+              body:   { description: "JSON body object OR raw string (for POST/PUT/PATCH)." },
               responseType: { type: "string", enum: ["json", "arraybuffer"], description: "Default 'json'." },
               timeoutMs: { type: "number", description: "Request timeout in ms (default 60000)." },
-              multipart: { type: "boolean", description: "Wenn true: multipart/form-data. Nutze 'form' und 'files'." },
-              form: { type: "object", description: "Key/Value für multipart (Nicht-Strings werden stringified)." },
+              multipart: { type: "boolean", description: "If true: multipart/form-data. Use 'form' and 'files'." },
+              form: { type: "object", description: "Key/Value for multipart (non-strings will be stringified)." },
               files: {
                 type: "array",
-                description: "Anhänge bei multipart=true. Item: { name:'file', url:'https://..', filename:'my.png' }",
+                description: "Attachments when multipart=true. Item: { name:'file', url:'https://..', filename:'my.png' }",
                 items: {
                   type: "object",
                   properties: {
@@ -333,13 +333,13 @@ const tools = [
               },
               meta: {
                 type: "object",
-                description: "Optionale Helfer-Flags (Create/Space-Restriction/Version/Append).",
+                description: "Optional helper flags (Create/Space-Restriction/Version/Append).",
                 properties: {
-                  injectDefaultSpace: { type: "boolean", description: "Default true. Nutzt blocks[].confluence.defaultSpace beim Anlegen." },
-                  injectDefaultParent: { type: "boolean", description: "Default true. Nutzt blocks[].confluence.defaultParentId beim Anlegen." },
-                  allowCrossSpace: { type: "boolean", description: "Default false. Wenn true, Space-Restriction für diesen Request aufheben." },
-                  autoBumpVersion: { type: "boolean", description: "Wenn true und PUT auf Page: Holt aktuelle Version und setzt version.number = current+1, falls nicht angegeben." },
-                  appendStorageHtml: { type: "string", description: "Wenn gesetzt und PUT auf Page: Holt aktuellen body.storage.value, hängt diesen HTML-String an und schreibt zurück." }
+                  injectDefaultSpace: { type: "boolean", description: "Default true. Uses blocks[].confluence.defaultSpace when creating." },
+                  injectDefaultParent: { type: "boolean", description: "Default true. Uses blocks[].confluence.defaultParentId when creating." },
+                  allowCrossSpace: { type: "boolean", description: "Default false. If true, disable space restriction for this request." },
+                  autoBumpVersion: { type: "boolean", description: "If true and PUT on a page: fetch current version and set version.number = current+1 if not provided." },
+                  appendStorageHtml: { type: "string", description: "If set and PUT on a page: fetch current body.storage.value, append this HTML string, and write back." }
                 }
               }
             }
@@ -363,7 +363,7 @@ const fullToolRegistry = {
   getLocation,
   getPDF,
   getImageSD,
-  getInformation, // ← ersetzt findTimeframes
+  getInformation, // ← replaces findTimeframes
   getHistory,
   confluencePage // ← JSON Proxy
 };
