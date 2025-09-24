@@ -127,7 +127,8 @@ function getChannelConfig(channelId) {
         max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
         avatarPrompt: "", imagePrompt: "",
         api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false },
-        confluence: null
+        confluence: null,
+        jira: null
       };
     }
 
@@ -207,6 +208,7 @@ function getChannelConfig(channelId) {
     }
 
     const confluence = (cfg.confluence && typeof cfg.confluence === "object") ? cfg.confluence : null;
+    const jira = (cfg.jira && typeof cfg.jira === "object") ? cfg.jira : null;
 
     return {
       name, botname, voice, persona, avatarUrl, instructions,
@@ -215,7 +217,8 @@ function getChannelConfig(channelId) {
       max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
       avatarPrompt, imagePrompt,
       api,
-      confluence   // ✅ jetzt enthalten
+      confluence, // ✅ passthrough for Confluence credentials/config
+      jira        // ✅ NEW: passthrough for Jira credentials/config
     };
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
@@ -226,7 +229,8 @@ function getChannelConfig(channelId) {
       max_tokens_chat: 4096, max_tokens_speaker: 1024, chatAppend: "", speechAppend: "",
       avatarPrompt: "", imagePrompt: "",
       api: { enabled: false, key: "", model: "", max_tokens: null, tools: [], toolRegistry: {}, apikey: "", endpoint: "", pseudotoolcalls: false },
-      confluence: null
+      confluence: null,
+      jira: null
     };
   }
 }

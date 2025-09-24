@@ -1,4 +1,4 @@
-// tools.js — smart history v2.9 (+ Confluence JSON Proxy, Space Restriction, Few-Shot Examples)
+// tools.js — smart history v2.9 (+ Confluence & Jira JSON Proxies, Restrictions, Few-Shot Examples)
 // - getInformation: OR-keyword search in CURRENT CHANNEL → MESSAGE CONTEXT
 // - getHistory: timeframe summarization (single LLM pass)
 // - + getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
@@ -9,6 +9,12 @@
 //   * Default: requests are restricted to defaultSpace (Create enforces space.key,
 //     Search gets CQL prefix space="KEY", Update/Delete are pre-validated).
 //     Override possible via json.meta.allowCrossSpace === true.
+// - Jira: jiraRequest as a GENERIC JSON PROXY (project restriction enabled by default)
+//   * The model provides a JSON object (HTTP request); we forward it 1:1 to Jira
+//   * Credentials (baseUrl, email, token, defaultProjectKey) from channel-config/<channelId>.json
+//   * Default: requests are restricted to defaultProjectKey (Create enforces fields.project.key,
+//     Search gets JQL prefix project="KEY", issue operations are pre-validated).
+//     Override possible via json.meta.allowCrossProject === true.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage, getImageSD } = require("./image.js");
@@ -22,6 +28,8 @@ const { reportError } = require("./error.js");
 
 // Confluence (JSON Proxy)
 const { confluencePage } = require("./confluence.js");
+// Jira (JSON Proxy)
+const { jiraRequest } = require("./jira.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
 
@@ -348,6 +356,72 @@ const tools = [
         required: ["json"]
       }
     }
+  },
+
+  // ==== Jira (JSON Proxy) ====================================================
+  {
+    type: "function",
+    function: {
+      name: "jiraRequest",
+      description:
+        "Generic JSON proxy to Jira Cloud REST API v3. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
+        "USE THIS FOR ANY REQUEST OR ACCESS TO JIRA. " +
+        "This tool forwards the request 1:1 to Jira (auth & baseUrl are injected from channel-config). " +
+        "Project restriction is ON by default:\n" +
+        "• POST /rest/api/3/issue → enforce fields.project.key unless meta.allowCrossProject===true.\n" +
+        "• GET /rest/api/3/search → prepend JQL with project=\"KEY\" unless allowCrossProject.\n" +
+        "• Any /rest/api/3/issue/{idOrKey}… → validate the issue belongs to KEY unless allowCrossProject.\n\n" +
+        "EXAMPLES (mirror these patterns exactly):\n" +
+        "1) CREATE ISSUE\n" +
+        "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/3/issue\", \"body\":{ \"fields\":{ \"summary\":\"Bug title\", \"issuetype\":{ \"name\":\"Bug\" }, \"project\":{ \"key\":\"\" } } }, \"meta\":{ \"injectDefaultProject\":true } } }\n" +
+        "2) JQL SEARCH\n" +
+        "{ \"json\": { \"method\":\"GET\", \"path\":\"/rest/api/3/search\", \"query\":{ \"jql\":\"assignee = currentUser() ORDER BY created DESC\", \"maxResults\":25 } } }\n" +
+        "3) ADD ATTACHMENT\n" +
+        "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/3/issue/ABC-123/attachments\", \"multipart\":true, \"files\":[{ \"name\":\"file\", \"url\":\"https://…/log.txt\", \"filename\":\"log.txt\" }], \"headers\":{ \"X-Atlassian-Token\":\"no-check\" } } }",
+      parameters: {
+        type: "object",
+        properties: {
+          json: {
+            type: "object",
+            description: "HTTP request definition for Jira.",
+            properties: {
+              method: { type: "string", description: "HTTP method (GET|POST|PUT|DELETE|PATCH). Default GET." },
+              path:   { type: "string", description: "Relative API path, e.g., '/rest/api/3/issue'. Ignored if 'url' is absolute." },
+              url:    { type: "string", description: "Absolute URL (optional). If provided, overrides 'path'." },
+              query:  { type: "object", description: "Query parameters as object." },
+              headers:{ type: "object", description: "Extra headers (Authorization will be overwritten with Basic Auth)." },
+              body:   { description: "JSON body object OR raw string (for POST/PUT/PATCH)." },
+              responseType: { type: "string", enum: ["json", "arraybuffer"], description: "Default 'json'." },
+              timeoutMs: { type: "number", description: "Request timeout in ms (default 60000)." },
+              multipart: { type: "boolean", description: "If true: multipart/form-data. Use 'form' and 'files'." },
+              form: { type: "object", description: "Key/Value for multipart (non-strings will be stringified)." },
+              files: {
+                type: "array",
+                description: "Attachments when multipart=true. Item: { name:'file', url:'https://..', filename:'my.png' }",
+                items: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    url: { type: "string" },
+                    filename: { type: "string" }
+                  },
+                  required: ["url"]
+                }
+              },
+              meta: {
+                type: "object",
+                description: "Optional helper flags (Create/Project-Restriction).",
+                properties: {
+                  injectDefaultProject: { type: "boolean", description: "Default true. Use blocks[].jira.defaultProjectKey when creating issues." },
+                  allowCrossProject: { type: "boolean", description: "Default false. If true, disable project restriction for this request." }
+                }
+              }
+            }
+          }
+        },
+        required: ["json"]
+      }
+    }
   }
 ];
 
@@ -365,7 +439,8 @@ const fullToolRegistry = {
   getImageSD,
   getInformation, // ← replaces findTimeframes
   getHistory,
-  confluencePage // ← JSON Proxy
+  confluencePage, // ← JSON Proxy
+  jiraRequest     // ← JSON Proxy
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
