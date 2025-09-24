@@ -1,11 +1,14 @@
-// tools.js — smart history v2.7 (+ Confluence JSON Proxy)
+// tools.js — smart history v2.8 (+ Confluence JSON Proxy + Space Restriction Hint)
 // - getInformation: OR-Keyword-Suche im CURRENT CHANNEL → NACHRICHTENKONTEXT
 // - getHistory: Timeframe-Summarization (Single LLM Pass)
 // - + getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
 //     getImageDescription, getLocation, getImageSD, getPDF
-// - NEU: confluencePage als GENERISCHER JSON-PROXY
+// - Confluence: confluencePage als GENERISCHER JSON-PROXY (Space-Restriction standardmäßig aktiv)
 //   * KI liefert ein JSON-Objekt (HTTP-Request); wir senden es 1:1 an Confluence
 //   * Credentials (baseUrl, email, token, defaultSpace, defaultParentId) aus channel-config/<channelId>.json
+//   * Standard: Requests werden auf den defaultSpace eingeschränkt (Create erzwingt space.key,
+//     Search bekommt cql-Präfix space="KEY", Update/Delete werden vorab verifiziert).
+//     Override möglich mit json.meta.allowCrossSpace === true.
 
 const { getWebpage } = require("./webpage.js");
 const { getImage, getImageSD } = require("./image.js");
@@ -279,30 +282,34 @@ const tools = [
       description:
         "Generic JSON proxy to Confluence Cloud REST API. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
         "This tool forwards the request 1:1 to Confluence (auth & baseUrl are injected from channel-config). " +
-        "For POST /rest/api/content it can auto-inject default space/parent from config unless disabled via meta.",
+        "Space-Restriction ist standardmäßig aktiv: " +
+        "• POST /rest/api/content erzwingt defaultSpace (und optional defaultParent). " +
+        "• GET /rest/api/content/search bekommt CQL-Präfix space=\"KEY\". " +
+        "• PUT/DELETE auf Seiten-IDs werden vorab auf Space==KEY geprüft. " +
+        "Override nur mit json.meta.allowCrossSpace === true.",
       parameters: {
         type: "object",
         properties: {
           json: {
             type: "object",
             description:
-              "HTTP request definition for Confluence. Example: " +
+              "HTTP request definition for Confluence. Beispiel: " +
               "{ method:'POST', path:'/rest/api/content', body:{ type:'page', title:'T', body:{ storage:{ value:'<p>..</p>', representation:'storage' } } }, " +
               "meta:{ injectDefaultSpace:true, injectDefaultParent:true } }",
             properties: {
               method: { type: "string", description: "HTTP method (GET|POST|PUT|DELETE|PATCH). Default GET." },
-              path:   { type: "string", description: "Relative API path, e.g. '/rest/api/content'. Ignored if 'url' is absolute." },
+              path:   { type: "string", description: "Relative API path, z.B. '/rest/api/content'. Ignored if 'url' is absolute." },
               url:    { type: "string", description: "Absolute URL (optional). If provided, overrides 'path'." },
-              query:  { type: "object", description: "Query parameters object." },
-              headers:{ type: "object", description: "Extra headers (Authorization will be overwritten with Basic auth)." },
-              body:   { description: "JSON body object OR raw string (for POST/PUT/PATCH)." },
+              query:  { type: "object", description: "Query parameters as object." },
+              headers:{ type: "object", description: "Extra headers (Authorization wird überschrieben mit Basic Auth)." },
+              body:   { description: "JSON body object ODER raw string (für POST/PUT/PATCH)." },
               responseType: { type: "string", enum: ["json", "arraybuffer"], description: "Default 'json'." },
               timeoutMs: { type: "number", description: "Request timeout in ms (default 60000)." },
-              multipart: { type: "boolean", description: "If true, send multipart/form-data. Use 'form' and 'files'." },
-              form: { type: "object", description: "Key/Value pairs added to multipart form (values are stringified when not strings)." },
+              multipart: { type: "boolean", description: "Wenn true: multipart/form-data. Nutze 'form' und 'files'." },
+              form: { type: "object", description: "Key/Value für multipart (Nicht-Strings werden stringified)." },
               files: {
                 type: "array",
-                description: "Files to attach when multipart=true. Each item: { name:'file', url:'https://..', filename:'my.png' }",
+                description: "Anhänge bei multipart=true. Item: { name:'file', url:'https://..', filename:'my.png' }",
                 items: {
                   type: "object",
                   properties: {
@@ -315,10 +322,11 @@ const tools = [
               },
               meta: {
                 type: "object",
-                description: "Optional flags for helper behavior on POST /rest/api/content.",
+                description: "Optionale Helfer-Flags (Create/Space-Restriction).",
                 properties: {
-                  injectDefaultSpace: { type: "boolean", description: "Default true. If true, uses blocks[].confluence.defaultSpace when missing." },
-                  injectDefaultParent: { type: "boolean", description: "Default true. If true, uses blocks[].confluence.defaultParentId when missing." }
+                  injectDefaultSpace: { type: "boolean", description: "Default true. Nutzt blocks[].confluence.defaultSpace beim Anlegen." },
+                  injectDefaultParent: { type: "boolean", description: "Default true. Nutzt blocks[].confluence.defaultParentId beim Anlegen." },
+                  allowCrossSpace: { type: "boolean", description: "Default false. Wenn true, Space-Restriction für diesen Request aufheben." }
                 }
               }
             }
