@@ -1,6 +1,7 @@
-// jira.js — v1.5
+// jira.js — v1.6
 // Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries + ORDER BY fix
-// + Defaults: request useful fields (key, summary, status, …) if none provided
+// + Defaults: request useful fields (summary, status, …) if none provided
+// + JQL placeholder sanitization: replace project="KEY"/"YOUR_PROJECT_KEY" with defaultProjectKey
 //
 // - Accepts JSON and forwards directly to Jira; returns raw JSON
 // - Enforces defaultProjectKey unless meta.allowCrossProject === true
@@ -128,6 +129,31 @@ function prefixProjectToJql(jql, projectKey) {
   return [coreWithProj, orderBy].filter(Boolean).join(" ").trim();
 }
 
+/* -------------------- Placeholder cleanup ---------------------------------- */
+
+function sanitizeJqlPlaceholders(jql, defaultProjectKey) {
+  let s = String(jql || "").trim();
+  if (!s) return s;
+
+  // Replace common placeholders with the configured project key, if present.
+  const placeholders = ['"KEY"', "'KEY'", '"YOUR_PROJECT_KEY"', "'YOUR_PROJECT_KEY'"];
+  for (const ph of placeholders) {
+    const re = new RegExp(`project\\s*=\\s*${ph.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}`, "gi");
+    if (defaultProjectKey) {
+      s = s.replace(re, `project = "${defaultProjectKey}"`);
+    } else {
+      // Remove the invalid clause entirely if no default key is available.
+      s = s.replace(re, "").replace(/\s+AND\s+/gi, " ").replace(/\s+OR\s+/gi, " ").trim();
+    }
+  }
+
+  // Collapse double spaces after replacements
+  s = s.replace(/\s{2,}/g, " ").trim();
+  // Remove leading/trailing dangling AND/OR
+  s = s.replace(/^(AND|OR)\s+/i, "").replace(/\s+(AND|OR)$/i, "").trim();
+  return s;
+}
+
 /* -------------------- Search normalization + default fields ---------------- */
 
 const DEFAULT_FIELDS = [
@@ -140,8 +166,7 @@ const DEFAULT_FIELDS = [
   "created",
   "updated"
 ];
-// (Hinweis: issue.key kommt in der Regel top-level mit, aber wir fragen hier
-// bewusst Kernfelder an, damit du nicht nur IDs siehst.)
+// Note: issue.key is top-level and not part of "fields"; we request core fields for better display.
 
 function normalizeSearchRequest(req, defaultProjectKey) {
   const allowCross = !!(req?.meta && req.meta.allowCrossProject === true);
@@ -160,6 +185,14 @@ function normalizeSearchRequest(req, defaultProjectKey) {
   let fields     = asArray(bodyIn.fields ?? q.fields);
   let expand     = asArray(bodyIn.expand ?? q.expand);
 
+  // Clean placeholders before prefixing
+  jql = sanitizeJqlPlaceholders(jql, defaultProjectKey);
+
+  // If the caller passed an empty/placeholder JQL, still give a useful default ORDER BY
+  if (!jql) {
+    jql = "ORDER BY created DESC";
+  }
+
   // Project restriction unless explicitly allowed
   if (!allowCross && defaultProjectKey) {
     jql = prefixProjectToJql(jql, defaultProjectKey);
@@ -170,19 +203,18 @@ function normalizeSearchRequest(req, defaultProjectKey) {
     fields = DEFAULT_FIELDS.slice();
   }
   if (!expand || expand.length === 0) {
-    // renderedFields is handy if consumers want HTML-rendered summaries/descriptions later
     expand = ["renderedFields"];
   }
-
-  // Avoid huge payloads by default
   if (maxResults === undefined || maxResults === null) {
     maxResults = 50;
   }
 
+  debugLog("Effective JQL", { jql });
+
   return {
     ...req,
     method: "POST",
-    path: "/rest/api/3/search",
+    path: "/rest/api/3/search/jql",
     url: undefined,
     query: {},
     headers: {
@@ -194,8 +226,8 @@ function normalizeSearchRequest(req, defaultProjectKey) {
       jql,
       ...(startAt    !== undefined ? { startAt: Number(startAt) } : {}),
       ...(maxResults !== undefined ? { maxResults: Number(maxResults) } : {}),
-      ...(fields ? { fields } : {}),
-      ...(expand ? { expand } : {})
+      ...(fields && fields.length ? { fields } : {}),
+      ...(expand && expand.length ? { expand } : {})
     }
   };
 }
