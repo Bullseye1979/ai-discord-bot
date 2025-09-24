@@ -295,7 +295,8 @@ const tools = [
         "{ \"json\": { \"method\":\"GET\", \"path\":\"/rest/api/content/search\", \"query\":{ \"cql\":\"type=page AND title ~ \\\"Session\\\"\", \"limit\":25 } } }\n" +
         "3) UPLOAD ATTACHMENT TO PAGE\n" +
         "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/content/12345/child/attachment\", \"multipart\":true, \"headers\":{ \"X-Atlassian-Token\":\"no-check\" }, \"files\":[{ \"name\":\"file\", \"url\":\"https://…/img.png\", \"filename\":\"img.png\" }], \"form\":{ \"comment\":\"Upload via bot\" } } }\n" +
-        "4) UPDATE PAGE STORAGE (version +1 required — the proxy will fetch current version if omitted)\n" +
+        "*Please note that 12345 is a pageID not a a title.*\n"+
+        "4) UPDATE PAGE STORAGE (version is required by Confluence. If you omit it, Confluence will reject the request. Fetch the current version first and send version.number = current+1.)\n" +
         "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\", \"version\":{ \"number\": 2 }, \"body\":{ \"storage\":{ \"value\":\"<p>Updated</p>\", \"representation\":\"storage\" } } } } }",
       parameters: {
         type: "object",
