@@ -1,8 +1,9 @@
-// jira.js — v1.3
-// Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries
+// jira.js — v1.4
+// Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries + ORDER BY fix
 // - Accepts JSON and forwards directly to Jira; returns raw JSON
 // - Enforces defaultProjectKey unless meta.allowCrossProject === true
 // - ALWAYS migrates search to POST /rest/api/3/search/jql (maps legacy /search GET/POST automatically)
+// - Fix: keep ORDER BY at end of whole JQL (do not put it inside parentheses when prefixing project)
 // - Gentle retries for 5xx/429
 // - Lazy-require getChannelConfig to avoid circular dependency
 
@@ -97,17 +98,40 @@ async function axiosWithRetry(opts, max = 2) {
   return last;
 }
 
-/* -------------------- Project restriction + search normalization ----------- */
+/* -------------------- ORDER BY handling + Project restriction -------------- */
+
+// Split JQL into { core, orderBy } so ORDER BY stays at the very end.
+function splitJqlOrderBy(jql) {
+  const src = String(jql || "");
+  const m = src.match(/\border\s+by\b/i);
+  if (!m) return { core: src.trim(), orderBy: "" };
+  const idx = m.index;
+  const core = src.slice(0, idx).trim();
+  const orderBy = src.slice(idx).trim(); // includes "ORDER BY ..."
+  return { core, orderBy };
+}
 
 function prefixProjectToJql(jql, projectKey) {
-  const base = String(jql || "").trim();
+  const { core, orderBy } = splitJqlOrderBy(jql);
+  const base = String(core || "").trim();
   const proj = `project = "${projectKey}"`;
-  if (!projectKey) return base || "";
-  if (!base) return proj;
-  // If already contains project = "KEY", don't double-prefix
+
+  if (!projectKey) {
+    // No project restriction → return original (core + order by)
+    return [base, orderBy].filter(Boolean).join(" ").trim();
+  }
+
+  if (!base) {
+    // Only ORDER BY present → prepend project then keep order by at end
+    const withProj = proj;
+    return [withProj, orderBy].filter(Boolean).join(" ").trim();
+  }
+
+  // If core already has same project, don't duplicate
   const re = new RegExp(`project\\s*=\\s*"?${projectKey.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}"?`, "i");
-  if (re.test(base)) return base;
-  return `${proj} AND (${base})`;
+  const coreWithProj = re.test(base) ? base : `${proj} AND (${base})`;
+
+  return [coreWithProj, orderBy].filter(Boolean).join(" ").trim();
 }
 
 /**
@@ -120,33 +144,31 @@ function prefixProjectToJql(jql, projectKey) {
  */
 function normalizeSearchRequest(req, defaultProjectKey) {
   const allowCross = !!(req?.meta && req.meta.allowCrossProject === true);
+  const isSearchPath = (p) => /^https?:\/\/[^/]+\/rest\/api\/3\/search(?:\/jql)?\/?$|^\/rest\/api\/3\/search(?:\/jql)?\/?$/i.test(String(p || ""));
+  const p = req.path || req.url || "";
+  if (!isSearchPath(p)) return req; // not a search endpoint
 
-  const isSearchPath = (p) => /^\/rest\/api\/3\/search(?:\/jql)?\/?$/.test(String(p || ""));
-  if (!isSearchPath(req.path || req.url || "")) return req; // not a search endpoint
-
-  // Collect possible inputs from query/body
   const q = req.query || {};
   const bodyIn = (req.body && typeof req.body === "object") ? { ...req.body } : {};
 
-  // Merge jql & options (query params win only if body missing them)
-  let jql = bodyIn.jql ?? q.jql ?? "";
-  const startAt = (bodyIn.startAt ?? q.startAt);
+  // Prefer body values; fall back to query
+  let jql = (bodyIn.jql ?? q.jql ?? "").toString();
+  const startAt    = (bodyIn.startAt ?? q.startAt);
   const maxResults = (bodyIn.maxResults ?? q.maxResults);
-  const fields = asArray(bodyIn.fields ?? q.fields);
-  const expand = asArray(bodyIn.expand ?? q.expand);
+  const fields     = asArray(bodyIn.fields ?? q.fields);
+  const expand     = asArray(bodyIn.expand ?? q.expand);
 
-  // Project restriction (unless allowed)
+  // Project restriction (unless explicitly allowed)
   if (!allowCross && defaultProjectKey) {
     jql = prefixProjectToJql(jql, defaultProjectKey);
   }
 
-  // Always rewrite to POST /rest/api/3/search/jql
-  const normalized = {
+  return {
     ...req,
     method: "POST",
     path: "/rest/api/3/search/jql",
     url: undefined,
-    query: {}, // no query params for the canonical call
+    query: {},
     headers: {
       ...(req.headers || {}),
       Accept: "application/json",
@@ -154,13 +176,12 @@ function normalizeSearchRequest(req, defaultProjectKey) {
     },
     body: {
       jql,
-      ...(startAt !== undefined ? { startAt: Number(startAt) } : {}),
+      ...(startAt    !== undefined ? { startAt: Number(startAt) } : {}),
       ...(maxResults !== undefined ? { maxResults: Number(maxResults) } : {}),
       ...(fields ? { fields } : {}),
       ...(expand ? { expand } : {})
     }
   };
-  return normalized;
 }
 
 /* -------------------- Core Proxy ------------------------------------------ */
