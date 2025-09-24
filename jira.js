@@ -1,13 +1,12 @@
-// jira.js — v1.0
-// Generic JSON Proxy + Project Restriction + Retries + Multipart Upload
-// - Accepts JSON and forwards directly to Jira Cloud; returns raw JSON
-// - Enforces defaultProjectKey from channel-config unless json.meta.allowCrossProject === true
-// - Verifies project on read/update/delete/transition; prefixes JQL with project=KEY on search
-// - Multipart upload with external file fetch (for attachments)
+// jira.js — v1.3
+// Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries
+// - Accepts JSON and forwards directly to Jira; returns raw JSON
+// - Enforces defaultProjectKey unless meta.allowCrossProject === true
+// - ALWAYS migrates search to POST /rest/api/3/search/jql (maps legacy /search GET/POST automatically)
+// - Gentle retries for 5xx/429
 // - Lazy-require getChannelConfig to avoid circular dependency
 
 const axios = require("axios");
-const FormData = require("form-data");
 const { reportError } = require("./error.js");
 
 /* -------------------- Utils -------------------- */
@@ -17,7 +16,6 @@ function debugLog(label, obj) {
   catch { console.log(`[Jira DEBUG] ${label}:`, obj); }
 }
 
-// Lazy to avoid circular dependency
 function getConfigFn() {
   try {
     const mod = require("./discord-helper.js");
@@ -79,24 +77,17 @@ function buildUrl(baseUrl, path, query) {
 
 function isAbsoluteUrl(u) { return /^https?:\/\//i.test(String(u || "")); }
 
-async function downloadToBuffer(url) {
-  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 60000, validateStatus: () => true });
-  if (res.status >= 400) {
-    const err = new Error(`FILE_FETCH_${res.status}`);
-    err._raw = { status: res.status, headers: res.headers, data: res.data?.toString?.() || null };
-    throw err;
-  }
-  return Buffer.from(res.data);
+function asArray(v) {
+  if (v === undefined || v === null) return undefined;
+  return Array.isArray(v) ? v : [v];
 }
 
-/* -------------------- Helper: axios with gentle retries -------------------- */
+/* -------------------- Gentle retries -------------------- */
 
 async function axiosWithRetry(opts, max = 2) {
-  let attempt = 0;
-  let last;
+  let attempt = 0, last;
   while (attempt <= max) {
     const res = await axios.request({ ...opts, validateStatus: () => true });
-    // Pass through anything < 500 and not 429
     if (res.status < 500 && res.status !== 429) return res;
     last = res;
     const delay = Math.min(1500 * (attempt + 1), 4000);
@@ -106,95 +97,73 @@ async function axiosWithRetry(opts, max = 2) {
   return last;
 }
 
-/* -------------------- Project helpers -------------------- */
+/* -------------------- Project restriction + search normalization ----------- */
 
-// Normalize: inject default project for POST /rest/api/3/issue
-function maybeInjectDefaults(req, creds) {
-  try {
-    const meta = req?.meta || {};
-    const allowProject = meta.injectDefaultProject !== false;
-
-    const method = String(req?.method || "GET").toUpperCase();
-    const path = String(req?.path || "");
-
-    if (method === "POST" && /\/rest\/api\/3\/issue\/?$/.test(path)) {
-      if (allowProject && creds?.defaultProjectKey) {
-        if (!req.body || typeof req.body !== "object") req.body = {};
-        if (!req.body.fields || typeof req.body.fields !== "object") req.body.fields = {};
-        const f = req.body.fields;
-        if (!f.project || typeof f.project !== "object") f.project = {};
-        f.project.key = creds.defaultProjectKey; // enforce default project on create
-      }
-      return req;
-    }
-
-    return req;
-  } catch {
-    return req;
-  }
+function prefixProjectToJql(jql, projectKey) {
+  const base = String(jql || "").trim();
+  const proj = `project = "${projectKey}"`;
+  if (!projectKey) return base || "";
+  if (!base) return proj;
+  // If already contains project = "KEY", don't double-prefix
+  const re = new RegExp(`project\\s*=\\s*"?${projectKey.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}"?`, "i");
+  if (re.test(base)) return base;
+  return `${proj} AND (${base})`;
 }
 
-// Enforce allowed project on various endpoints unless allowCrossProject === true
-async function enforceProjectRestriction(req, creds, headers) {
+/**
+ * Normalize any search call to POST /rest/api/3/search/jql with body fields.
+ * Accepts legacy:
+ *   - GET /rest/api/3/search?jql=...&maxResults=...&startAt=...&fields=...&expand=...
+ *   - POST /rest/api/3/search { jql, maxResults, startAt, fields, expand }
+ * New canonical:
+ *   - POST /rest/api/3/search/jql { jql, maxResults, startAt, fields, expand }
+ */
+function normalizeSearchRequest(req, defaultProjectKey) {
   const allowCross = !!(req?.meta && req.meta.allowCrossProject === true);
-  if (allowCross || !creds?.defaultProjectKey) return req;
 
-  const method = String(req?.method || "GET").toUpperCase();
-  const path = String(req?.path || "");
-  const projectKey = creds.defaultProjectKey;
+  const isSearchPath = (p) => /^\/rest\/api\/3\/search(?:\/jql)?\/?$/.test(String(p || ""));
+  if (!isSearchPath(req.path || req.url || "")) return req; // not a search endpoint
 
-  // 1) CREATE issue → project already injected in maybeInjectDefaults
-  if (method === "POST" && /\/rest\/api\/3\/issue\/?$/.test(path)) {
-    if (req?.body && typeof req.body === "object") {
-      if (!req.body.fields) req.body.fields = {};
-      if (!req.body.fields.project) req.body.fields.project = {};
-      req.body.fields.project.key = projectKey; // hard enforce
-    }
-    return req;
+  // Collect possible inputs from query/body
+  const q = req.query || {};
+  const bodyIn = (req.body && typeof req.body === "object") ? { ...req.body } : {};
+
+  // Merge jql & options (query params win only if body missing them)
+  let jql = bodyIn.jql ?? q.jql ?? "";
+  const startAt = (bodyIn.startAt ?? q.startAt);
+  const maxResults = (bodyIn.maxResults ?? q.maxResults);
+  const fields = asArray(bodyIn.fields ?? q.fields);
+  const expand = asArray(bodyIn.expand ?? q.expand);
+
+  // Project restriction (unless allowed)
+  if (!allowCross && defaultProjectKey) {
+    jql = prefixProjectToJql(jql, defaultProjectKey);
   }
 
-  // 2) SEARCH (JQL) → prefix with project = KEY AND (...)
-  if (method === "GET" && /\/rest\/api\/3\/search\/?$/.test(path)) {
-    const q = req.query || {};
-    const jql = String(q.jql || "").trim();
-    const wrapped = jql ? `project = "${projectKey}" AND (${jql})` : `project = "${projectKey}"`;
-    req.query = { ...q, jql: wrapped };
-    return req;
-  }
-
-  // 3) ISSUE operations by idOrKey → verify the issue belongs to the project first
-  const issueMatch = path.match(/\/rest\/api\/3\/issue\/([^/]+)(?:\/.*)?$/);
-  if (issueMatch) {
-    const keyOrId = issueMatch[1];
-
-    // Fetch issue's project
-    const checkUrl = `${creds.baseUrl}/rest/api/3/issue/${encodeURIComponent(keyOrId)}?fields=project`;
-    const res = await axiosWithRetry({
-      method: "GET",
-      url: checkUrl,
-      headers,
-      timeout: 20000
-    });
-
-    const key = res?.data?.fields?.project?.key || null;
-    if (res.status >= 400 || !key) {
-      const err = new Error(`PROJECT_CHECK_FAILED_${res?.status || "ERR"}`);
-      err._raw = res?.data;
-      throw err;
+  // Always rewrite to POST /rest/api/3/search/jql
+  const normalized = {
+    ...req,
+    method: "POST",
+    path: "/rest/api/3/search/jql",
+    url: undefined,
+    query: {}, // no query params for the canonical call
+    headers: {
+      ...(req.headers || {}),
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: {
+      jql,
+      ...(startAt !== undefined ? { startAt: Number(startAt) } : {}),
+      ...(maxResults !== undefined ? { maxResults: Number(maxResults) } : {}),
+      ...(fields ? { fields } : {}),
+      ...(expand ? { expand } : {})
     }
-    if (key !== projectKey) {
-      const err = new Error("FORBIDDEN_PROJECT");
-      err._project = { expected: projectKey, got: key, issue: keyOrId };
-      throw err;
-    }
-    return req;
-  }
-
-  // 4) Everything else: pass through
-  return req;
+  };
+  return normalized;
 }
 
-/* -------------------- Core Proxy -------------------- */
+/* -------------------- Core Proxy ------------------------------------------ */
 
 async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
   const startedAt = Date.now();
@@ -202,16 +171,15 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
     const rawArgs = typeof toolFunction?.arguments === "string"
       ? JSON.parse(toolFunction.arguments || "{}")
       : (toolFunction?.arguments || {});
-    const req = rawArgs.json || rawArgs || {};
-    debugLog("ToolCall JSON (in)", req);
+    const reqIn = rawArgs.json || rawArgs || {};
+    debugLog("ToolCall JSON (in)", reqIn);
 
-    // Early validation
-    if (!req || typeof req !== "object" || !req.method || (!req.path && !req.url)) {
-      debugLog("Bad Tool Args", req);
+    if (!reqIn || typeof reqIn !== "object" || !reqIn.method || (!reqIn.path && !reqIn.url)) {
+      debugLog("Bad Tool Args", reqIn);
       return JSON.stringify({
         ok: false,
         error: "BAD_TOOL_ARGS",
-        hint: "jiraRequest requires {json:{method:'GET|POST|PUT|DELETE|PATCH', path:'/rest/api/3/...'} }"
+        hint: "jiraRequest requires {json:{method:'GET|POST|PUT|DELETE|PATCH', path:'/rest/api/...'} }"
       });
     }
 
@@ -219,59 +187,36 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
     const channelId = runtime?.channel_id || null;
     const creds = pickJiraCreds(channelId);
     if (!creds) {
-      return JSON.stringify({ ok: false, error: "JIRA_CONFIG — Missing jira credentials in channel-config" });
+      return JSON.stringify({ ok: false, error: "JIRA_CONFIG — Missing Jira credentials in channel-config" });
     }
 
-    // Build request basics
+    // Base headers/url
+    const baseUrl = creds.baseUrl;
+    const headersIn = (reqIn.headers && typeof reqIn.headers === "object") ? { ...reqIn.headers } : {};
+    const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
+
+    // Normalize search calls to the new endpoint (always)
+    let req = { ...reqIn, headers };
+    req = normalizeSearchRequest(req, creds.defaultProjectKey);
+
+    // Build axios request
     let method = String(req.method || "GET").toUpperCase();
     const responseType = req.responseType === "arraybuffer" ? "arraybuffer" : "json";
     const timeout = Number.isFinite(Number(req.timeoutMs)) ? Number(req.timeoutMs) : 60000;
 
-    const baseUrl = creds.baseUrl;
-    const url = isAbsoluteUrl(req.url) ? req.url : buildUrl(baseUrl, req.path || "/", req.query || {});
-    const headersIn = (req.headers && typeof req.headers === "object") ? { ...req.headers } : {};
-    const headers = { ...headersIn, ...authHeader(creds.email, creds.token), Accept: "application/json" };
-
-    // Inject defaults for issue create, then enforce project restriction
-    const withDefaults = maybeInjectDefaults({ ...req }, creds);
-    const guardedReq = await enforceProjectRestriction(withDefaults, creds, headers);
-
-    // Body / Multipart
+    const finalUrl = isAbsoluteUrl(req.url) ? req.url : buildUrl(baseUrl, req.path || "/", req.query || {});
     let data = undefined;
-    let finalHeaders = { ...headers };
+    let finalHeaders = { ...(req.headers || headers) };
 
-    if (guardedReq.multipart) {
-      const form = new FormData();
-      if (guardedReq.form && typeof guardedReq.form === "object") {
-        for (const [k, v] of Object.entries(guardedReq.form)) {
-          if (v === undefined || v === null) continue;
-          form.append(k, typeof v === "string" ? v : JSON.stringify(v));
-        }
-      }
-      if (Array.isArray(guardedReq.files)) {
-        for (const f of guardedReq.files) {
-          const name = f?.name || "file";
-          const filename = f?.filename || (String(f?.url || "").split("/").pop()?.split("?")[0]) || "upload.bin";
-          const buf = await downloadToBuffer(String(f?.url || "")); // external fetch
-          form.append(name, buf, filename);
-        }
-      }
-      data = form;
-      finalHeaders = { ...finalHeaders, ...form.getHeaders(), "X-Atlassian-Token": "no-check" };
-      // Jira attachments require no Content-Type override; FormData sets it
-    } else if (["POST", "PUT", "PATCH"].includes(method)) {
-      if (typeof guardedReq.body === "string") {
-        data = guardedReq.body;
+    if (["POST", "PUT", "PATCH"].includes(method)) {
+      if (typeof req.body === "string") {
+        data = req.body;
         if (!finalHeaders["Content-Type"]) finalHeaders["Content-Type"] = "application/json";
-      } else if (guardedReq.body && typeof guardedReq.body === "object") {
-        data = guardedReq.body;
+      } else if (req.body && typeof req.body === "object") {
+        data = req.body;
         finalHeaders["Content-Type"] = "application/json";
-      } else {
-        data = undefined;
       }
     }
-
-    const finalUrl = isAbsoluteUrl(guardedReq.url) ? guardedReq.url : buildUrl(baseUrl, guardedReq.path || "/", guardedReq.query || {});
 
     // Execute with retries
     debugLog("HTTP Request", { method, url: finalUrl, headers: Object.keys(finalHeaders), responseType, timeout });
@@ -285,7 +230,7 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
     });
 
     const hdrSubset = {};
-    for (const k of ["x-seraph-loginreason", "x-arequestid", "content-type", "content-length", "location"]) {
+    for (const k of ["x-arequestid", "content-type", "content-length", "location", "x-ratelimit-remaining", "retry-after"]) {
       if (res.headers?.[k]) hdrSubset[k] = res.headers[k];
     }
 
@@ -308,16 +253,14 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
     debugLog("Proxy Error", {
       message: err?.message,
       status,
-      dataPreview: typeof data === "string" ? data.slice(0, 500) : data,
-      project: err?._project
+      dataPreview: typeof data === "string" ? data.slice(0, 500) : data
     });
     await reportError(err, null, "JIRA_PROXY", { emit: "channel" });
     return JSON.stringify({
       ok: false,
       error: err?.message || String(err),
       status: status || null,
-      data: data || null,
-      project: err?._project || null
+      data: data || null
     });
   }
 }
