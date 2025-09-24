@@ -1,8 +1,16 @@
-// jira.js — v1.8
-// Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries + ORDER BY fix
-// + Defaults: request useful fields (summary, status, …) if none provided
-// + JQL placeholder sanitization: replace project = KEY / "KEY" / YOUR_PROJECT_KEY (with/without quotes)
-// + Respect original method: GET -> /search/jql with query params, POST -> /search/jql with JSON body
+// jira.js — v1.9
+// Generic JSON Proxy for Jira Cloud
+// - Project Restriction
+// - Always use /rest/api/3/search/jql (legacy /search GET/POST normalized)
+// - Respect original verb for search: GET -> query params, POST -> JSON body
+// - ORDER BY kept at the end when prefixing project
+// - Defaults for fields/expand/maxResults on search
+// - JQL placeholder sanitization (KEY / "KEY" / YOUR_PROJECT_KEY)
+// - Gentle retries for 5xx/429
+// - Transitions support:
+//   * GET  /rest/api/3/issue/{issueIdOrKey}/transitions        → passthrough
+//   * POST /rest/api/3/issue/{issueIdOrKey}/transitions        → accepts {transition:{id}, fields?} OR {transitionId, transitionName}
+//   * PUT/PATCH /rest/api/3/issue/{issueIdOrKey} with fields.status/statusName → auto-convert to transition (name→id), apply fields (without status) during transition
 
 const axios = require("axios");
 const { reportError } = require("./error.js");
@@ -249,6 +257,71 @@ function normalizeSearchRequest(reqIn, defaultProjectKey) {
   };
 }
 
+/* -------------------- Transition helpers ---------------------------------- */
+
+function parseIssueFromPath(pathOrUrl) {
+  const s = String(pathOrUrl || "");
+  const m = s.match(/\/rest\/api\/3\/issue\/([^\/\?\s]+)(?:\/|$)/i);
+  return m ? m[1] : null;
+}
+
+function isTransitionsPath(pathOrUrl) {
+  return /\/rest\/api\/3\/issue\/[^\/]+\/transitions\/?$/i.test(String(pathOrUrl || ""));
+}
+
+function isIssueUpdatePath(pathOrUrl) {
+  return /\/rest\/api\/3\/issue\/[^\/]+\/?$/i.test(String(pathOrUrl || ""));
+}
+
+function desiredStatusFromBody(body) {
+  if (!body) return null;
+  // Accept several shapes
+  if (typeof body.statusName === "string") return body.statusName;
+  if (typeof body.status === "string") return body.status;
+  if (body.status && typeof body.status.name === "string") return body.status.name;
+  if (body.fields && body.fields.status && typeof body.fields.status.name === "string") return body.fields.status.name;
+  return null;
+}
+
+function stripStatusFromFields(fields) {
+  if (!fields || typeof fields !== "object") return fields;
+  const copy = { ...fields };
+  if (copy.status) {
+    const { status, ...rest } = copy;
+    return rest;
+  }
+  return copy;
+}
+
+async function listTransitions(baseUrl, issue, headers, query) {
+  const url = buildUrl(baseUrl, `/rest/api/3/issue/${encodeURIComponent(issue)}/transitions`, query || {});
+  return axiosWithRetry({ method: "GET", url, headers, responseType: "json", timeout: 60000 });
+}
+
+async function postTransition(baseUrl, issue, headers, transitionId, fields) {
+  const url = buildUrl(baseUrl, `/rest/api/3/issue/${encodeURIComponent(issue)}/transitions`);
+  const body = {
+    transition: { id: String(transitionId) },
+    ...(fields && Object.keys(fields).length ? { fields } : {})
+  };
+  return axiosWithRetry({
+    method: "POST",
+    url,
+    headers: { ...headers, "Content-Type": "application/json", Accept: "application/json" },
+    data: body,
+    responseType: "json",
+    timeout: 60000
+  });
+}
+
+async function resolveTransitionIdByName(baseUrl, issue, headers, name) {
+  const res = await listTransitions(baseUrl, issue, headers, { expand: "transitions.fields" });
+  const transitions = Array.isArray(res?.data?.transitions) ? res.data.transitions : [];
+  const wanted = String(name || "").trim().toLowerCase();
+  const hit = transitions.find(t => String(t.name || "").trim().toLowerCase() === wanted);
+  return hit ? String(hit.id) : null;
+}
+
 /* -------------------- Core Proxy ------------------------------------------ */
 
 async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
@@ -283,10 +356,109 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
     let req = { ...reqIn, headers };
     req = normalizeSearchRequest(req, creds.defaultProjectKey);
 
-    let method = String(req.method || "GET").toUpperCase();
+    // --- Transitions: passthrough for GET/POST transitions, and auto-convert status updates ---
+    const pathOrUrl = req.path || req.url || "";
+    const method = String(req.method || "GET").toUpperCase();
+
+    // 1) Explicit transitions listing
+    if (isTransitionsPath(pathOrUrl) && method === "GET") {
+      const issue = parseIssueFromPath(pathOrUrl);
+      const res = await listTransitions(baseUrl, issue, req.headers || headers, req.query || {});
+      const out = {
+        ok: res.status < 400,
+        status: res.status,
+        url: res.config?.url,
+        headers: subsetHeaders(res.headers),
+        data: res.data,
+        took_ms: Date.now() - startedAt
+      };
+      debugLog("HTTP Response (transitions GET)", { status: res.status, preview: res.data });
+      return JSON.stringify(out);
+    }
+
+    // 2) Explicit transitions POST (accepts transitionName or transitionId)
+    if (isTransitionsPath(pathOrUrl) && method === "POST") {
+      const issue = parseIssueFromPath(pathOrUrl);
+      const b = (req.body && typeof req.body === "object") ? req.body : {};
+      let transitionId =
+        b?.transition?.id ||
+        b?.transitionId ||
+        (typeof b?.id === "string" ? b.id : null);
+
+      const transitionName =
+        b?.transition?.name ||
+        b?.transitionName ||
+        (typeof b?.name === "string" ? b.name : null);
+
+      let fields = (b.fields && typeof b.fields === "object") ? b.fields : undefined;
+
+      if (!transitionId && transitionName) {
+        transitionId = await resolveTransitionIdByName(baseUrl, issue, req.headers || headers, transitionName);
+        if (!transitionId) {
+          return JSON.stringify({
+            ok: false,
+            error: "TRANSITION_NOT_FOUND",
+            hint: `No transition named '${transitionName}' available for issue ${issue}.`
+          });
+        }
+      }
+      if (!transitionId) {
+        return JSON.stringify({
+          ok: false,
+          error: "MISSING_TRANSITION",
+          hint: "Provide transitionId or transitionName."
+        });
+      }
+
+      const res = await postTransition(baseUrl, issue, req.headers || headers, transitionId, fields);
+      const out = {
+        ok: res.status < 400,
+        status: res.status,
+        url: res.config?.url,
+        headers: subsetHeaders(res.headers),
+        data: res.data,
+        took_ms: Date.now() - startedAt
+      };
+      debugLog("HTTP Response (transitions POST)", { status: res.status, preview: res.data });
+      return JSON.stringify(out);
+    }
+
+    // 3) Issue update with a desired status → auto-convert to transition
+    if (isIssueUpdatePath(pathOrUrl) && (method === "PUT" || method === "PATCH")) {
+      const desired = desiredStatusFromBody(req.body);
+      if (desired) {
+        const issue = parseIssueFromPath(pathOrUrl);
+        // Remove status from fields for use in transition fields
+        const fieldsIn = (req.body && typeof req.body === "object") ? (req.body.fields || {}) : {};
+        const fields = stripStatusFromFields(fieldsIn);
+
+        const transitionId = await resolveTransitionIdByName(baseUrl, issue, req.headers || headers, desired);
+        if (!transitionId) {
+          return JSON.stringify({
+            ok: false,
+            error: "TRANSITION_NOT_FOUND",
+            hint: `No transition named '${desired}' available for issue ${issue}.`
+          });
+        }
+
+        const res = await postTransition(baseUrl, issue, req.headers || headers, transitionId, fields);
+        const out = {
+          ok: res.status < 400,
+          status: res.status,
+          url: res.config?.url,
+          headers: subsetHeaders(res.headers),
+          data: res.data,
+          took_ms: Date.now() - startedAt,
+          info: { autoConvertedFrom: method, desiredStatus: desired }
+        };
+        debugLog("HTTP Response (auto-transition via issue update)", { status: res.status, preview: res.data });
+        return JSON.stringify(out);
+      }
+    }
+
+    // --- Default proxy path: anything else (including normalized search) ---
     const responseType = req.responseType === "arraybuffer" ? "arraybuffer" : "json";
     const timeout = Number.isFinite(Number(req.timeoutMs)) ? Number(req.timeoutMs) : 60000;
-
     const finalUrl = isAbsoluteUrl(req.url) ? req.url : buildUrl(baseUrl, req.path || "/", req.query || {});
     let data = undefined;
     let finalHeaders = { ...(req.headers || headers) };
@@ -311,22 +483,17 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
       responseType
     });
 
-    const hdrSubset = {};
-    for (const k of ["x-arequestid", "content-type", "content-length", "location", "x-ratelimit-remaining", "retry-after"]) {
-      if (res.headers?.[k]) hdrSubset[k] = res.headers[k];
-    }
-
     const out = {
       ok: res.status < 400,
       status: res.status,
       url: finalUrl,
-      headers: hdrSubset,
+      headers: subsetHeaders(res.headers),
       data: responseType === "arraybuffer"
         ? { bufferLength: Buffer.isBuffer(res.data) ? res.data.length : 0 }
         : res.data,
       took_ms: Date.now() - startedAt
     };
-    debugLog("HTTP Response", { status: res.status, headers: hdrSubset, preview: (responseType === "json" ? res.data : `arraybuffer(${out.data.bufferLength})`) });
+    debugLog("HTTP Response", { status: res.status, headers: subsetHeaders(res.headers), preview: (responseType === "json" ? res.data : `arraybuffer(${out.data.bufferLength})`) });
     return JSON.stringify(out);
 
   } catch (err) {
@@ -345,6 +512,14 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
       data: data || null
     });
   }
+}
+
+function subsetHeaders(h) {
+  const hdrSubset = {};
+  for (const k of ["x-arequestid", "content-type", "content-length", "location", "x-ratelimit-remaining", "retry-after"]) {
+    if (h?.[k]) hdrSubset[k] = h[k];
+  }
+  return hdrSubset;
 }
 
 module.exports = { jiraRequest };
