@@ -1,7 +1,8 @@
-// jira.js — v1.7
+// jira.js — v1.8
 // Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries + ORDER BY fix
 // + Defaults: request useful fields (summary, status, …) if none provided
 // + JQL placeholder sanitization: replace project = KEY / "KEY" / YOUR_PROJECT_KEY (with/without quotes)
+// + Respect original method: GET -> /search/jql with query params, POST -> /search/jql with JSON body
 
 const axios = require("axios");
 const { reportError } = require("./error.js");
@@ -128,12 +129,6 @@ function sanitizeJqlPlaceholders(jql, defaultProjectKey) {
   let s = String(jql || "").trim();
   if (!s) return s;
 
-  // Match variants:
-  // project = KEY
-  // project = "KEY"
-  // project = YOUR_PROJECT_KEY
-  // project = 'YOUR_PROJECT_KEY'
-  // (case-insensitive; optional quotes and whitespace)
   const variants = [
     /project\s*=\s*("?|')?KEY\1/gi,
     /project\s*=\s*("?|')?YOUR_PROJECT_KEY\1/gi
@@ -143,19 +138,17 @@ function sanitizeJqlPlaceholders(jql, defaultProjectKey) {
     if (defaultProjectKey) {
       s = s.replace(re, `project = "${defaultProjectKey}"`);
     } else {
-      // remove the clause entirely if we don't know the project key
       s = s.replace(re, "").trim();
     }
   }
 
-  // Remove accidental empty parens and fix dangling AND/OR due to removals
-  // e.g., "AND ()", "() AND", duplicate spaces, etc.
+  // Clean up after removals
   s = s
-    .replace(/\(\s*\)/g, "")                 // empty parentheses
-    .replace(/\s{2,}/g, " ")                 // multiple spaces
-    .replace(/^\s*(AND|OR)\s+/i, "")         // leading AND/OR
-    .replace(/\s+(AND|OR)\s*$/i, "")         // trailing AND/OR
-    .replace(/\s+(AND|OR)\s+(AND|OR)\s+/gi, " $2 ") // collapse double operators
+    .replace(/\(\s*\)/g, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^\s*(AND|OR)\s+/i, "")
+    .replace(/\s+(AND|OR)\s*$/i, "")
+    .replace(/\s+(AND|OR)\s+(AND|OR)\s+/gi, " $2 ")
     .trim();
 
   return s;
@@ -174,16 +167,17 @@ const DEFAULT_FIELDS = [
   "updated"
 ];
 
-function normalizeSearchRequest(req, defaultProjectKey) {
-  const allowCross = !!(req?.meta && req.meta.allowCrossProject === true);
+function normalizeSearchRequest(reqIn, defaultProjectKey) {
+  const allowCross = !!(reqIn?.meta && reqIn.meta.allowCrossProject === true);
   const isSearchPath = (p) =>
     /^https?:\/\/[^/]+\/rest\/api\/3\/search(?:\/jql)?\/?$|^\/rest\/api\/3\/search(?:\/jql)?\/?$/i
       .test(String(p || ""));
-  const p = req.path || req.url || "";
-  if (!isSearchPath(p)) return req;
+  const p = reqIn.path || reqIn.url || "";
+  if (!isSearchPath(p)) return reqIn;
 
-  const q = req.query || {};
-  const bodyIn = (req.body && typeof req.body === "object") ? { ...req.body } : {};
+  const origMethod = String(reqIn.method || "GET").toUpperCase();
+  const q = reqIn.query || {};
+  const bodyIn = (reqIn.body && typeof reqIn.body === "object") ? { ...reqIn.body } : {};
 
   let jql        = (bodyIn.jql ?? q.jql ?? "").toString();
   const startAt  = (bodyIn.startAt ?? q.startAt);
@@ -209,14 +203,39 @@ function normalizeSearchRequest(req, defaultProjectKey) {
 
   debugLog("Effective JQL", { jql });
 
+  // Respect the original method:
+  if (origMethod === "GET") {
+    // GET /rest/api/3/search/jql?jql=...&maxResults=...&startAt=...&fields=...&expand=...
+    const query = {
+      jql,
+      ...(startAt    !== undefined ? { startAt: String(Number(startAt)) } : {}),
+      ...(maxResults !== undefined ? { maxResults: String(Number(maxResults)) } : {}),
+      ...(fields && fields.length ? { fields: fields.join(",") } : {}),
+      ...(expand && expand.length ? { expand: expand.join(",") } : {})
+    };
+    return {
+      ...reqIn,
+      method: "GET",
+      path: "/rest/api/3/search/jql",
+      url: undefined,
+      query,
+      headers: {
+        ...(reqIn.headers || {}),
+        Accept: "application/json"
+      },
+      body: undefined
+    };
+  }
+
+  // POST /rest/api/3/search/jql with JSON body
   return {
-    ...req,
+    ...reqIn,
     method: "POST",
     path: "/rest/api/3/search/jql",
     url: undefined,
     query: {},
     headers: {
-      ...(req.headers || {}),
+      ...(reqIn.headers || {}),
       Accept: "application/json",
       "Content-Type": "application/json"
     },
@@ -260,7 +279,7 @@ async function jiraRequest(toolFunction, _context, _getAIResponse, runtime) {
     const headersIn = (reqIn.headers && typeof reqIn.headers === "object") ? { ...reqIn.headers } : {};
     const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
 
-    // Always normalize search to /search/jql + project + default fields
+    // Normalize search to /search/jql, respecting original verb
     let req = { ...reqIn, headers };
     req = normalizeSearchRequest(req, creds.defaultProjectKey);
 
