@@ -1,10 +1,10 @@
-// confluence.js — v2.2
+// confluence.js — v2.3
 // Generic JSON Proxy + Space Restriction + Auto-Version-Bump + Append-Storage + Retries
 // - Accepts JSON and forwards directly to Confluence; returns raw JSON
 // - Enforces defaultSpace from channel-config unless meta.allowCrossSpace === true
 // - Verifies space on update/delete; prefixes CQL with space=KEY on search
 // - Optional meta.autoBumpVersion: fetches current version and bumps if missing
-// - Optional meta.appendStorageHtml: fetches current storage HTML and appends HTML safely
+// - Optional meta.appendStorageHtml: fetches current storage HTML and appends HTML (keine versehentliche Escapes)
 // - Multipart upload with external file fetch
 // - Lazy-require getChannelConfig to avoid circular dependency
 
@@ -93,11 +93,24 @@ async function downloadToBuffer(url) {
   return Buffer.from(res.data);
 }
 
+/**
+ * ensureStorageHtml
+ * - Lässt gültiges Storage-XHTML (inkl. Namespaces wie <ac:image>, <ri:attachment>, <ri:page>) UNVERÄNDERT.
+ * - Wrappt nur reinen Text in <p>…</p> und escapt ihn.
+ */
 function ensureStorageHtml(s) {
   const str = String(s || "").trim();
   if (!str) return "<p></p>";
-  const hasTags = /<[a-z][\s>]/i.test(str);
-  return hasTags ? str : `<p>${str.replace(/[<>&]/g, m => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[m]))}</p>`;
+
+  // Erkenne HTML/Storage-XHTML Tags:
+  // - normale Tags: <p ...>, <div ...>
+  // - namespaced: <ac:image ...>, <ri:attachment ...>, <ri:page ...>
+  // - self-closing/closing werden durch [\s/>] abgedeckt
+  const hasTags = /<([a-z]+:)?[a-z][^>]*>/i.test(str);
+  if (hasTags) return str;
+
+  // Sonst: als Text behandeln
+  return `<p>${str.replace(/[<>&]/g, m => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[m]))}</p>`;
 }
 
 /* -------------------- Helper: axios with gentle retries -------------------- */
@@ -161,11 +174,11 @@ async function enforceSpaceRestriction(req, creds, headers) {
   const path = String(req?.path || "");
   const spaceKey = creds.defaultSpace;
 
-  // 1) CREATE page → space already injected in maybeInjectDefaults
+  // 1) CREATE page → space already injected
   if (method === "POST" && /\/rest\/api\/content\/?$/.test(path)) {
     if (req?.body && typeof req.body === "object") {
       if (!req.body.space) req.body.space = {};
-      req.body.space.key = spaceKey; // hard enforce
+      req.body.space.key = spaceKey;
     }
     return req;
   }
@@ -182,8 +195,7 @@ async function enforceSpaceRestriction(req, creds, headers) {
   // 3) LIST content → force spaceKey param
   if (method === "GET" && /\/rest\/api\/content\/?$/.test(path)) {
     const q = req.query || {};
-    if (!("spaceKey" in q)) q.spaceKey = spaceKey;
-    else q.spaceKey = spaceKey; // enforce
+    q.spaceKey = spaceKey;
     req.query = q;
     return req;
   }
@@ -193,7 +205,6 @@ async function enforceSpaceRestriction(req, creds, headers) {
   if ((method === "PUT" || method === "DELETE" || method === "POST" || method === "GET") && idMatch) {
     const pageId = idMatch[1];
 
-    // Fetch page space
     const checkUrl = `${creds.baseUrl}/rest/api/content/${encodeURIComponent(pageId)}?expand=space`;
     const res = await axiosWithRetry({
       method: "GET",
@@ -255,7 +266,7 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
     const req = rawArgs.json || rawArgs || {};
     debugLog("ToolCall JSON (in)", req);
 
-    // Early validation to stop empty/invalid toolcalls
+    // Early validation
     if (!req || typeof req !== "object" || !req.method || (!req.path && !req.url)) {
       debugLog("Bad Tool Args", req);
       return JSON.stringify({
@@ -278,7 +289,6 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
     const timeout = Number.isFinite(Number(req.timeoutMs)) ? Number(req.timeoutMs) : 60000;
 
     const baseUrl = creds.baseUrl;
-    const url = isAbsoluteUrl(req.url) ? req.url : buildUrl(baseUrl, req.path || "/", req.query || {});
     const headersIn = (req.headers && typeof req.headers === "object") ? { ...req.headers } : {};
     const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
 
@@ -300,7 +310,6 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
       if (pageId) {
         const { html: oldHtml, version: v } = await fetchStorageHtml(baseUrl, pageId, headers);
         const add = ensureStorageHtml(guardedReq.meta.appendStorageHtml);
-        // Simple append. (Optional: smarter insert before closing body if needed.)
         const merged = oldHtml + add;
 
         if (!guardedReq.body.body) guardedReq.body.body = {};
