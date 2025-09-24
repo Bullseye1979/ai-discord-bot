@@ -1,13 +1,10 @@
-// confluence.js — v1.1 (create/update/delete page + upload/embed image + Debug Logs)
+// confluence.js — v1.2 (create/update/delete page + upload/embed image + Debug Logs)
+// - Nutzt Lazy-Require für getChannelConfig, um Circular-Dependency zu vermeiden
 // - Loggt Requests, Statuscodes und Responses ins Console-Log
 // - Liest Credentials aus channel-config/<channelId>.json → blocks[].confluence
 
 const axios = require("axios");
 const FormData = require("form-data");
-const { getChannelConfig } = require("./discord-helper.js");
-console.log("[Confluence DEBUG] helper typeof getChannelConfig:", typeof getChannelConfig);
-
-
 const { reportError } = require("./error.js");
 
 function debugLog(label, obj) {
@@ -19,6 +16,21 @@ function debugLog(label, obj) {
 }
 
 function pickConfluenceCreds(channelId) {
+  // Lazy require → verhindert Circular Dependency
+  let getChannelConfig;
+  try {
+    ({ getChannelConfig } = require("./discord-helper.js"));
+    debugLog("Helper typeof getChannelConfig", typeof getChannelConfig);
+  } catch (err) {
+    debugLog("Helper Load Error", err.message || err);
+    return null;
+  }
+
+  if (typeof getChannelConfig !== "function") {
+    debugLog("getChannelConfig not a function", {});
+    return null;
+  }
+
   const meta = getChannelConfig(String(channelId || ""));
   if (!meta) return null;
 
