@@ -1,19 +1,10 @@
-// tools.js — smart history v2.5 (getInformation + getHistory, frames[] supported)
+// tools.js — smart history v2.6 (+ Confluence ToolCall)
 // - getInformation: OR-Keyword-Suche im CURRENT CHANNEL → NACHRICHTENKONTEXT
-//     * NUR die 30 neuesten Treffer (ORDER BY id DESC LIMIT 30)
-//     * für jeden Treffer: N davor + Treffer + N danach (default 10) — alles strikt im selben Channel
-//     * dedupliziert, global id-aufsteigend sortiert
-//     * flache Liste { sender, timestamp(ISO), content } (KEINE Zusammenfassung)
-// - getHistory: Timeframe-Summarization über EIN oder MEHRERE Zeitfenster (frames[] ODER start/end ODER kompletter Channel)
-//     * Single LLM Pass (no chunking); user_prompt steuert Output
-//
-// Außerdem enthalten: getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
-// getImageDescription, getLocation, getImageSD, getPDF
-//
-// Hinweise:
-// * getInformation ersetzt findTimeframes (Alias bleibt erhalten in normalizeToolName).
-// * Wenn der Nutzer explizite Zeitangaben liefert → direkt getHistory verwenden.
-// * Wenn nur Keywords ohne klare Zeitangabe → getInformation für Kontext-Snippets verwenden.
+// - getHistory: Timeframe-Summarization (Single LLM Pass)
+// - + getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
+//     getImageDescription, getLocation, getImageSD, getPDF
+// - NEU: confluencePage (create/update/delete + Attachment/Image-Embed)
+//   * Credentials kommen aus channel-config/<channelId>.json → blocks[].confluence{ baseUrl, email, token, defaultSpace, defaultParentId }
 
 const { getWebpage } = require("./webpage.js");
 const { getImage, getImageSD } = require("./image.js");
@@ -24,6 +15,9 @@ const { getLocation } = require("./location.js");
 const { getPDF } = require("./pdf.js");
 const { getInformation, getHistory } = require("./history.js");
 const { reportError } = require("./error.js");
+
+// NEU: Confluence Tool (eigene Datei erforderlich)
+const { confluencePage } = require("./confluence.js");
 
 // ---- OpenAI tool specs ------------------------------------------------------
 
@@ -274,6 +268,34 @@ const tools = [
         required: ["html"]
       }
     }
+  },
+
+  // ==== Confluence (NEU) =====================================================
+  {
+    type: "function",
+    function: {
+      name: "confluencePage",
+      description:
+        "Create, update or delete a Confluence page (Cloud). Can also upload an image (from URL) and embed it into the page content. " +
+        "Credentials are read from the channel-config block (blocks[].confluence).",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["create", "update", "delete"], description: "Operation to perform." },
+          // create
+          space_key: { type: "string", description: "Confluence Space Key. If omitted, uses blocks[].confluence.defaultSpace." },
+          title: { type: "string", description: "Page title (required for create/update)." },
+          content_html: { type: "string", description: "Body in Confluence storage format or plain text (will be wrapped)." },
+          parent_id: { type: "string", description: "Optional ancestor page id for create." },
+          image_url: { type: "string", description: "Optional: remote image URL to upload & embed." },
+          image_filename: { type: "string", description: "Optional: filename override for the uploaded image." },
+          // update/delete
+          page_id: { type: "string", description: "Target page id (required for update/delete)." },
+          user_id: { type: "string", description: "Optional: User ID or display name (for attribution/logging only)." }
+        },
+        required: ["action"]
+      }
+    }
   }
 ];
 
@@ -290,7 +312,8 @@ const fullToolRegistry = {
   getPDF,
   getImageSD,
   getInformation, // ← ersetzt findTimeframes
-  getHistory
+  getHistory,
+  confluencePage // ← NEU
 };
 
 /** Normalize tool names (aliases + case-insensitive) to the canonical registry key. */
