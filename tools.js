@@ -1,4 +1,4 @@
-// tools.js — smart history v2.8 (+ Confluence JSON Proxy + Space Restriction Hint)
+// tools.js — smart history v2.9 (+ Confluence JSON Proxy, Space Restriction, Few-Shot Examples)
 // - getInformation: OR-Keyword-Suche im CURRENT CHANNEL → NACHRICHTENKONTEXT
 // - getHistory: Timeframe-Summarization (Single LLM Pass)
 // - + getWebpage, getImage, getGoogle, getYoutube, getYoutubeSearch,
@@ -281,22 +281,28 @@ const tools = [
       name: "confluencePage",
       description:
         "Generic JSON proxy to Confluence Cloud REST API. The assistant MUST provide a single 'json' object with HTTP request parameters. " +
-        "USE THIS FOR ANY REQUEST OR ACCESS TO CONFLUENCE. DO NOT USE OTHER TOOLCALLS TO TRY TO ACCESS CONFLUENCE. "+
+        "USE THIS FOR ANY REQUEST OR ACCESS TO CONFLUENCE. DO NOT USE OTHER TOOLCALLS TO TRY TO ACCESS CONFLUENCE. " +
         "This tool forwards the request 1:1 to Confluence (auth & baseUrl are injected from channel-config). " +
-        "Space-Restriction ist standardmäßig aktiv: " +
-        "• POST /rest/api/content erzwingt defaultSpace (und optional defaultParent). " +
-        "• GET /rest/api/content/search bekommt CQL-Präfix space=\"KEY\". " +
-        "• PUT/DELETE auf Seiten-IDs werden vorab auf Space==KEY geprüft. " +
-        "Override nur mit json.meta.allowCrossSpace === true.",
+        "Space restriction is ON by default:\n" +
+        "• POST /rest/api/content → enforce defaultSpace (and defaultParent if available) unless meta.allowCrossSpace===true.\n" +
+        "• GET /rest/api/content/search → prepend CQL with space=\"KEY\" unless allowCrossSpace.\n" +
+        "• PUT/DELETE by pageId → validate page belongs to KEY unless allowCrossSpace.\n\n" +
+        "EXAMPLES (the assistant MUST mirror these patterns exactly):\n" +
+        "1) CREATE PAGE\n" +
+        "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/content\", \"body\":{ \"type\":\"page\", \"title\":\"Session 3\", \"space\":{ \"key\":\"\" }, \"body\":{ \"storage\":{ \"value\":\"<p>Notes</p>\", \"representation\":\"storage\" } } }, \"meta\":{ \"injectDefaultSpace\":true, \"injectDefaultParent\":true } } }\n" +
+        "2) SEARCH PAGES IN SPACE (CQL)\n" +
+        "{ \"json\": { \"method\":\"GET\", \"path\":\"/rest/api/content/search\", \"query\":{ \"cql\":\"type=page AND title ~ \\\"Session\\\"\", \"limit\":25 } } }\n" +
+        "3) UPLOAD ATTACHMENT TO PAGE\n" +
+        "{ \"json\": { \"method\":\"POST\", \"path\":\"/rest/api/content/12345/child/attachment\", \"multipart\":true, \"headers\":{ \"X-Atlassian-Token\":\"no-check\" }, \"files\":[{ \"name\":\"file\", \"url\":\"https://…/img.png\", \"filename\":\"img.png\" }], \"form\":{ \"comment\":\"Upload via bot\" } } }\n" +
+        "4) UPDATE PAGE STORAGE (version +1 required — the proxy will fetch current version if omitted)\n" +
+        "{ \"json\": { \"method\":\"PUT\", \"path\":\"/rest/api/content/12345\", \"body\":{ \"id\":\"12345\", \"type\":\"page\", \"title\":\"Session 3\", \"version\":{ \"number\": 2 }, \"body\":{ \"storage\":{ \"value\":\"<p>Updated</p>\", \"representation\":\"storage\" } } } } }",
       parameters: {
         type: "object",
         properties: {
           json: {
             type: "object",
             description:
-              "HTTP request definition for Confluence. Beispiel: " +
-              "{ method:'POST', path:'/rest/api/content', body:{ type:'page', title:'T', body:{ storage:{ value:'<p>..</p>', representation:'storage' } } }, " +
-              "meta:{ injectDefaultSpace:true, injectDefaultParent:true } }",
+              "HTTP request definition for Confluence. See the examples in the description.",
             properties: {
               method: { type: "string", description: "HTTP method (GET|POST|PUT|DELETE|PATCH). Default GET." },
               path:   { type: "string", description: "Relative API path, z.B. '/rest/api/content'. Ignored if 'url' is absolute." },
