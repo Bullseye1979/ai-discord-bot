@@ -1,14 +1,7 @@
-// jira.js — v1.6
+// jira.js — v1.7
 // Generic JSON Proxy for Jira Cloud + Project Restriction + Always-use /rest/api/3/search/jql + Retries + ORDER BY fix
 // + Defaults: request useful fields (summary, status, …) if none provided
-// + JQL placeholder sanitization: replace project="KEY"/"YOUR_PROJECT_KEY" with defaultProjectKey
-//
-// - Accepts JSON and forwards directly to Jira; returns raw JSON
-// - Enforces defaultProjectKey unless meta.allowCrossProject === true
-// - ALWAYS migrates search to POST /rest/api/3/search/jql (maps legacy /search GET/POST automatically)
-// - Keeps ORDER BY at the end of the whole JQL (do not wrap it inside parentheses)
-// - Gentle retries for 5xx/429
-// - Lazy-require getChannelConfig to avoid circular dependency
+// + JQL placeholder sanitization: replace project = KEY / "KEY" / YOUR_PROJECT_KEY (with/without quotes)
 
 const axios = require("axios");
 const { reportError } = require("./error.js");
@@ -135,22 +128,36 @@ function sanitizeJqlPlaceholders(jql, defaultProjectKey) {
   let s = String(jql || "").trim();
   if (!s) return s;
 
-  // Replace common placeholders with the configured project key, if present.
-  const placeholders = ['"KEY"', "'KEY'", '"YOUR_PROJECT_KEY"', "'YOUR_PROJECT_KEY'"];
-  for (const ph of placeholders) {
-    const re = new RegExp(`project\\s*=\\s*${ph.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}`, "gi");
+  // Match variants:
+  // project = KEY
+  // project = "KEY"
+  // project = YOUR_PROJECT_KEY
+  // project = 'YOUR_PROJECT_KEY'
+  // (case-insensitive; optional quotes and whitespace)
+  const variants = [
+    /project\s*=\s*("?|')?KEY\1/gi,
+    /project\s*=\s*("?|')?YOUR_PROJECT_KEY\1/gi
+  ];
+
+  for (const re of variants) {
     if (defaultProjectKey) {
       s = s.replace(re, `project = "${defaultProjectKey}"`);
     } else {
-      // Remove the invalid clause entirely if no default key is available.
-      s = s.replace(re, "").replace(/\s+AND\s+/gi, " ").replace(/\s+OR\s+/gi, " ").trim();
+      // remove the clause entirely if we don't know the project key
+      s = s.replace(re, "").trim();
     }
   }
 
-  // Collapse double spaces after replacements
-  s = s.replace(/\s{2,}/g, " ").trim();
-  // Remove leading/trailing dangling AND/OR
-  s = s.replace(/^(AND|OR)\s+/i, "").replace(/\s+(AND|OR)$/i, "").trim();
+  // Remove accidental empty parens and fix dangling AND/OR due to removals
+  // e.g., "AND ()", "() AND", duplicate spaces, etc.
+  s = s
+    .replace(/\(\s*\)/g, "")                 // empty parentheses
+    .replace(/\s{2,}/g, " ")                 // multiple spaces
+    .replace(/^\s*(AND|OR)\s+/i, "")         // leading AND/OR
+    .replace(/\s+(AND|OR)\s*$/i, "")         // trailing AND/OR
+    .replace(/\s+(AND|OR)\s+(AND|OR)\s+/gi, " $2 ") // collapse double operators
+    .trim();
+
   return s;
 }
 
@@ -166,7 +173,6 @@ const DEFAULT_FIELDS = [
   "created",
   "updated"
 ];
-// Note: issue.key is top-level and not part of "fields"; we request core fields for better display.
 
 function normalizeSearchRequest(req, defaultProjectKey) {
   const allowCross = !!(req?.meta && req.meta.allowCrossProject === true);
@@ -185,29 +191,21 @@ function normalizeSearchRequest(req, defaultProjectKey) {
   let fields     = asArray(bodyIn.fields ?? q.fields);
   let expand     = asArray(bodyIn.expand ?? q.expand);
 
-  // Clean placeholders before prefixing
+  // Sanitize placeholders first
   jql = sanitizeJqlPlaceholders(jql, defaultProjectKey);
 
-  // If the caller passed an empty/placeholder JQL, still give a useful default ORDER BY
-  if (!jql) {
-    jql = "ORDER BY created DESC";
-  }
+  // Default JQL if nothing left
+  if (!jql) jql = "ORDER BY created DESC";
 
   // Project restriction unless explicitly allowed
   if (!allowCross && defaultProjectKey) {
     jql = prefixProjectToJql(jql, defaultProjectKey);
   }
 
-  // Sensible defaults: ensure we get useful data if caller provided nothing
-  if (!fields || fields.length === 0) {
-    fields = DEFAULT_FIELDS.slice();
-  }
-  if (!expand || expand.length === 0) {
-    expand = ["renderedFields"];
-  }
-  if (maxResults === undefined || maxResults === null) {
-    maxResults = 50;
-  }
+  // Sensible defaults
+  if (!fields || fields.length === 0) fields = DEFAULT_FIELDS.slice();
+  if (!expand || expand.length === 0) expand = ["renderedFields"];
+  if (maxResults === undefined || maxResults === null) maxResults = 50;
 
   debugLog("Effective JQL", { jql });
 
