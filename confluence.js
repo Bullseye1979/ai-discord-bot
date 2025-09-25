@@ -1,8 +1,8 @@
-// confluence.js — v2.3
+// confluence.js — v2.4
 // Generic JSON Proxy + Space Restriction + Auto-Version-Bump + Append-Storage + Retries
 // - Accepts JSON and forwards directly to Confluence; returns raw JSON
 // - Enforces defaultSpace from channel-config unless meta.allowCrossSpace === true
-// - Verifies space on update/delete; prefixes CQL with space=KEY on search
+// - Verifies space on update/delete; prefixes CQL with space=KEY on search (nur wenn noch kein space= vorhanden)
 // - Optional meta.autoBumpVersion: fetches current version and bumps if missing
 // - Optional meta.appendStorageHtml: fetches current storage HTML and appends HTML (keine versehentliche Escapes)
 // - Multipart upload with external file fetch
@@ -137,7 +137,8 @@ function maybeInjectDefaults(req, creds) {
   try {
     const meta = req?.meta || {};
     const allowSpace = meta.injectDefaultSpace !== false;
-    const allowParent = meta.injectDefaultParent !== false;
+    // ⬇️ Parent-Injektion ist jetzt **OPT-IN**
+    const allowParent = meta.injectDefaultParent === true;
 
     const method = String(req?.method || "GET").toUpperCase();
     const path = String(req?.path || "");
@@ -183,11 +184,12 @@ async function enforceSpaceRestriction(req, creds, headers) {
     return req;
   }
 
-  // 2) SEARCH → prefix CQL with space=KEY AND (...)
+  // 2) SEARCH → prefix CQL mit space=KEY nur wenn noch kein space= in der CQL steht
   if (method === "GET" && /\/rest\/api\/content\/search\/?$/.test(path)) {
     const q = req.query || {};
     const cql = String(q.cql || "").trim();
-    const wrapped = cql ? `space = "${spaceKey}" AND (${cql})` : `space = "${spaceKey}"`;
+    const hasSpace = /\bspace\s*=\s*["']?[A-Za-z0-9_-]+["']?/i.test(cql);
+    const wrapped = hasSpace ? cql : (cql ? `space = "${spaceKey}" AND (${cql})` : `space = "${spaceKey}"`);
     req.query = { ...q, cql: wrapped };
     return req;
   }
@@ -216,7 +218,7 @@ async function enforceSpaceRestriction(req, creds, headers) {
     const key = res?.data?.space?.key || null;
     if (res.status >= 400 || !key) {
       const err = new Error(`SPACE_CHECK_FAILED_${res?.status || "ERR"}`);
-      err._raw = res?.data;
+      err._raw = res.data;
       throw err;
     }
     if (key !== spaceKey) {

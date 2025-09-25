@@ -1,9 +1,7 @@
-// aiCore.js — unified flow v2.44
-// (Fix v2.44: Finalizer-Coalescing – alle während des Finalizers
-//  erzeugten Assistant-Teilnachrichten werden nach der internen
-//  Continue-Schleife zu GENAU EINER Assistant-Nachricht zusammengeführt.
-//  Damit kann die aufrufende Schicht nichts „verlieren“ und zeigt nicht
-//  nur das letzte Stück an. Enthält v2.40-Sync der Kettenschleife.)
+// aiCore.js — unified flow v2.45
+// (Fix v2.45: Eingangs-Segmentierung von großen Tool-Outputs als "anchored parts"
+//  direkt im replyTool(); der Finalizer erhält damit zuverlässig Parts und kann
+//  seine Continue-Schleife ausfahren. Enthält v2.44-Coalescing und v2.40-Sync.)
 // -------------------------------------------------------------------------------
 // - EIN Flow für native & Pseudo-Tools (pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
@@ -11,7 +9,7 @@
 //   + Continue-Logik: wenn kein tool_call, aber finish_reason === "length", mit "continue" erneut fragen
 // - Finalisierungsturn (postToolFinalize=true): Tool-Outputs ans Modell zur Aufbereitung; Tools strikt deaktiviert
 //   + Finalizer hat eigene Continue-Schleife (mehrteilige, sehr lange Antworten)
-//   + NEU: Finalizer coalesced seine Teilstücke in EINE Assistant-Message (v2.44)
+//   + v2.44: Finalizer coalesced seine Teilstücke in EINE Assistant-Nachricht
 // - v2.39: collectedAssistantParts sammelt ALLE Textteile (Kettenschleife)
 // - v2.40: collectedAssistantParts werden nach der Schleife in context.messages gemerged
 // - Kein Fabricate, kein Auto-Prompt-Fill
@@ -425,19 +423,15 @@ async function runFinalizeWithContinue(context, tokenlimit, model, apiKey, optio
     break;
   }
 
-  // *** NEU: Coalescing – alle während des Finalizers gepushten Teile
-  //          wieder zu einer einzigen Assistant-Nachricht zusammenfassen. ***
+  // v2.44: Coalescing – alle während des Finalizers gepushten Teile
   if (pushedIdxs.length > 1 && combined) {
-    // Ersetze die erste Finalizer-Assistant-Nachricht
     context.messages[pushedIdxs[0]].content = combined;
-    // Entferne alle übrigen Teilnachrichten (von hinten nach vorne splicen)
     for (let i = pushedIdxs.length - 1; i >= 1; i--) {
       context.messages.splice(pushedIdxs[i], 1);
     }
   }
 
-  // *** Sicherstellen, dass das KOMPLETTE Finalizer-Ergebnis als LETZTE
-  //     Assistant-Nachricht im Verlauf steht. ***
+  // Sicherstellen, dass das KOMPLETTE Finalizer-Ergebnis als letzte Assistant-Nachricht steht
   if (combined) {
     const last = context.messages[context.messages.length - 1];
     if (!(last && last.role === "assistant" && String(last.content || "").trim() === combined)) {
@@ -696,6 +690,15 @@ async function getAIResponse(
 
             // Für Finalizer sammeln (RAM)
             toolResults.push({ name: fnName || "tool", raw: out });
+
+            // *** v2.45: Große Tool-Outputs sofort als "anchored parts" einspeisen ***
+            try {
+              const MAX_PART = Math.max(3000, Number(process.env.TOOL_PART_CHARS || 6000));
+              // Nur segmentieren, wenn sinnvoll groß:
+              if (typeof out === "string" ? out.length > MAX_PART : true) {
+                injectToolOutputAsAssistantParts(context, fnName || "tool", out, MAX_PART);
+              }
+            } catch {}
           };
 
           if (!toolFunction) {
