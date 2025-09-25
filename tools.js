@@ -293,6 +293,7 @@ const tools = [
         "This tool forwards the request 1:1 to Confluence (auth & baseUrl are injected from channel-config). " +
         "It might be required to run this tool 2 times, once to get the page-ID from the description and a second time to perform the actual action on this page. " +
         "Space restriction is ON by default:\n" +
+        "ALWAYS USE THE ATLASSIAN DOCUMENT FORMAT (ADF) JSOM. Do not use Markdown (###, **Text**, etc.) or raw text. \n"+
         "• POST /rest/api/content → enforce defaultSpace (and defaultParent if available) unless meta.allowCrossSpace===true.\n" +
         "• GET /rest/api/content/search → prepend CQL with space=\"KEY\" unless allowCrossSpace.\n" +
         "• PUT/DELETE by pageId → validate page belongs to KEY unless allowCrossSpace.\n\n" +
