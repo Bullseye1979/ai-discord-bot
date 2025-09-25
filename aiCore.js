@@ -1,7 +1,9 @@
-// aiCore.js — unified flow v2.45
+// aiCore.js — unified flow v2.45 (Variante 2, gefixt)
 // (Fix v2.45: Eingangs-Segmentierung von großen Tool-Outputs als "anchored parts"
-//  direkt im replyTool(); der Finalizer erhält damit zuverlässig Parts und kann
-//  seine Continue-Schleife ausfahren. Enthält v2.44-Coalescing und v2.40-Sync.)
+//  NACH dem vollständigen Pairing (assistant.tool_calls -> tool-Replies).
+//  Die Anchored-Parts werden NICHT mehr im replyTool() injiziert, sondern
+//  gesammelt und erst direkt nach den tool-Replies inseriert.
+//  Enthält v2.44-Coalescing und v2.40-Sync.)
 // -------------------------------------------------------------------------------
 // - EIN Flow für native & Pseudo-Tools (pseudotoolcalls = true|false)
 // - pseudotoolcalls=true: 1 Pseudo-Toolcall -> normalisieren -> ausführen -> (optional) finalisieren
@@ -525,6 +527,7 @@ async function getAIResponse(
     /* ===== CHAIN LOOP (native tools) / SINGLE SHOT (pseudo) ===== */
     let rounds = 0;
     let continueLoop = true;
+    let theFinishReason = ""; // fix: explizit scopen
 
     while (continueLoop && rounds < Math.max(1, sequenceLimit)) {
       rounds += 1;
@@ -586,14 +589,14 @@ async function getAIResponse(
       } catch (err) {
         const details = { endpoint, status: err?.response?.status, data: err?.response?.data };
         await reportError(err, null, "OPENAI_CHAT", { details });
-        try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify({ endpoint, model, payloadPreview: { messages: messagesToSend.slice(-6), tools: payload.tools ? (payload.tools.map(t => t?.function?.name || t?.name)) : [] } }, null, 2)); } catch {}
+        try { console.error("[OPENAI_CHAT][REQUEST_DEBUG]", JSON.stringify({ endpoint, model, payloadPreview: { messages: messagesToSend.slice(-6), tools: payload.tools ? (payload.tools.map(t => t?.function?.name || t?.name)) : [] }, }, null, 2)); } catch {}
         console.log("\n\n=== CONTEXT RAW DUMP ===\n", context?.messages || [], "\n=== /CONTEXT RAW DUMP ===\n");
         throw err;
       }
 
       const choice = aiResponse?.data?.choices?.[0] || {};
       const aiMessage = choice.message || {};
-      theFinishReason = choice.finish_reason; // lokal
+      theFinishReason = choice.finish_reason || ""; // lokal
       const rawText = (aiMessage.content || "").trim();
       lastRawAssistant = rawText;
 
@@ -671,6 +674,10 @@ async function getAIResponse(
       if (hadToolCallsThisTurn) {
         const callsToRun = pseudotoolcalls ? normalizedCalls.slice(0, 1) : normalizedCalls;
 
+        // NEU (Variante 2): Anchored-Parts werden gesammelt und erst NACH allen tool-Replies injiziert
+        const pendingAnchoredParts = []; // [{ toolName, payloadString }]
+        const MAX_PART = Math.max(3000, Number(process.env.TOOL_PART_CHARS || 6000));
+
         for (const call of callsToRun) {
           const fnName = call.name;
           const args = call.arguments || {};
@@ -683,20 +690,18 @@ async function getAIResponse(
               ? (content || "")
               : (() => { try { return JSON.stringify(content); } catch { return String(content); } })();
 
-            // tool-Message (RAM-Kontext)
+            // tool-Message (RAM-Kontext) — WICHTIG fürs Pairing
             context.messages.push({ role: "tool", tool_call_id: call.id, content: out });
-
-            // KEINE DB-Persistierung mehr
 
             // Für Finalizer sammeln (RAM)
             toolResults.push({ name: fnName || "tool", raw: out });
 
-            // *** v2.45: Große Tool-Outputs sofort als "anchored parts" einspeisen ***
+            // NICHT direkt injizieren! (kein assistant-Part hier)
+            // Stattdessen: ggf. als pending Anchored-Part vormerken
             try {
-              const MAX_PART = Math.max(3000, Number(process.env.TOOL_PART_CHARS || 6000));
-              // Nur segmentieren, wenn sinnvoll groß:
-              if (typeof out === "string" ? out.length > MAX_PART : true) {
-                injectToolOutputAsAssistantParts(context, fnName || "tool", out, MAX_PART);
+              const length = typeof out === "string" ? out.length : String(out || "").length;
+              if (length > MAX_PART) {
+                pendingAnchoredParts.push({ toolName: fnName || "tool", payload: out });
               }
             } catch {}
           };
@@ -718,6 +723,18 @@ async function getAIResponse(
             await reportError(toolErr, null, `TOOL_${(fnName || "unknown").toUpperCase()}`);
             dbg("Tool error:", fnName, emsg);
             replyTool(JSON.stringify({ error: emsg, tool: fnName || "unknown" }));
+          }
+        }
+
+        // *** Hier (Variante 2): Erst NACH allen tool-Replies die Anchored-Parts injizieren ***
+        // Dadurch bleibt die Sequenz strikt: assistant(tool_calls) → tool → tool → ... → assistant(«Part …»)
+        if (pendingAnchoredParts.length > 0) {
+          for (const part of pendingAnchoredParts) {
+            try {
+              injectToolOutputAsAssistantParts(context, part.toolName, part.payload, MAX_PART);
+            } catch (e) {
+              dbg("Anchored parts inject error:", e?.message || String(e));
+            }
           }
         }
       }
