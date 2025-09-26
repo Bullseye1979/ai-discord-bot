@@ -1,10 +1,12 @@
-// confluence.js — v2.4
-// Generic JSON Proxy + Space Restriction + Auto-Version-Bump + Append-Storage + Retries
+// confluence.js — v2.4 (Cloud Editor compat + auto-expand)
 // - Accepts JSON and forwards directly to Confluence; returns raw JSON
 // - Enforces defaultSpace from channel-config unless meta.allowCrossSpace === true
-// - Verifies space on update/delete; prefixes CQL with space=KEY on search (nur wenn noch kein space= vorhanden)
+// - Verifies space on update/delete; prefixes CQL with space=KEY on search
 // - Optional meta.autoBumpVersion: fetches current version and bumps if missing
 // - Optional meta.appendStorageHtml: fetches current storage HTML and appends HTML (keine versehentliche Escapes)
+// - Cloud Editor Compatibility scrub for storage XHTML (headings, wrapping, basic cleanup)
+// - Auto-Expand: GET immer (konfigurierbar) body.storage (und optional ADF) mitliefern
+// - After POST/PUT: optionaler Follow-up GET mit expand, damit Chat IMMER Text hat
 // - Multipart upload with external file fetch
 // - Lazy-require getChannelConfig to avoid circular dependency
 
@@ -93,9 +95,48 @@ async function downloadToBuffer(url) {
   return Buffer.from(res.data);
 }
 
+/* -------------------- Cloud-Editor Compat (Storage XHTML) -------------------- */
+/**
+ * Confluence Cloud Editor (v2) zeigt weiterhin 'storage' an, aber:
+ * - <h1> ist reserviert (Seitentitel) → in <h2> umwandeln
+ * - lose Textknoten vermeiden → Notfalls <p> wrappen
+ * - übermäßig viele <br> normalisieren
+ * - triviale self-closing normalisieren (<br> → <br/>)
+ * - (Optional) Weitere harte Verbote könnten hier ergänzt werden
+ */
+function scrubStorageForCloudEditor(html) {
+  if (!html || typeof html !== "string") return html;
+
+  let s = html;
+
+  // h1 -> h2 (Cloud nutzt H1 für den Titel)
+  s = s.replace(/<\s*h1(\s[^>]*)?>/gi, "<h2$1>");
+  s = s.replace(/<\s*\/\s*h1\s*>/gi, "</h2>");
+
+  // <br> → <br/> und Runs von <br/><br/><br/> auf max 2 kürzen
+  s = s.replace(/<br\s*>/gi, "<br/>");
+  s = s.replace(/(?:<br\/>\s*){3,}/gi, "<br/><br/>");
+
+  // Top-level reiner Text → in <p> wrappen (nur wenn es nicht schon valider Block ist)
+  // Heuristik: wenn das Ganze keine Tags enthält, übernehmen ensureStorageHtml ohnehin das Wrapping.
+  // Hier noch: Texte außerhalb von Block-Tag-Gruppen schnell einschließen.
+  // (Sehr einfache Heuristik, bewusst konservativ)
+  const trimmed = s.trim();
+  if (!/^<([a-z]+:)?[a-z]/i.test(trimmed)) {
+    s = `<p>${escapeText(trimmed)}</p>`;
+  }
+
+  return s;
+}
+
+function escapeText(str) {
+  return String(str || "").replace(/[<>&]/g, m => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[m]));
+}
+
 /**
  * ensureStorageHtml
- * - Lässt gültiges Storage-XHTML (inkl. Namespaces wie <ac:image>, <ri:attachment>, <ri:page>) UNVERÄNDERT.
+ * - Lässt gültiges Storage-XHTML (inkl. Namespaces wie <ac:image>, <ri:attachment>, <ri:page>) UNVERÄNDERT
+ *   (bis auf Cloud-Compat-Scrub).
  * - Wrappt nur reinen Text in <p>…</p> und escapt ihn.
  */
 function ensureStorageHtml(s) {
@@ -103,14 +144,14 @@ function ensureStorageHtml(s) {
   if (!str) return "<p></p>";
 
   // Erkenne HTML/Storage-XHTML Tags:
-  // - normale Tags: <p ...>, <div ...>
-  // - namespaced: <ac:image ...>, <ri:attachment ...>, <ri:page ...>
-  // - self-closing/closing werden durch [\s/>] abgedeckt
   const hasTags = /<([a-z]+:)?[a-z][^>]*>/i.test(str);
-  if (hasTags) return str;
+  if (hasTags) {
+    // Cloud-Editor-Compat-Scrub auf bestehendem HTML
+    return scrubStorageForCloudEditor(str);
+  }
 
-  // Sonst: als Text behandeln
-  return `<p>${str.replace(/[<>&]/g, m => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[m]))}</p>`;
+  // Sonst: als reinen Text behandeln
+  return `<p>${escapeText(str)}</p>`;
 }
 
 /* -------------------- Helper: axios with gentle retries -------------------- */
@@ -137,8 +178,7 @@ function maybeInjectDefaults(req, creds) {
   try {
     const meta = req?.meta || {};
     const allowSpace = meta.injectDefaultSpace !== false;
-    // ⬇️ Parent-Injektion ist jetzt **OPT-IN**
-    const allowParent = meta.injectDefaultParent === true;
+    const allowParent = meta.injectDefaultParent !== false;
 
     const method = String(req?.method || "GET").toUpperCase();
     const path = String(req?.path || "");
@@ -147,6 +187,7 @@ function maybeInjectDefaults(req, creds) {
     if (!req.body || typeof req.body !== "object") return req;
     const body = req.body;
 
+    // Normalize storage body (Cloud-compat)
     if (body.type === "page" && body?.body?.storage?.value) {
       body.body.storage.value = ensureStorageHtml(body.body.storage.value);
       body.body.storage.representation = body.body.storage.representation || "storage";
@@ -184,12 +225,11 @@ async function enforceSpaceRestriction(req, creds, headers) {
     return req;
   }
 
-  // 2) SEARCH → prefix CQL mit space=KEY nur wenn noch kein space= in der CQL steht
+  // 2) SEARCH → prefix CQL with space=KEY AND (...)
   if (method === "GET" && /\/rest\/api\/content\/search\/?$/.test(path)) {
     const q = req.query || {};
     const cql = String(q.cql || "").trim();
-    const hasSpace = /\bspace\s*=\s*["']?[A-Za-z0-9_-]+["']?/i.test(cql);
-    const wrapped = hasSpace ? cql : (cql ? `space = "${spaceKey}" AND (${cql})` : `space = "${spaceKey}"`);
+    const wrapped = cql ? `space = "${spaceKey}" AND (${cql})` : `space = "${spaceKey}"`;
     req.query = { ...q, cql: wrapped };
     return req;
   }
@@ -218,7 +258,7 @@ async function enforceSpaceRestriction(req, creds, headers) {
     const key = res?.data?.space?.key || null;
     if (res.status >= 400 || !key) {
       const err = new Error(`SPACE_CHECK_FAILED_${res?.status || "ERR"}`);
-      err._raw = res.data;
+      err._raw = res?.data;
       throw err;
     }
     if (key !== spaceKey) {
@@ -246,15 +286,16 @@ async function fetchVersionNumber(baseUrl, id, headers) {
   return Number(r.data.version.number);
 }
 
-async function fetchStorageHtml(baseUrl, id, headers) {
-  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(id)}?expand=body.storage,version`;
+async function fetchStorageHtml(baseUrl, id, headers, { includeADF = false } = {}) {
+  const expand = includeADF ? "body.storage,body.atlas_doc_format,version" : "body.storage,version";
+  const url = `${baseUrl}/rest/api/content/${encodeURIComponent(id)}?expand=${encodeURIComponent(expand)}`;
   const r = await axiosWithRetry({ method: "GET", url, headers, timeout: 20000 });
   if (r.status >= 400 || !r.data?.body?.storage?.value) {
     const e = new Error(`FETCH_STORAGE_FAILED_${r.status}`);
     e._raw = r.data;
     throw e;
   }
-  return { html: String(r.data.body.storage.value), version: Number(r.data.version?.number || 1) };
+  return { page: r.data, html: String(r.data.body.storage.value), version: Number(r.data.version?.number || 1) };
 }
 
 /* -------------------- Core Proxy -------------------- */
@@ -294,9 +335,30 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
     const headersIn = (req.headers && typeof req.headers === "object") ? { ...req.headers } : {};
     const headers = { ...headersIn, ...authHeader(creds.email, creds.token) };
 
+    // Defaults
+    const meta = req.meta || {};
+    const autoExpandGET = meta.autoExpandGET !== false;               // default true
+    const includeADF = meta.includeADF === true;                      // opt-in ADF return
+    const followUpExpandOnWrite = meta.followUpExpandOnWrite !== false; // default true
+
     // Inject defaults for create page, then enforce space restriction
     const withDefaults = maybeInjectDefaults({ ...req }, creds);
     const guardedReq = await enforceSpaceRestriction(withDefaults, creds, headers);
+
+    // ---- Auto-Expand for GETs ----
+    if (autoExpandGET && String(guardedReq.method || "").toUpperCase() === "GET") {
+      const p = String(guardedReq.path || "");
+      const isContentGet = /\/rest\/api\/content(\/\d+)?\/?$/.test(p) || /\/rest\/api\/content\/\d+$/i.test(p);
+      const isSearch = /\/rest\/api\/content\/search\/?$/.test(p);
+      if (isContentGet && !isSearch) {
+        const q = guardedReq.query || {};
+        const existing = String(q.expand || "").split(",").map(s => s.trim()).filter(Boolean);
+        const wanted = ["body.storage", "version"];
+        if (includeADF) wanted.push("body.atlas_doc_format");
+        const final = Array.from(new Set([...existing, ...wanted])).join(",");
+        guardedReq.query = { ...q, expand: final };
+      }
+    }
 
     // ---- Meta features: append storage + auto-bump version (preparation) ----
 
@@ -310,9 +372,9 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
       const idMatch = (guardedReq.path || "").match(/\/rest\/api\/content\/(\d+)(?:\/.*)?$/);
       const pageId = idMatch?.[1] || guardedReq.body?.id;
       if (pageId) {
-        const { html: oldHtml, version: v } = await fetchStorageHtml(baseUrl, pageId, headers);
+        const { html: oldHtml, version: v } = await fetchStorageHtml(baseUrl, pageId, headers, { includeADF });
         const add = ensureStorageHtml(guardedReq.meta.appendStorageHtml);
-        const merged = oldHtml + add;
+        const merged = scrubStorageForCloudEditor(oldHtml + add);
 
         if (!guardedReq.body.body) guardedReq.body.body = {};
         guardedReq.body.body.storage = {
@@ -374,6 +436,11 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
         data = guardedReq.body;
         if (!finalHeaders["Content-Type"]) finalHeaders["Content-Type"] = "application/json";
       } else if (guardedReq.body && typeof guardedReq.body === "object") {
+        // Cloud-Compat auf body.body.storage.value anwenden (falls vorhanden)
+        if (guardedReq.body?.type === "page" && guardedReq.body?.body?.storage?.value) {
+          guardedReq.body.body.storage.value = ensureStorageHtml(guardedReq.body.body.storage.value);
+          guardedReq.body.body.storage.representation = guardedReq.body.body.storage.representation || "storage";
+        }
         data = guardedReq.body;
         finalHeaders["Content-Type"] = "application/json";
       } else {
@@ -399,6 +466,7 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
       if (res.headers?.[k]) hdrSubset[k] = res.headers[k];
     }
 
+    // Basis-Out
     const out = {
       ok: res.status < 400,
       status: res.status,
@@ -409,7 +477,39 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
         : res.data,
       took_ms: Date.now() - startedAt
     };
-    debugLog("HTTP Response", { status: res.status, headers: hdrSubset, preview: (responseType === "json" ? res.data : `arraybuffer(${out.data.bufferLength})`) });
+
+    // Nach POST/PUT: wenn Page-ID vorhanden und followUpExpandOnWrite aktiv → expand nachziehen
+    const mayFollowUp = followUpExpandOnWrite && ["POST", "PUT"].includes(method) && !responseType !== "arraybuffer";
+    if (mayFollowUp) {
+      try {
+        const newId =
+          out?.data?.id ||
+          // einige Endpoints liefern location-Header …/content/{id}
+          (typeof hdrSubset.location === "string" ? (hdrSubset.location.match(/content\/(\d+)/)?.[1] || null) : null);
+
+        if (newId) {
+          const expand = includeADF ? "body.storage,body.atlas_doc_format,version,space" : "body.storage,version,space";
+          const followUrl = `${baseUrl}/rest/api/content/${encodeURIComponent(newId)}?expand=${encodeURIComponent(expand)}`;
+          const follow = await axiosWithRetry({
+            method: "GET",
+            url: followUrl,
+            headers: finalHeaders,
+            timeout: 20000,
+            responseType: "json"
+          });
+
+          // **Wichtig:** Originaldaten NICHT überschreiben, sondern zusätzlich bereitstellen
+          out.data_expanded = follow?.data || null;
+          // und für Chat-Komfort einen „previewText“ (reiner Text) extrahieren
+          const storageHtml = follow?.data?.body?.storage?.value || "";
+          out.preview_text = extractPlainTextFromStorage(storageHtml).slice(0, 4000);
+        }
+      } catch (e) {
+        debugLog("Follow-up expand failed", e?.message || String(e));
+      }
+    }
+
+    debugLog("HTTP Response", { status: out.status, headers: hdrSubset, preview: (responseType === "json" ? out.data : `arraybuffer(${out.data.bufferLength})`) });
     return JSON.stringify(out);
 
   } catch (err) {
@@ -430,6 +530,32 @@ async function confluencePage(toolFunction, _context, _getAIResponse, runtime) {
       space: err?._space || null
     });
   }
+}
+
+/* ---------- Helpers: Plaintext-Extraction (für Chat-Vorschau) ---------- */
+function extractPlainTextFromStorage(html) {
+  if (!html || typeof html !== "string") return "";
+  // Sehr einfache, robuste Ent-Taggung für Chat-Zwecke (kein perfekter Renderer!)
+  let s = html;
+
+  // Zeilenumbrüche um Block-Elemente
+  s = s.replace(/<\/(p|h[2-6]|li|div|tr)>/gi, "</$1>\n");
+
+  // Listen-Bullets grob markieren
+  s = s.replace(/<li[^>]*>/gi, "- ");
+
+  // Tags strippen
+  s = s.replace(/<[^>]+>/g, "");
+
+  // Entities
+  s = s.replace(/&nbsp;/g, " ");
+  s = s.replace(/&amp;/g, "&");
+  s = s.replace(/&lt;/g, "<");
+  s = s.replace(/&gt;/g, ">");
+
+  // Whitespace normalisieren
+  s = s.replace(/\r?\n\s*\n\s*\n+/g, "\n\n").trim();
+  return s;
 }
 
 module.exports = { confluencePage };

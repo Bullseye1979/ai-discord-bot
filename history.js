@@ -1,4 +1,4 @@
-// history.js — focused v6.0 (K-of-N + Window Relevance)
+// history.js — focused v6.1 (K-of-N + Window Relevance + Smart Dump Threshold)
 // - getInformation({ keywords[], window=10, max_hits=30, min_match?, candidate_limit? }):
 //     1) K-von-N-Match (Score = #Keywords in content) über die *neusten* Kandidaten,
 //     2) Filter auf score >= min_match (Default: 2 wenn ≥2 Keywords, sonst 1),
@@ -6,8 +6,9 @@
 //        WindowScore = (#distinct Keywords im Fenster) + Bonus (Zeilen mit >=2 Keywords) + kleiner Frequenzbonus,
 //     4) Sortierung: WindowScore DESC, dann id DESC; wähle Top max_hits Fenster,
 //     5) Flache, deduplizierte Ausgabe aller Zeilen dieser Fenster (id ASC) als {sender,timestamp,content}.
-// - getHistory({ frames?=[{start,end}], start?, end?, user_prompt, model?, max_tokens? }):
-//     Single-pass LLM über die selektierten Rows.
+// - getHistory({ frames?=[{start,end}], start?, end?, user_prompt, model?, max_tokens?,
+//                dump_threshold_tokens?, max_dump_chars?, return_json? }):
+//     Smart: Komprimieren -> Token-Schätzung -> (klein) Dump-Return ODER (groß) LLM über komprimierten Text.
 //
 // Notes:
 // * Stelle sicher, dass in aiService.js ein hohes Timeout gesetzt ist (OPENAI_TIMEOUT_MS ≥ 180000).
@@ -85,6 +86,69 @@ function contains(textLower, kwLower) {
   return textLower.indexOf(kwLower) !== -1;
 }
 
+/** Rough token estimator: ~4 chars per token (conservative). */
+function approxTokensFromChars(chars) {
+  return Math.ceil(chars / 4);
+}
+
+/**
+ * Deterministic cheap compression for logs to reduce token cost
+ * - Drops trivial noise (very short ack like "ok", "thx", "lol", "+1")
+ * - Collapses consecutive messages from the same sender
+ * - Elides huge code blocks (```…```) to «code N lines»
+ * - Shortens URLs to host/pathname
+ * - Keeps light timestamp (MM-DD HH:MM)
+ */
+function cheapCompressRows(rows) {
+  const out = [];
+  let lastSender = null;
+
+  const isNoise = (c) => {
+    const s = c.trim().toLowerCase();
+    return (
+      s.length === 0 ||
+      s.length <= 2 ||
+      s === "ok" ||
+      s === "kk" ||
+      s === "thx" ||
+      s === "thanks" ||
+      s === "lol" ||
+      s === "+1"
+    );
+  };
+
+  for (const r of rows) {
+    let c = String(r.content || "").trim();
+    if (isNoise(c)) continue;
+
+    // Elide very long code blocks
+    c = c.replace(/```[\s\S]*?```/g, (m) => {
+      const lines = m.split("\n").length;
+      return lines > 30 ? `«code ${lines} lines»` : m;
+    });
+
+    // URL shortener (host + pathname)
+    c = c.replace(/\bhttps?:\/\/[^\s)]+/g, (u) => {
+      try {
+        const { host, pathname } = new URL(u);
+        return `${host}${pathname}`.replace(/\/+$/, "");
+      } catch { return u; }
+    });
+
+    const sender = String(r.sender || r.role || "unknown").trim();
+    const ts = r.timestamp ? r.timestamp.slice(5, 16).replace("T", " ") : ""; // „MM-DD HH:MM“
+    const segment = `[${ts}] ${sender}: ${c}`;
+
+    if (sender === lastSender && out.length) {
+      out[out.length - 1] += `; ${c}`;
+    } else {
+      out.push(segment);
+      lastSender = sender;
+    }
+  }
+  return out.join("\n");
+}
+
 /* ----------------------------- index management ----------------------------- */
 
 /**
@@ -159,12 +223,7 @@ async function ensureIndexes(db) {
  *  {
  *    data: [{ sender, timestamp, content }],
  *    count,
- *    meta: {
- *      keywords, min_match, window, max_hits, candidate_limit,
- *      candidates_found, candidates_after_min_match,
- *      selected_windows,
- *      scoring: "k-of-n + window relevance"
- *    }
+ *    meta: { ... }
  *  }
  */
 async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runtime) {
@@ -214,7 +273,7 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
       ) AS t
       WHERE score >= ?
       ORDER BY score DESC, id DESC
-      LIMIT ${candidateLimit}  -- nach Filter ggf. weniger; wir behalten den Pool groß für Window-Scoring
+      LIMIT ${candidateLimit}
     `;
     const candidateVals = [...likes, channelId, ...likes, minMatch];
 
@@ -238,8 +297,6 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
     }
 
     // --- 2) Window-Relevanz je Kandidat
-    // Für jeden Kandidaten: ±N Rows (selber Channel), WindowScore berechnen.
-    // Wir puffern Rows in rowCache, damit wir später nicht erneut laden müssen.
     const rowCache = new Map(); // id -> {id,sender,timestamp,content}
     const windows = [];         // { anchorId, score, ids:Set<number> }
 
@@ -262,7 +319,6 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
     const kwLower = keywords.map((k) => String(k || "").toLowerCase());
 
     function computeWindowScore(rows) {
-      // unique keywords across window
       const seenKw = new Set();
       let totalMatches = 0;
       let adjacencyCount = 0;
@@ -280,7 +336,7 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
         if (perRowDistinct >= 2) adjacencyCount += 1;
       }
 
-      const uniqueCount = seenKw.size;                 // 0..N
+      const uniqueCount = seenKw.size;
       const freqBonus = Math.max(0, totalMatches - uniqueCount) * 0.05; // 0.05 je Wiederholung
       const adjBonus = Math.min(adjacencyCount * 0.2, 0.6);             // max 0.6 Bonus
       const score = uniqueCount + adjBonus + Math.min(freqBonus, 0.5);  // max +0.5 aus Frequenz
@@ -296,7 +352,7 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
         loadAfter(anchorId, windowN)
       ]);
 
-      const prevAsc = [...prev].reverse(); // prev kommt DESC
+      const prevAsc = [...prev].reverse();
       const winRows = prevAsc.concat(center ? [center] : []).concat(next);
 
       // Cache rows
@@ -310,24 +366,23 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
       windows.push({ anchorId, score: winScore, ids: idSet });
     }
 
-    // --- 3) Auswahl der Top-Fenster: WindowScore DESC, dann Anker id DESC
+    // --- 3) Auswahl der Top-Fenster
     windows.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return b.anchorId - a.anchorId;
     });
     const selected = windows.slice(0, maxHits);
 
-    // --- 4) Alle IDs der Top-Fenster global deduplizieren und final sortieren (ASC)
+    // --- 4) IDs sammeln & sortieren
     const globalIdSet = new Set();
     for (const w of selected) {
       for (const id of w.ids) globalIdSet.add(id);
     }
     const finalIds = Array.from(globalIdSet).sort((a, b) => a - b);
 
-    // Daten aus Cache; falls etwas fehlt (sollte selten sein), einmalig nachladen
+    // Nachladen falls nötig
     const missing = finalIds.filter((id) => !rowCache.has(id));
     if (missing.length) {
-      // Baue sichere Platzhalter für IN (...)
       const qs = missing.map(() => "?").join(",");
       const loadSQL = `SELECT id, sender, timestamp, content FROM context_log WHERE channel_id = ? AND id IN (${qs})`;
       const [rows] = await db.execute(loadSQL, [channelId, ...missing]);
@@ -353,7 +408,7 @@ async function getInformation(toolFunction, ctxOrUndefined, _getAIResponse, runt
         max_hits: maxHits,
         candidate_limit: candidateLimit,
         candidates_found: candidates.length,
-        candidates_after_min_match: candidates.length, // bereits nach min_match gefiltert
+        candidates_after_min_match: candidates.length,
         selected_windows: selected.length,
         scoring: "k-of-n + window relevance"
       }
@@ -384,17 +439,26 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       ? Math.max(256, Math.floor(Number(args.max_tokens)))
       : Math.max(256, Math.floor(Number(process.env.TIMEFRAME_TOKENS || 12000)));
 
+    // Smart dump thresholds
+    const dumpThreshold = Number.isFinite(Number(args.dump_threshold_tokens))
+      ? Math.max(500, Math.floor(Number(args.dump_threshold_tokens)))
+      : Math.max(500, Math.floor(Number(process.env.HISTORY_DUMP_TOKENS || 4000)));
+
+    const maxDumpChars = Number.isFinite(Number(args.max_dump_chars))
+      ? Math.max(10_000, Math.floor(Number(args.max_dump_chars)))
+      : Math.max(10_000, Math.floor(Number(process.env.HISTORY_MAX_DUMP_CHARS || 200_000)));
+
+    const returnJSON = String(args.return_json || "").toLowerCase() === "true" || args.return_json === true;
+
     console.log(
       `[history][getHistory#${reqId}:args]`,
-      JSON.stringify({ channelId, framesCount: frames.length, start, end, userPromptLen: userPrompt.length, model, maxTokens }, null, 2)
+      JSON.stringify({ channelId, framesCount: frames.length, start, end, userPromptLen: userPrompt.length, model, maxTokens, dumpThreshold, maxDumpChars, returnJSON }, null, 2)
     );
 
     if (!channelId) return "ERROR: channel_id missing";
     if (!userPrompt) return "ERROR: user_prompt is required";
 
     const db = await getPool();
-    // Diese Funktion ist weniger suchlastig; Index-Anlage hier nicht zwingend notwendig,
-    // aber harmless – wir rufen es nicht erneut auf, wenn bereits vorhanden.
     await ensureIndexes(db);
 
     let rows = [];
@@ -452,9 +516,32 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
 
     rows.sort((a, b) => (a.id || 0) - (b.id || 0));
 
-    const digest = rowsToText(rows);
-    console.log(`[history][getHistory#${reqId}:digest]`, JSON.stringify({ chars: digest.length }, null, 2));
+    // New: compress, estimate tokens, choose path
+    const cheap = cheapCompressRows(rows);
+    const approx = approxTokensFromChars(cheap.length);
+    console.log(`[history][getHistory#${reqId}:compress]`, JSON.stringify({ chars: cheap.length, approx_tokens: approx }, null, 2));
 
+    // Small → Dump (no LLM)
+    if (approx <= dumpThreshold) {
+      let dump = cheap;
+      let truncated = false;
+      if (dump.length > maxDumpChars) {
+        dump = dump.slice(0, maxDumpChars) + "\n…(truncated)…";
+        truncated = true;
+      }
+      if (returnJSON) {
+        return JSON.stringify({
+          mode: "dump",
+          approx_tokens: approx,
+          truncated,
+          chars: dump.length,
+          dump
+        });
+      }
+      return dump;
+    }
+
+    // Large → LLM (feed compressed logs)
     const ctx = new Context("", "", [], {}, null, { skipInitialSummaries: true, persistToDB: false });
     await ctx.add("system", "history_timeframe",
       [
@@ -465,11 +552,22 @@ async function getHistory(toolFunction, ctxOrUndefined, _getAIResponse, runtime)
       ].join(" ")
     );
     await ctx.add("user", "instruction", userPrompt);
-    await ctx.add("user", "logs", digest);
+    // IMPORTANT: give the compressed digest (cheaper) instead of raw
+    await ctx.add("user", "logs", cheap);
 
     const out = await getAI(ctx, maxTokens, model);
     const result = (out || "").trim() || "No answer possible.";
     console.log(`[history][getHistory#${reqId}:done]`, JSON.stringify({ outLen: result.length }, null, 2));
+
+    if (returnJSON) {
+      return JSON.stringify({
+        mode: "llm",
+        approx_tokens: approx,
+        input_chars: cheap.length,
+        output: result
+      });
+    }
+
     return result;
   } catch (err) {
     console.error(`[history][getHistory#${reqId}:ERROR]`, err?.message || err);
