@@ -1,10 +1,9 @@
-// discord-helper.js — refactored v3.7 (robuster Embed-Versand mit kumulativem 6000-Limit, gestaffelten Fallbacks, erweitertem Catch)
+// discord-helper.js — refactored v3.8 (robuster Embed-Versand + primings Support)
 // Avatar aus Channel-Config-Prompt (+ Persona/Name-Addendum), Cache-Busting, strict channel-only config, safe URLs
-// NEU (v3.7):
-// - Batch-Packing der Embeds mit kumulativer 6000-Zeichen-Grenze je Nachricht
-// - Schrittweise Degradation: Batch → Einzel-Embed → Trim → Plain-Text
-// - Verbesserter Catch: ausführliches reportError + optionaler Hinweis im Kanal (EMBED_FALLBACK_NOTICE=1)
-// - Keine „nur letzter Teil kommt an“-Situationen mehr bei mehrteiligen Antworten
+// NEU (v3.8):
+// - Unterstützung für blocks[].primings [{ name, priming }]
+// - Helper getPrimingsForUser(channelId, userId) für AI-Prompts
+// - Bestehende v3.7-Features unverändert (6000-Limit Batch, Fallbacks, etc.)
 
 const fs = require("fs");
 const os = require("os");
@@ -113,6 +112,19 @@ async function ensureChannelAvatar(channelId, channelMeta) {
   }
 }
 
+/* -------------------- Channel-Config -------------------- */
+
+function normalizePrimings(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const it of arr) {
+    const name = String(it?.name || "").trim();
+    const priming = String(it?.priming || "").trim();
+    if (name && priming) out.push({ name, priming });
+  }
+  return out;
+}
+
 /** Channel-Config ausschließlich aus channel-config/<channelId>.json (+ _API Normalisierung) */
 function getChannelConfig(channelId) {
   try {
@@ -141,11 +153,12 @@ function getChannelConfig(channelId) {
     const name = typeof cfg.name === "string" ? cfg.name : "";
     const botname = typeof cfg.botname === "string" ? cfg.botname : "AI";
     const selectedTools = Array.isArray(cfg.tools) ? cfg.tools : [];
-    const blocks = Array.isArray(cfg.blocks) ? cfg.blocks : [];
+    const blocksIn = Array.isArray(cfg.blocks) ? cfg.blocks : [];
 
     const summaryPrompt = (typeof cfg.summaryPrompt === "string" && cfg.summaryPrompt) ||
                           (typeof cfg.summary_prompt === "string" && cfg.summary_prompt) || "";
 
+    // ⚠️ global: max_user_messages (Root-Level)
     const rawMax = (cfg.max_user_messages ?? cfg.maxUserMessages);
     const max_user_messages =
       (rawMax === null || rawMax === undefined || rawMax === "")
@@ -210,6 +223,25 @@ function getChannelConfig(channelId) {
     const confluence = (cfg.confluence && typeof cfg.confluence === "object") ? cfg.confluence : null;
     const jira = (cfg.jira && typeof cfg.jira === "object") ? cfg.jira : null;
 
+    // ✅ Blocks normalisieren + primings hinzufügen
+    const blocks = blocksIn.map((b) => {
+      const speaker = Array.isArray(b?.speaker) ? b.speaker.map(String) : [];
+      const primings = normalizePrimings(b?.primings);
+      const out = {
+        speaker,
+        primings
+      };
+      // Zusätzliche bekannte Felder (Passthrough) beibehalten:
+      if (b?.jira && typeof b.jira === "object") out.jira = b.jira;
+      if (b?.confluence && typeof b.confluence === "object") out.confluence = b.confluence;
+      // weitere Felder unangetastet übernehmen (falls vorhanden)
+      for (const [k, v] of Object.entries(b || {})) {
+        if (out[k] !== undefined) continue;
+        out[k] = v;
+      }
+      return out;
+    });
+
     return {
       name, botname, voice, persona, avatarUrl, instructions,
       tools: ctxTools, toolRegistry, blocks, summaryPrompt,
@@ -217,8 +249,8 @@ function getChannelConfig(channelId) {
       max_tokens_chat, max_tokens_speaker, chatAppend, speechAppend,
       avatarPrompt, imagePrompt,
       api,
-      confluence, // ✅ passthrough for Confluence credentials/config
-      jira        // ✅ NEW: passthrough for Jira credentials/config
+      confluence, // passthrough
+      jira        // passthrough
     };
   } catch (err) {
     reportError(err, null, "GET_CHANNEL_CONFIG");
@@ -235,8 +267,25 @@ function getChannelConfig(channelId) {
   }
 }
 
+/**
+ * Liefert die Primings für einen User im Channel:
+ * - sucht den ersten Block, in dem die userId in speaker[] enthalten ist
+ * - gibt dessen primings[] zurück (oder [])
+ */
+function getPrimingsForUser(channelId, userId) {
+  try {
+    const meta = getChannelConfig(String(channelId || ""));
+    if (!meta?.blocks?.length || !userId) return [];
+    const uid = String(userId);
+    const blk = meta.blocks.find(b => Array.isArray(b.speaker) && b.speaker.includes(uid));
+    return Array.isArray(blk?.primings) ? blk.primings : [];
+  } catch {
+    return [];
+  }
+}
 
-/** Split long text into <=2000 char chunks for Discord */
+/* -------------------- Text & Embed Utilities (unverändert aus v3.7) -------------------- */
+
 function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   if (!text) return [];
   const chunks = [];
@@ -265,7 +314,6 @@ function splitIntoChunks(text, hardLimit = 2000, softLimit = 1900) {
   return chunks.flatMap(hardSplit);
 }
 
-/** Send chunked message */
 async function sendChunked(channel, content) {
   try {
     const parts = splitIntoChunks(content);
@@ -275,7 +323,6 @@ async function sendChunked(channel, content) {
   }
 }
 
-/** Post summaries list */
 async function postSummariesIndividually(channel, summaries, headerPrefix = null) {
   try {
     for (let i = 0; i < summaries.length; i++) {
@@ -451,14 +498,11 @@ const HARD_DESC_MAX = 4096;     // max description chars pro Embed
 const HARD_EMBED_SUM = 6000;    // max Summe pro Nachricht (alle Embeds zusammen)
 const MAX_EMBEDS_PER_MSG = 10;  // Discord Limit
 
-// Konservativer Overhead pro Embed: author+footer+Metadaten
 function estimateEmbedOverhead(authorName, footerText) {
-  // Discord rechnet UTF-16 Code Units; wir nehmen Sicherheitsaufschlag
   const meta = (authorName?.length || 0) + (footerText?.length || 0);
-  return meta + 64; // +64 Sicherheitsmarge
+  return meta + 64;
 }
 
-// Beschreibung sicher slicen
 function smartSlice(s, limit) {
   if (s.length <= limit) return s;
   const cut1 = s.lastIndexOf("\n\n", limit);
@@ -468,7 +512,6 @@ function smartSlice(s, limit) {
   return s.slice(0, cut).trim();
 }
 
-// Baue ein Embed-Objekt, das die Limits berücksichtigt
 function makeEmbed(desc, opts) {
   const {
     themeColor,
@@ -478,7 +521,6 @@ function makeEmbed(desc, opts) {
     addImageUrl
   } = opts;
 
-  // Harter Trim auf 4096 für ganz harte Fälle
   let finalDesc = desc.length > HARD_DESC_MAX ? desc.slice(0, HARD_DESC_MAX) : desc;
 
   const embed = {
@@ -494,23 +536,20 @@ function makeEmbed(desc, opts) {
   return embed;
 }
 
-// Länge eines Embeds (grob) für Summenbudget
 function embedLengthApprox(embed) {
   const authorLen = (embed?.author?.name?.length || 0);
   const footerLen = (embed?.footer?.text?.length || 0);
   const descLen = (embed?.description?.length || 0);
-  // Kein Title/Fields derzeit; Bild-URL zählt nicht in Zeichenlimit mit
   return authorLen + footerLen + descLen;
 }
 
-// Packe Embeds in Batches, sodass Summe je Nachricht < 6000 bleibt, max 10 Embeds
 function packEmbedsIntoBatches(embeds) {
   const batches = [];
   let current = [];
   let sumLen = 0;
   for (const e of embeds) {
     const est = embedLengthApprox(e);
-    if (current.length >= MAX_EMBEDS_PER_MSG || (sumLen + est) > (HARD_EMBED_SUM - 50)) { // 50 Puffer
+    if (current.length >= MAX_EMBEDS_PER_MSG || (sumLen + est) > (HARD_EMBED_SUM - 50)) {
       if (current.length) batches.push(current);
       current = [e];
       sumLen = est;
@@ -523,7 +562,6 @@ function packEmbedsIntoBatches(embeds) {
   return batches;
 }
 
-// Versuche ein einzelnes Embed zu senden; bei 50035 → trimmen → Plain-Text
 async function sendSingleEmbedWithFallback(hook, params, embed, { channelForFallback, plainPrefix = "" }) {
   try {
     await hook.send({
@@ -538,7 +576,6 @@ async function sendSingleEmbedWithFallback(hook, params, embed, { channelForFall
   } catch (err) {
     const code = (err?.rawError?.code || err?.code || err?.status || "").toString();
     const msg = String(err?.message || "");
-    // Detail-Report
     await reportError(err, channelForFallback, "SEND_SINGLE_EMBED", {
       meta: {
         embed_len: embedLengthApprox(embed),
@@ -548,12 +585,11 @@ async function sendSingleEmbedWithFallback(hook, params, embed, { channelForFall
     });
 
     if (code === "50035" || msg.includes("MAX_EMBED_SIZE_EXCEEDED") || msg.includes("BASE_TYPE_MAX_LENGTH")) {
-      // Trimmen: berechne maxDescByTotal
       const authorLen = params.authorName.length;
       const footerLen = params.footerText.length;
       const maxDescByTotal = Math.min(
         HARD_DESC_MAX,
-        Math.max(0, HARD_EMBED_SUM - (authorLen + footerLen + 16)) // 16 Puffer
+        Math.max(0, HARD_EMBED_SUM - (authorLen + footerLen + 16))
       );
 
       let d = String(embed.description || "");
@@ -580,7 +616,6 @@ async function sendSingleEmbedWithFallback(hook, params, embed, { channelForFall
         }
         return "trimmed";
       } catch (err2) {
-        // Letzter Fallback: Plain-Text (chunked)
         await reportError(err2, channelForFallback, "SEND_SINGLE_EMBED_TRIM_FAILED", {
           meta: { code: err2?.code, msg: err2?.message, raw: err2?.rawError || err2 }
         });
@@ -593,7 +628,6 @@ async function sendSingleEmbedWithFallback(hook, params, embed, { channelForFall
       }
     }
 
-    // anderer Fehler → als Text senden
     const plain = `${plainPrefix}${embed?.description || ""}`;
     await sendChunked(channelForFallback, plain);
     return "plaintext";
@@ -689,24 +723,79 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
     const modelPart = model && String(model).trim() ? ` (${String(model).trim()})` : "";
     const footerText = `${baseName}${modelPart}`;
 
-    // Budget pro Embed (Description)
-    const overhead = estimateEmbedOverhead(authorName, footerText);
+    const HARD_DESC_MAX = 4096;
+    const HARD_EMBED_SUM = 6000;
+    const MAX_EMBEDS_PER_MSG = 10;
+
+    const overhead = (authorName?.length || 0) + (footerText?.length || 0) + 64;
     let DESC_BUDGET = Math.min(HARD_DESC_MAX, Math.max(500, HARD_EMBED_SUM - overhead));
-    DESC_BUDGET = Math.min(DESC_BUDGET, 3800); // etwas konservativer
+    DESC_BUDGET = Math.min(DESC_BUDGET, 3800);
 
     const fullDesc = (bodyText + bulletsBlock).trim();
 
-    // In Beschreibungsteile splitten
     const descChunks = [];
     let remaining = fullDesc;
     while (remaining.length > 0) {
-      const part = smartSlice(remaining, DESC_BUDGET);
+      const cut1 = remaining.lastIndexOf("\n\n", DESC_BUDGET);
+      const cut2 = remaining.lastIndexOf("\n", DESC_BUDGET);
+      const cut3 = remaining.lastIndexOf(" ", DESC_BUDGET);
+      const cut = Math.max(cut1, cut2, cut3, DESC_BUDGET);
+      const part = remaining.slice(0, cut).trim();
       descChunks.push(part);
       remaining = remaining.slice(part.length).trimStart();
       if (remaining.length && remaining[0] === "\n") remaining = remaining.slice(1);
     }
 
-    // Embeds bauen (Bild nur im ersten)
+    function embedLengthApprox(embed) {
+      const authorLen = (embed?.author?.name?.length || 0);
+      const footerLen = (embed?.footer?.text?.length || 0);
+      const descLen = (embed?.description?.length || 0);
+      return authorLen + footerLen + descLen;
+    }
+
+    function makeEmbed(desc, opts) {
+      const {
+        themeColor,
+        authorName,
+        personaAvatarUrl,
+        footerText,
+        addImageUrl
+      } = opts;
+
+      let finalDesc = desc.length > HARD_DESC_MAX ? desc.slice(0, HARD_DESC_MAX) : desc;
+
+      const embed = {
+        color: themeColor,
+        author: { name: authorName, icon_url: personaAvatarUrl || undefined },
+        description: finalDesc,
+        timestamp: new Date().toISOString(),
+        footer: { text: footerText }
+      };
+      if (addImageUrl) {
+        embed.image = { url: addImageUrl };
+      }
+      return embed;
+    }
+
+    function packEmbedsIntoBatches(embeds) {
+      const batches = [];
+      let current = [];
+      let sumLen = 0;
+      for (const e of embeds) {
+        const est = embedLengthApprox(e);
+        if (current.length >= MAX_EMBEDS_PER_MSG || (sumLen + est) > (HARD_EMBED_SUM - 50)) {
+          if (current.length) batches.push(current);
+          current = [e];
+          sumLen = est;
+        } else {
+          current.push(e);
+          sumLen += est;
+        }
+      }
+      if (current.length) batches.push(current);
+      return batches;
+    }
+
     const embeds = descChunks.map((d, i) => makeEmbed(d, {
       themeColor,
       authorName,
@@ -715,15 +804,21 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       addImageUrl: i === 0 && firstImage?.url ? firstImage.url : null
     }));
 
-    // Batches bilden, die kumulativ < 6000 bleiben
     const batches = packEmbedsIntoBatches(embeds);
 
     const threadId = isThread ? message.channel.id : undefined;
     const baseParams = { authorName, personaAvatarUrl, footerText, threadId };
 
-    // 1) Versuche Batch-weise zu senden
     for (let bi = 0; bi < batches.length; bi++) {
       const slice = batches[bi];
+      const hook = await hookChannel.fetchWebhooks().then(hooks => {
+        let h = hooks.find((w) => w.name === (botname || meta?.botname || "AI"));
+        return h || hookChannel.createWebhook({
+          name: botname || meta?.botname || "AI",
+          avatar: personaAvatarUrl || undefined
+        });
+      });
+
       try {
         await hook.send({
           content: "",
@@ -734,7 +829,6 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
           threadId
         });
       } catch (err) {
-        // 2) Fallback: sende die Embeds dieses Batches einzeln
         const code = (err?.rawError?.code || err?.code || err?.status || "").toString();
         const msg = String(err?.message || "");
         await reportError(err, hookChannel, "REPLY_WEBHOOK_EMBED_BATCH_FAILED", {
@@ -749,7 +843,6 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
 
         for (let ei = 0; ei < slice.length; ei++) {
           const e = slice[ei];
-          // Präfix im Plain-Text-Fallback, damit Reihenfolge klar bleibt
           const prefix = (batches.length > 1 || slice.length > 1) ? `(${bi + 1}/${batches.length} • ${ei + 1}/${slice.length})\n` : "";
           await sendSingleEmbedWithFallback(hook, baseParams, e, {
             channelForFallback: isThread ? message.channel : hookChannel,
@@ -765,7 +858,6 @@ async function setReplyAsWebhookEmbed(message, aiText, options = {}) {
       }
     }
   } catch (err) {
-    // 3) Letzter globaler Fallback
     await reportError(err, message?.channel, "REPLY_WEBHOOK_EMBED_GLOBAL", {
       meta: { msg: String(err?.message || ""), raw: err?.rawError || err }
     });
@@ -910,11 +1002,12 @@ async function setStartListening(connection, guildId, guildTextChannels, client,
             const text  = await getTranscription(file, "whisper-1", "auto");
             const clean = (text || "").trim(); if (!clean) return;
 
-            const norm = normText(clean); const now  = Date.now();
+            const norm = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim();
+            const normed = norm(clean); const now  = Date.now();
             if (!setStartListening.__dups) setStartListening.__dups = new Map();
             const last = setStartListening.__dups.get(key);
-            if (last && last.norm === norm && (now - last.ts) < DUP_WINDOW_MS) return;
-            setStartListening.__dups.set(key, { norm, ts: now });
+            if (last && last.norm === normed && (now - last.ts) < DUP_WINDOW_MS) return;
+            setStartListening.__dups.set(key, { norm: normed, ts: now });
 
             const speaker = await resolveSpeakerName(client, guildId, userId);
 
@@ -1023,6 +1116,7 @@ function resetRecordingFlag(guildId) {
 
 module.exports = {
   getChannelConfig,
+  getPrimingsForUser,          // ✅ NEU: für aiCore.js, um primings in den Systemprompt zu hängen
   setMessageReaction,
   setReplyAsWebhook,
   splitIntoChunks,

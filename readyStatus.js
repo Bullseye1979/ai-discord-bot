@@ -1,5 +1,7 @@
-// readyStatus.js — v2.1 (presence allow-list + DB-change guard)
-// - Neu: Generiert NUR neuen Status, wenn sich die höchste Log-ID seit letztem Update verändert hat.
+// readyStatus.js — v2.2 (presence leading-hourglass guard + allow-list + DB-change guard)
+// - Neu (v2.2): Überschreibe Presence NICHT, wenn irgendeine aktuelle Activity
+//   mit "⌛" beginnt (nur Anfang zählt; Rest egal). Damit bleibt der Tool-Call-Status stabil.
+// - Weiterhin: Generiert NUR neuen Status, wenn sich die höchste Log-ID seit letztem Update verändert hat.
 
 require("dotenv").config();
 const fs = require("fs");
@@ -167,6 +169,19 @@ async function buildStatusFromLogs(rows, model, maxTokens = 64) {
   return hardTrimOneLine(out, HARDLEN);
 }
 
+/** Prüft, ob irgendeine aktuelle Activity mit "⌛" beginnt (ggf. vorangestellte Spaces erlaubt). */
+function hasLeadingHourglassActivity(client) {
+  try {
+    const activities = client?.user?.presence?.activities || [];
+    return activities.some(a => {
+      const name = typeof a?.name === "string" ? a.name : "";
+      return /^\s*⌛/.test(name);
+    });
+  } catch {
+    return false;
+  }
+}
+
 async function maybeUpdateReadyStatus(client, opts = {}) {
   try {
     const enabled = String(process.env.READY_STATUS_ENABLED ?? "1").trim() !== "0";
@@ -182,9 +197,13 @@ async function maybeUpdateReadyStatus(client, opts = {}) {
     const hit = opts.force ? true : (rollDie(dieMax) === 1);
     if (!hit) return;
 
-    const presenceName = client.user?.presence?.activities?.[0]?.name || "";
-    const busy = presenceName.includes("⌛");
-    if (busy && !opts.force) return;
+    // ⛔ Sperre: Wenn eine Activity aktuell mit "⌛" beginnt, KEIN Update (außer force)
+    if (hasLeadingHourglassActivity(client) && !opts.force) {
+      // Optional: Debug-Log, um zu sehen, warum übersprungen wurde
+      const firstName = client?.user?.presence?.activities?.[0]?.name || "";
+      console.log(`[readyStatus] Skip: leading hourglass activity detected ("${firstName}")`);
+      return;
+    }
 
     const { rows, maxId } = await fetchLastLogs(20, allowList);
     if (!rows.length) {
@@ -192,7 +211,7 @@ async function maybeUpdateReadyStatus(client, opts = {}) {
       return;
     }
 
-    // === NEU: Nur weiter, wenn maxId > _lastLogId ===
+    // === Nur weiter, wenn maxId > _lastLogId ===
     if (maxId <= getLastLogId() && !opts.force) {
       console.log(`[readyStatus] No new logs since last update (lastLogId=${getLastLogId()}); skipping.`);
       return;

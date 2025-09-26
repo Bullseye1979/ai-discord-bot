@@ -500,6 +500,33 @@ async function getAIResponse(
         if (schema) sysParts.push(schema);
       }
 
+      // 🔹 NEU: Primings aus context_orig.blocks für den aktuellen User in die bestehende System-Message integrieren
+      const normalizePrimings = (arr) => {
+        if (!Array.isArray(arr)) return [];
+        const out = [];
+        for (const it of arr) {
+          const name = String(it?.name || "").trim();
+          const p    = String(it?.priming || "").trim();
+          if (name && p) out.push({ name, priming: p });
+        }
+        return out;
+      };
+
+      const currentUserId = String(
+        options?.userId || context_orig?.userId || options?.pendingUser?.id || ""
+      ).trim();
+
+      if (Array.isArray(context_orig.blocks) && currentUserId) {
+        const blk = context_orig.blocks.find(b =>
+          Array.isArray(b?.speaker) && b.speaker.map(String).includes(currentUserId)
+        );
+        const prims = normalizePrimings(blk?.primings);
+        if (prims.length) {
+          const lines = prims.map(x => `- [${x.name}] ${x.priming}`);
+          sysParts.push(["User/Tool primings:", ...lines].join("\n"));
+        }
+      }
+
       const sysCombined = sysParts.join("\n\n").trim();
       if (sysCombined) context.messages.unshift({ role: "system", content: sysCombined });
     } catch {}
