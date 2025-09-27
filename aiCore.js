@@ -1,17 +1,9 @@
-// aiCore.js — v3.1-compat (Unified Tool Loop + getAIResponse Shim)
+// aiCore.js — v3.1-compat-fix (Unified Tool Loop + getAIResponse Shim)
+// Fixes für AI_HTTP_400:
+//  - Keine assistant-Nachrichten mit content:null (content-Feld weglassen, wenn leer)
+//  - tool-Nachrichten OHNE "name"-Feld (nur role, tool_call_id, content)
+//
 // ---------------------------------------------------------------
-// - Ein einziger Loop: Modell → (tool_calls?) → Tools → Modell … bis fertig.
-// - Kein separater Finalizer-Flow nötig.
-// - Große Tool-Outputs werden als mehrere tool-Nachrichten gechunked.
-// - Backward-Compat: exportiert zusätzlich getAIResponse(...), das wie v2.46 einen *String* liefert.
-//
-// Erwartete Umgebung (kompatibel zu deiner v2.46):
-// - context_orig: { messages, tools, toolRegistry, channelId?, persona?, instructions? }
-// - Tools im alten Format: fn({ name, arguments }, handoverContext, getAIResponse, runtime)
-// - OPENAI_API_URL / OPENAI_API_KEY via config/env möglich
-//
-// Hinweis: Der Shim injiziert optional Standardpriming/Persona/Instructions und UTC-Zeit
-//          (wie in deiner v2.46), falls vorhanden.
 
 require("dotenv").config();
 const axios = require("axios");
@@ -19,7 +11,7 @@ const http = require("http");
 const https = require("https");
 const { OPENAI_API_URL } = require("./config.js");
 
-/* -------------------- Transport (wie gehabt) -------------------- */
+/* -------------------- Transport -------------------- */
 const keepAliveHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 16, timeout: 30_000 });
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 16, timeout: 30_000 });
 const axiosAI = axios.create({
@@ -113,7 +105,8 @@ async function executeAllToolCalls(lastAssistant, toolsRegistry, ctx, toolChunkS
     execResults.push(res);
     const chunks = chunkString(res.output ?? "", toolChunkSize);
     for (const part of chunks) {
-      toolMessages.push({ role: "tool", tool_call_id: tc.id, name: res.name || tc.function?.name, content: part });
+      // WICHTIG: keine "name"-Eigenschaft in tool-Messages!
+      toolMessages.push({ role: "tool", tool_call_id: tc.id, content: part });
     }
   }
   return { toolMessages, execResults };
@@ -145,7 +138,7 @@ async function runUnifiedFlow(deps, opts) {
     max_tokens,
     stop,
     ctx = {},
-    // Kompat-Optionen:
+    // Kompat:
     tokenlimit,
     continueOnLength = DEFAULTS.continueOnLength,
   } = opts || {};
@@ -177,15 +170,24 @@ async function runUnifiedFlow(deps, opts) {
 
     trace.push({ type: "model", finish, hasToolCalls, usage: resp?.usage });
 
-    messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: msg.tool_calls ?? undefined });
+    // Assistant-Nachricht anhängen – nur gültige Felder
+    const assistantMsg = { role: "assistant" };
+    if (typeof msg.content === "string" && msg.content.trim().length > 0) {
+      assistantMsg.content = msg.content;
+    }
+    if (hasToolCalls) {
+      assistantMsg.tool_calls = msg.tool_calls;
+    }
+    messages.push(assistantMsg);
 
     if (hasToolCalls) {
       const { toolMessages, execResults } = await executeAllToolCalls(msg, toolsRegistry, ctx, toolChunkSize);
       trace.push({ type: "tools", results: execResults.map(r => ({ name: r.name, ok: r.ok, error: r.error })) });
       for (const tm of toolMessages) messages.push(tm);
-      continue;
+      continue; // Modell erneut fragen
     }
 
+    // Kein Tool-Call – ggf. "continue" bei length
     if (finish === "length" && continueOnLength) {
       if (continues >= Math.max(0, maxContinues)) { trace.push({ type: "continue_guard", note: "maxContinues reached" }); break; }
       continues++;
@@ -210,7 +212,6 @@ function defaultReplyFormat(text) {
 }
 
 /* -------------------- Backward Compatibility Layer -------------------- */
-// Alte Exportnamen
 async function run(deps, opts) { return runUnifiedFlow(deps, opts); }
 async function runFlow(deps, opts) { return runUnifiedFlow(deps, opts); }
 async function runAiCore(deps, opts) { return runUnifiedFlow(deps, opts); }
@@ -218,18 +219,16 @@ async function runAiCore(deps, opts) { return runUnifiedFlow(deps, opts); }
 /**
  * getAIResponse(context_orig, tokenlimit=4096, sequenceLimit=1000, model="gpt-4o", apiKey=null, options={}, client=null)
  * - Liefert wie v2.46 einen *String* (finaler Assistant-Text).
- * - Intern: baut Adapter auf runUnifiedFlow.
  */
 async function getAIResponse(
   context_orig,
   tokenlimit = 4096,
-  _sequenceLimit = 1000,    // wird im unified Loop nicht mehr benötigt
+  _sequenceLimit = 1000,
   model = "gpt-4o",
   apiKey = null,
   options = {},
   _client = null
 ) {
-  // 1) OpenAI-Client-Adapter (axios-basiert, wie bisher)
   const configuredRaw =
     (options?.endpoint || "").trim() ||
     (process.env.OPENAI_API_URL || "").trim() ||
@@ -245,20 +244,18 @@ async function getAIResponse(
       completions: {
         create: async (payload) => {
           const res = await postWithRetry(endpoint, payload, headers, 3);
-          // Rückgabeform kompatibel zum SDK-Shape
           return { choices: res?.data?.choices || [], usage: res?.data?.usage, data: res?.data };
         }
       }
     }
   };
 
-  // 2) Tools-Adapter: Map<string, (args, ctx) => any> → ruft alte Tool-Signatur auf
+  // ToolsRegistry-Adapter: Map<string, (args, ctx) => any> → alte Tool-Signatur
   const origTools = context_orig?.toolRegistry || {};
   const toolsRegistry = new Map(
     Object.keys(origTools).map(name => {
       const fn = origTools[name];
       return [name, async (args, ctx) => {
-        // handoverContext: minimal, aber mit History kompatibel
         const handoverContext = { messages: Array.isArray(ctx?.messages) ? ctx.messages : [] };
         const runtime = { channel_id: context_orig?.channelId || null };
         return fn({ name, arguments: args }, handoverContext, getAIResponse, runtime);
@@ -266,7 +263,7 @@ async function getAIResponse(
     })
   );
 
-  // 3) Messages vorbereiten: Zeit + Priming/Persona/Instructions (wie v2.46)
+  // Messages vorbereiten: Zeit + optional Priming/Persona/Instructions
   const messages = Array.isArray(context_orig?.messages) ? [...context_orig.messages] : [];
   const sysParts = [];
   const priming = (process.env.STANDARDPRIMING || "").trim();
@@ -277,14 +274,12 @@ async function getAIResponse(
   const nowUtc = new Date().toISOString();
 
   const initialMessages = [];
-  initialMessages.push({ role: "system", content: `Current UTC time: ${nowUtc} <- Use this time whenever asked. Translate to the requested location; if none, use your current location.` });
+  initialMessages.push({ role: "system", content: `Current UTC time: ${nowUtc} <- Use this time whenever asked.` });
   if (sysCombined) initialMessages.push({ role: "system", content: sysCombined });
   initialMessages.push(...messages);
 
-  // 4) Tools-Schema (falls vorhanden)
   const tools = Array.isArray(context_orig?.tools) ? context_orig.tools : undefined;
 
-  // 5) Unified Loop ausführen
   const { messages: outMsgs } = await runUnifiedFlow(
     { openai, toolsRegistry, replyFormat: null },
     {
@@ -293,14 +288,12 @@ async function getAIResponse(
       tools,
       tokenlimit,
       enableTools: true,
-      // Defaults übernehmen / optional aus options mappen:
       max_tokens: tokenlimit,
       temperature: options?.temperature,
       stop: options?.stop,
     }
   );
 
-  // 6) Finalen Assistant-Text (String) extrahieren wie früher
   const lastAssistant = [...outMsgs].reverse().find(m => m.role === "assistant");
   const finalText = lastAssistant?.content || "";
   return String(finalText || "");
@@ -314,6 +307,6 @@ module.exports = {
   run,
   runFlow,
   runAiCore,
-  // Drop-in für bestehende Aufrufer:
+  // Drop-in:
   getAIResponse,
 };
