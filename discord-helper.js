@@ -1,9 +1,8 @@
-// discord-helper.js — refactored v3.8 (robuster Embed-Versand + primings Support)
+// discord-helper.js — refactored v3.9 (primings entfernt)
 // Avatar aus Channel-Config-Prompt (+ Persona/Name-Addendum), Cache-Busting, strict channel-only config, safe URLs
-// NEU (v3.8):
-// - Unterstützung für blocks[].primings [{ name, priming }]
-// - Helper getPrimingsForUser(channelId, userId) für AI-Prompts
-// - Bestehende v3.7-Features unverändert (6000-Limit Batch, Fallbacks, etc.)
+// Änderungen v3.9:
+// - KEIN Support mehr für blocks[].primings; alle Primings-bezogenen Helfer entfernt
+// - Bestehende v3.7/3.8-Features unverändert (6000-Limit Batch, Fallbacks, etc.)
 
 const fs = require("fs");
 const os = require("os");
@@ -114,17 +113,6 @@ async function ensureChannelAvatar(channelId, channelMeta) {
 
 /* -------------------- Channel-Config -------------------- */
 
-function normalizePrimings(arr) {
-  if (!Array.isArray(arr)) return [];
-  const out = [];
-  for (const it of arr) {
-    const name = String(it?.name || "").trim();
-    const priming = String(it?.priming || "").trim();
-    if (name && priming) out.push({ name, priming });
-  }
-  return out;
-}
-
 /** Channel-Config ausschließlich aus channel-config/<channelId>.json (+ _API Normalisierung) */
 function getChannelConfig(channelId) {
   try {
@@ -223,23 +211,11 @@ function getChannelConfig(channelId) {
     const confluence = (cfg.confluence && typeof cfg.confluence === "object") ? cfg.confluence : null;
     const jira = (cfg.jira && typeof cfg.jira === "object") ? cfg.jira : null;
 
-    // ✅ Blocks normalisieren + primings hinzufügen
+    // ✅ Blocks normalisieren (ohne primings)
     const blocks = blocksIn.map((b) => {
       const speaker = Array.isArray(b?.speaker) ? b.speaker.map(String) : [];
-      const primings = normalizePrimings(b?.primings);
-      const out = {
-        speaker,
-        primings
-      };
-      // Zusätzliche bekannte Felder (Passthrough) beibehalten:
-      if (b?.jira && typeof b.jira === "object") out.jira = b.jira;
-      if (b?.confluence && typeof b.confluence === "object") out.confluence = b.confluence;
-      // weitere Felder unangetastet übernehmen (falls vorhanden)
-      for (const [k, v] of Object.entries(b || {})) {
-        if (out[k] !== undefined) continue;
-        out[k] = v;
-      }
-      return out;
+      const { primings, ...rest } = (b || {}); // 'primings' bewusst droppen
+      return { speaker, ...rest };
     });
 
     return {
@@ -264,23 +240,6 @@ function getChannelConfig(channelId) {
       confluence: null,
       jira: null
     };
-  }
-}
-
-/**
- * Liefert die Primings für einen User im Channel:
- * - sucht den ersten Block, in dem die userId in speaker[] enthalten ist
- * - gibt dessen primings[] zurück (oder [])
- */
-function getPrimingsForUser(channelId, userId) {
-  try {
-    const meta = getChannelConfig(String(channelId || ""));
-    if (!meta?.blocks?.length || !userId) return [];
-    const uid = String(userId);
-    const blk = meta.blocks.find(b => Array.isArray(b.speaker) && b.speaker.includes(uid));
-    return Array.isArray(blk?.primings) ? blk.primings : [];
-  } catch {
-    return [];
   }
 }
 
@@ -1116,7 +1075,7 @@ function resetRecordingFlag(guildId) {
 
 module.exports = {
   getChannelConfig,
-  getPrimingsForUser,          // ✅ NEU: für aiCore.js, um primings in den Systemprompt zu hängen
+  // getPrimingsForUser: entfernt
   setMessageReaction,
   setReplyAsWebhook,
   splitIntoChunks,

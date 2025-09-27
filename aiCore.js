@@ -1,4 +1,4 @@
-// aiCore.js — unified flow v2.45 (Variante 2, gefixt)
+// aiCore.js — unified flow v2.46 (Primings entfernt)
 // (Fix v2.45: Eingangs-Segmentierung von großen Tool-Outputs als "anchored parts"
 //  NACH dem vollständigen Pairing (assistant.tool_calls -> tool-Replies).
 //  Die Anchored-Parts werden NICHT mehr im replyTool() injiziert, sondern
@@ -500,32 +500,7 @@ async function getAIResponse(
         if (schema) sysParts.push(schema);
       }
 
-      // 🔹 NEU: Primings aus context_orig.blocks für den aktuellen User in die bestehende System-Message integrieren
-      const normalizePrimings = (arr) => {
-        if (!Array.isArray(arr)) return [];
-        const out = [];
-        for (const it of arr) {
-          const name = String(it?.name || "").trim();
-          const p    = String(it?.priming || "").trim();
-          if (name && p) out.push({ name, priming: p });
-        }
-        return out;
-      };
-
-      const currentUserId = String(
-        options?.userId || context_orig?.userId || options?.pendingUser?.id || ""
-      ).trim();
-
-      if (Array.isArray(context_orig.blocks) && currentUserId) {
-        const blk = context_orig.blocks.find(b =>
-          Array.isArray(b?.speaker) && b.speaker.map(String).includes(currentUserId)
-        );
-        const prims = normalizePrimings(blk?.primings);
-        if (prims.length) {
-          const lines = prims.map(x => `- [${x.name}] ${x.priming}`);
-          sysParts.push(["User/Tool primings:", ...lines].join("\n"));
-        }
-      }
+      // (Primings aus blocks[] wurden entfernt)
 
       const sysCombined = sysParts.join("\n\n").trim();
       if (sysCombined) context.messages.unshift({ role: "system", content: sysCombined });
@@ -701,8 +676,8 @@ async function getAIResponse(
       if (hadToolCallsThisTurn) {
         const callsToRun = pseudotoolcalls ? normalizedCalls.slice(0, 1) : normalizedCalls;
 
-        // NEU (Variante 2): Anchored-Parts werden gesammelt und erst NACH allen tool-Replies injiziert
-        const pendingAnchoredParts = []; // [{ toolName, payloadString }]
+        // Anchored-Parts werden gesammelt und erst NACH allen tool-Replies injiziert
+        const pendingAnchoredParts = []; // [{ toolName, payload: string }]
         const MAX_PART = Math.max(3000, Number(process.env.TOOL_PART_CHARS || 6000));
 
         for (const call of callsToRun) {
@@ -723,8 +698,7 @@ async function getAIResponse(
             // Für Finalizer sammeln (RAM)
             toolResults.push({ name: fnName || "tool", raw: out });
 
-            // NICHT direkt injizieren! (kein assistant-Part hier)
-            // Stattdessen: ggf. als pending Anchored-Part vormerken
+            // Ggf. als pending Anchored-Part vormerken (bei sehr langem Output)
             try {
               const length = typeof out === "string" ? out.length : String(out || "").length;
               if (length > MAX_PART) {
@@ -753,8 +727,7 @@ async function getAIResponse(
           }
         }
 
-        // *** Hier (Variante 2): Erst NACH allen tool-Replies die Anchored-Parts injizieren ***
-        // Dadurch bleibt die Sequenz strikt: assistant(tool_calls) → tool → tool → ... → assistant(«Part …»)
+        // *** Erst NACH allen tool-Replies die Anchored-Parts injizieren ***
         if (pendingAnchoredParts.length > 0) {
           for (const part of pendingAnchoredParts) {
             try {
