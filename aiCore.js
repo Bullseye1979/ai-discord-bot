@@ -1,4 +1,3 @@
-/* 
 // aiCore.js — unified flow v2.46 (Primings entfernt)
 // (Fix v2.45: Eingangs-Segmentierung von großen Tool-Outputs als "anchored parts"
 //  NACH dem vollständigen Pairing (assistant.tool_calls -> tool-Replies).
